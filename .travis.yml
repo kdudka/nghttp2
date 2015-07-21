@@ -9,7 +9,7 @@ before_install:
 
 install:
     - sudo apt-get install -qq -y --force-yes csbuild
-    - sudo apt-get install autoconf automake autotools-dev g++-4.9 libstdc++-4.9-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
+    - sudo apt-get install autoconf automake autotools-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
 
 script:
     - autoreconf -fiv && ./configure
