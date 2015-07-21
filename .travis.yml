@@ -20,4 +20,4 @@ before_script:
 
 script:
     - autoreconf -fiv && ./configure
-    - test -z "$TRAVIS_COMMIT_RANGE" || csbuild --git-commit-range "$TRAVIS_COMMIT_RANGE" -c "make -j9" --git-bisect --print-fixed
+    - test -z "$TRAVIS_COMMIT_RANGE" || csbuild --git-commit-range "$TRAVIS_COMMIT_RANGE" -c "make clean && make -j9" --git-bisect --print-fixed
