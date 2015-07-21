@@ -13,4 +13,4 @@ install:
 
 script:
     - autoreconf -fiv && ./configure
-    - test -z "$TRAVIS_COMMIT_RANGE" || csbuild --git-commit-range "$TRAVIS_COMMIT_RANGE" -c "make -j9" --git-bisect --print-fixed -w0
+    - test -z "$TRAVIS_COMMIT_RANGE" || csbuild --git-commit-range "$TRAVIS_COMMIT_RANGE" -c "make -j9" --git-bisect --print-fixed
