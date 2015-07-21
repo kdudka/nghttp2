@@ -8,8 +8,8 @@ before_install:
     - sudo apt-get update -qq
 
 install:
-    - sudo apt-get install -qq -y --force-yes csbuild
-    - sudo apt-get install autoconf automake autotools-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
+    - sudo apt-get install -qq -y --force-yes automake csbuild
+    - sudo apt-get install autoconf autotools-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
 
 script:
     - autoreconf -fiv && ./configure
