@@ -9,7 +9,13 @@ before_install:
 
 install:
     - sudo apt-get install -qq -y --force-yes automake csbuild
-    - sudo apt-get install autoconf autotools-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
+    - sudo apt-get install autoconf autotools-dev g++-4.8 libstdc++-4.8-dev libtool pkg-config libcunit1-dev libev-dev libevent-dev libjansson-dev libjemalloc-dev libssl-dev libxml2-dev zlib1g-dev
+    - sudo bash -c 'for i in cswrap cscppc csclng; do ln -fsv ../../bin/$i /usr/lib/$i/gcc-4.8; done'
+    - sudo bash -c 'for i in cswrap cscppc csclng++; do ln -fsv ../../bin/$i /usr/lib/${i/++/}/g++-4.8; done'
+
+before_script:
+    - export CC="gcc-4.8"
+    - export CXX="g++-4.8"
 
 script:
     - autoreconf -fiv && ./configure
