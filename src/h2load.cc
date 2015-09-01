@@ -265,10 +265,7 @@ Client::Client(Worker *worker, size_t req_todo)
   request_timeout_watcher.data = this;
 }
 
-Client::~Client() {
-  ev_timer_stop(worker->loop, &request_timeout_watcher);
-  disconnect();
-}
+Client::~Client() { disconnect(); }
 
 int Client::do_read() { return readfn(*this); }
 int Client::do_write() { return writefn(*this); }
@@ -348,7 +345,7 @@ void Client::fail() {
 void Client::disconnect() {
   ev_timer_stop(worker->loop, &conn_inactivity_watcher);
   ev_timer_stop(worker->loop, &conn_active_watcher);
-
+  ev_timer_stop(worker->loop, &request_timeout_watcher);
   streams.clear();
   session.reset();
   state = CLIENT_IDLE;
@@ -1164,9 +1161,14 @@ void read_script_from_file(std::istream &infile,
     char *end;
     auto v = std::strtod(start, &end);
 
-    if (end == start || errno != 0) {
+    errno = 0;
+    if (v < 0.0 || !std::isfinite(v) || end == start || errno != 0) {
+      auto error = errno;
       std::cerr << "Time value error at line " << line_count << ". \n\t"
-                << script_line.substr(0, pos) << std::endl;
+                << "value = " << script_line.substr(0, pos) << std::endl;
+      if (error != 0) {
+        std::cerr << "\t" << strerror(error) << std::endl;
+      }
       exit(EXIT_FAILURE);
     }
 
@@ -1295,15 +1297,15 @@ Options:
               Path of a file containing one  or more lines separated by
               EOLs. Each script line  is composed of  two tab-separated
               fields. The first field  represents  the time offset from
-              the  start of  execution, expressed  as milliseconds with
-              microsecond  resolution.  The second field represents the
-              URI.   This   option  will   disable  URIs  getting  from
-              command-line.  If '-'  is given as <PATH>,  script  lines
-              will be read from stdin.  Script lines are used  in order
-              for each  client.  If  -n is  given, it must be less than
-              or equal to the number of script lines, larger values are
-              clamped  to  the   number  of  script  lines.  If  -n  is
-              not given,  the number of requests  will  default to  the
+              the start of execution,  expressed as a positive value of
+              milliseconds  with  microsecond  resolution.  The  second
+              field represents the URI.  This option will disable  URIs
+              getting  from  command-line.  If '-'  is given as <PATH>,
+              script  lines  will be read from stdin.  Script lines are
+              used in order for each client. If -n is given, it must be
+              less than or equal to the number of script lines,  larger
+              values are clamped to the number of script lines.  If  -n
+              is not given,  the number of requests will default to the
               number of script lines. The scheme, host and port defined
               in the  first URI  are used  solely.  Values contained in
               other URIs, if  present, are  ignored.  Definition  of  a
