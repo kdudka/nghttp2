@@ -1286,6 +1286,8 @@ int Http2Upstream::on_downstream_header_complete(Downstream *downstream) {
   //   don't want to push for HEAD request.  Not sure other methods
   //   are also eligible for push.
   if (!get_config()->no_server_push &&
+      nghttp2_session_get_remote_settings(session_,
+                                          NGHTTP2_SETTINGS_ENABLE_PUSH) == 1 &&
       get_config()->downstream_proto == PROTO_HTTP &&
       !get_config()->http2_proxy && (downstream->get_stream_id() % 2) &&
       downstream->get_response_header(http2::HD_LINK) &&
@@ -1501,6 +1503,7 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
       const char *relq = nullptr;
       size_t relqlen = 0;
 
+      std::string authority, scheme;
       http_parser_url v{};
       rv = http_parser_parse_url(link_url, link_urllen, 0, &v);
       if (rv != 0) {
@@ -1518,9 +1521,18 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
           relqlen = end - relq;
         }
       } else {
-        if (v.field_set & (1 << UF_HOST)) {
-          continue;
+        if (v.field_set & (1 << UF_SCHEMA)) {
+          http2::copy_url_component(scheme, &v, UF_SCHEMA, link_url);
         }
+
+        if (v.field_set & (1 << UF_HOST)) {
+          http2::copy_url_component(authority, &v, UF_HOST, link_url);
+          if (v.field_set & (1 << UF_PORT)) {
+            authority += ":";
+            authority += util::utos(v.port);
+          }
+        }
+
         if (v.field_set & (1 << UF_PATH)) {
           auto &f = v.field_data[UF_PATH];
           rel = link_url + f.off;
@@ -1536,9 +1548,18 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
           relqlen = f.len;
         }
       }
+
+      if (scheme.empty()) {
+        scheme = downstream->get_request_http2_scheme();
+      }
+
+      if (authority.empty()) {
+        authority = downstream->get_request_http2_authority();
+      }
+
       auto path = http2::path_join(base, baselen, nullptr, 0, rel, rellen, relq,
                                    relqlen);
-      rv = submit_push_promise(path, downstream);
+      rv = submit_push_promise(scheme, authority, path, downstream);
       if (rv != 0) {
         return -1;
       }
@@ -1547,7 +1568,9 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
   return 0;
 }
 
-int Http2Upstream::submit_push_promise(const std::string &path,
+int Http2Upstream::submit_push_promise(const std::string &scheme,
+                                       const std::string &authority,
+                                       const std::string &path,
                                        Downstream *downstream) {
   int rv;
   std::vector<nghttp2_nv> nva;
@@ -1555,13 +1578,9 @@ int Http2Upstream::submit_push_promise(const std::string &path,
 
   // juse use "GET" for now
   nva.push_back(http2::make_nv_ll(":method", "GET"));
-  nva.push_back(
-      http2::make_nv_ls(":scheme", downstream->get_request_http2_scheme()));
+  nva.push_back(http2::make_nv_ls(":scheme", scheme));
   nva.push_back(http2::make_nv_ls(":path", path));
-  auto &authority = downstream->get_request_http2_authority();
-  if (!authority.empty()) {
-    nva.push_back(http2::make_nv_ls(":authority", authority));
-  }
+  nva.push_back(http2::make_nv_ls(":authority", authority));
 
   for (auto &kv : downstream->get_request_headers()) {
     switch (kv.token) {
