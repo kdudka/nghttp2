@@ -27,6 +27,7 @@
 
 #include "nghttp2_config.h"
 
+#include <cstring>
 #include <memory>
 #include <array>
 #include <functional>
@@ -45,10 +46,15 @@ make_unique(size_t size) {
   return std::unique_ptr<T>(new typename std::remove_extent<T>::type[size]());
 }
 
-template <typename T, typename... Rest>
-std::array<T, sizeof...(Rest)+1> make_array(T &&t, Rest &&... rest) {
-  return std::array<T, sizeof...(Rest)+1>{
-      {std::forward<T>(t), std::forward<Rest>(rest)...}};
+// std::forward is conexpr since C++14
+template <typename... T>
+constexpr std::array<
+    typename std::decay<typename std::common_type<T...>::type>::type,
+    sizeof...(T)>
+make_array(T &&... t) {
+  return std::array<
+      typename std::decay<typename std::common_type<T...>::type>::type,
+      sizeof...(T)>{{std::forward<T>(t)...}};
 }
 
 template <typename T, size_t N> constexpr size_t array_size(T (&)[N]) {
@@ -164,6 +170,31 @@ constexpr unsigned long long operator"" _g(unsigned long long g) {
 constexpr double operator"" _h(unsigned long long h) { return h * 60 * 60; }
 
 constexpr double operator"" _min(unsigned long long min) { return min * 60; }
+
+// Returns a copy of NULL-terminated string [first, last).
+template <typename InputIt>
+std::unique_ptr<char[]> strcopy(InputIt first, InputIt last) {
+  auto res = make_unique<char[]>(last - first + 1);
+  *std::copy(first, last, res.get()) = '\0';
+  return res;
+}
+
+// Returns a copy of NULL-terminated string |val|.
+inline std::unique_ptr<char[]> strcopy(const char *val) {
+  return strcopy(val, val + strlen(val));
+}
+
+// Returns a copy of val.c_str().
+inline std::unique_ptr<char[]> strcopy(const std::string &val) {
+  return strcopy(std::begin(val), std::end(val));
+}
+
+inline std::unique_ptr<char[]> strcopy(const std::unique_ptr<char[]> &val) {
+  if (!val) {
+    return nullptr;
+  }
+  return strcopy(val.get());
+}
 
 } // namespace nghttp2
 

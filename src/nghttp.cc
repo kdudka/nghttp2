@@ -48,7 +48,6 @@
 #include <tuple>
 
 #include <openssl/err.h>
-#include <openssl/conf.h>
 
 #ifdef HAVE_JANSSON
 #include <jansson.h>
@@ -1110,11 +1109,7 @@ int HttpClient::tls_handshake() {
 
   auto rv = SSL_do_handshake(ssl);
 
-  if (rv == 0) {
-    return -1;
-  }
-
-  if (rv < 0) {
+  if (rv <= 0) {
     auto err = SSL_get_error(ssl, rv);
     switch (err) {
     case SSL_ERROR_WANT_READ:
@@ -1152,11 +1147,7 @@ int HttpClient::read_tls() {
   for (;;) {
     auto rv = SSL_read(ssl, buf.data(), buf.size());
 
-    if (rv == 0) {
-      return -1;
-    }
-
-    if (rv < 0) {
+    if (rv <= 0) {
       auto err = SSL_get_error(ssl, rv);
       switch (err) {
       case SSL_ERROR_WANT_READ:
@@ -1184,11 +1175,7 @@ int HttpClient::write_tls() {
     if (wb.rleft() > 0) {
       auto rv = SSL_write(ssl, wb.pos, wb.rleft());
 
-      if (rv == 0) {
-        return -1;
-      }
-
-      if (rv < 0) {
+      if (rv <= 0) {
         auto err = SSL_get_error(ssl, rv);
         switch (err) {
         case SSL_ERROR_WANT_READ:
@@ -1861,6 +1848,28 @@ int before_frame_send_callback(nghttp2_session *session,
 } // namespace
 
 namespace {
+int on_frame_not_send_callback(nghttp2_session *session,
+                               const nghttp2_frame *frame, int lib_error_code,
+                               void *user_data) {
+  if (frame->hd.type != NGHTTP2_HEADERS ||
+      frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+    return 0;
+  }
+
+  auto req = static_cast<Request *>(
+      nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+  if (!req) {
+    return 0;
+  }
+
+  std::cerr << "[ERROR] request " << req->uri
+            << " failed: " << nghttp2_strerror(lib_error_code) << std::endl;
+
+  return 0;
+}
+} // namespace
+
+namespace {
 int on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
                              uint32_t error_code, void *user_data) {
   auto client = get_client(user_data);
@@ -2212,6 +2221,9 @@ int run(char **uris, int n) {
   nghttp2_session_callbacks_set_before_frame_send_callback(
       callbacks, before_frame_send_callback);
 
+  nghttp2_session_callbacks_set_on_frame_not_send_callback(
+      callbacks, on_frame_not_send_callback);
+
   nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
 
   if (config.padding) {
@@ -2450,10 +2462,7 @@ Options:
 } // namespace
 
 int main(int argc, char **argv) {
-  SSL_load_error_strings();
-  SSL_library_init();
-  OpenSSL_add_all_algorithms();
-  OPENSSL_config(nullptr);
+  ssl::libssl_init();
 
   bool color = false;
   while (1) {

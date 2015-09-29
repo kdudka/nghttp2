@@ -53,6 +53,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>
+#include <errno.h>
 
 #include <nghttp2/nghttp2.h>
 
@@ -124,6 +126,7 @@ static char *strcopy(const char *s, size_t len) {
 /*
  * Prints error message |msg| and exit.
  */
+NGHTTP2_NORETURN
 static void die(const char *msg) {
   fprintf(stderr, "FATAL: %s\n", msg);
   exit(EXIT_FAILURE);
@@ -133,6 +136,7 @@ static void die(const char *msg) {
  * Prints error containing the function name |func| and message |msg|
  * and exit.
  */
+NGHTTP2_NORETURN
 static void dief(const char *func, const char *msg) {
   fprintf(stderr, "FATAL: %s: %s\n", func, msg);
   exit(EXIT_FAILURE);
@@ -142,6 +146,7 @@ static void dief(const char *func, const char *msg) {
  * Prints error containing the function name |func| and error code
  * |error_code| and exit.
  */
+NGHTTP2_NORETURN
 static void diec(const char *func, int error_code) {
   fprintf(stderr, "FATAL: %s: error_code=%d, msg=%s\n", func, error_code,
           nghttp2_strerror(error_code));
@@ -657,10 +662,10 @@ static int parse_uri(struct URI *res, const char *uri) {
         return -1;
       }
       offset = i;
-      res->port = port;
+      res->port = (uint16_t)port;
     }
   }
-  res->hostportlen = uri + offset + ipv6addr - res->host;
+  res->hostportlen = (size_t)(uri + offset + ipv6addr - res->host);
   for (i = offset; i < len; ++i) {
     if (uri[i] == '#') {
       break;
@@ -689,10 +694,11 @@ int main(int argc, char **argv) {
   act.sa_handler = SIG_IGN;
   sigaction(SIGPIPE, &act, 0);
 
+#ifndef OPENSSL_IS_BORINGSSL
+  OPENSSL_config(NULL);
+#endif /* OPENSSL_IS_BORINGSSL */
   SSL_load_error_strings();
   SSL_library_init();
-  OpenSSL_add_all_algorithms();
-  OPENSSL_config(NULL);
 
   rv = parse_uri(&uri, argv[1]);
   if (rv != 0) {

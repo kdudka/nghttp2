@@ -66,16 +66,6 @@ const char DEFAULT_STRIP_CHARSET[] = "\r\n\t ";
 
 const char UPPER_XDIGITS[] = "0123456789ABCDEF";
 
-bool isAlpha(const char c) {
-  return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z');
-}
-
-bool isDigit(const char c) { return '0' <= c && c <= '9'; }
-
-bool isHexDigit(const char c) {
-  return isDigit(c) || ('A' <= c && c <= 'F') || ('a' <= c && c <= 'f');
-}
-
 bool inRFC3986UnreservedChars(const char c) {
   static const char unreserved[] = {'-', '.', '_', '~'};
   return isAlpha(c) || isDigit(c) ||
@@ -636,15 +626,16 @@ void write_uri_field(std::ostream &o, const char *uri, const http_parser_url &u,
 }
 
 bool numeric_host(const char *hostname) {
-  struct addrinfo *res;
-  struct addrinfo hints {};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_flags = AI_NUMERICHOST;
-  if (getaddrinfo(hostname, nullptr, &hints, &res)) {
-    return false;
-  }
-  freeaddrinfo(res);
-  return true;
+  return numeric_host(hostname, AF_INET) || numeric_host(hostname, AF_INET6);
+}
+
+bool numeric_host(const char *hostname, int family) {
+  int rv;
+  std::array<uint8_t, sizeof(struct in6_addr)> dst;
+
+  rv = inet_pton(family, hostname, dst.data());
+
+  return rv == 1;
 }
 
 std::string numeric_name(const struct sockaddr *sa, socklen_t salen) {
@@ -779,7 +770,7 @@ bool check_h2_is_selected(const unsigned char *proto, size_t len) {
 }
 
 namespace {
-bool select_h2(const unsigned char **out, unsigned char *outlen,
+bool select_proto(const unsigned char **out, unsigned char *outlen,
                const unsigned char *in, unsigned int inlen, const char *key,
                unsigned int keylen) {
   for (auto p = in, end = in + inlen; p + keylen <= end; p += *p + 1) {
@@ -795,12 +786,23 @@ bool select_h2(const unsigned char **out, unsigned char *outlen,
 
 bool select_h2(const unsigned char **out, unsigned char *outlen,
                const unsigned char *in, unsigned int inlen) {
-  return select_h2(out, outlen, in, inlen, NGHTTP2_PROTO_ALPN,
+  return select_proto(out, outlen, in, inlen, NGHTTP2_PROTO_ALPN,
                    str_size(NGHTTP2_PROTO_ALPN)) ||
-         select_h2(out, outlen, in, inlen, NGHTTP2_H2_16_ALPN,
+         select_proto(out, outlen, in, inlen, NGHTTP2_H2_16_ALPN,
                    str_size(NGHTTP2_H2_16_ALPN)) ||
-         select_h2(out, outlen, in, inlen, NGHTTP2_H2_14_ALPN,
+         select_proto(out, outlen, in, inlen, NGHTTP2_H2_14_ALPN,
                    str_size(NGHTTP2_H2_14_ALPN));
+}
+
+bool select_protocol(const unsigned char **out, unsigned char *outlen,
+               const unsigned char *in, unsigned int inlen, std::vector<std::string> proto_list) {
+  for (const auto &proto : proto_list) {
+    if (select_proto(out, outlen, in, inlen, proto.c_str(), static_cast<unsigned int>(proto.size()))) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 std::vector<unsigned char> get_default_alpn() {
@@ -813,6 +815,39 @@ std::vector<unsigned char> get_default_alpn() {
   p = std::copy_n(NGHTTP2_H2_16_ALPN, str_size(NGHTTP2_H2_16_ALPN), p);
   p = std::copy_n(NGHTTP2_H2_14_ALPN, str_size(NGHTTP2_H2_14_ALPN), p);
 
+  return res;
+}
+
+
+std::vector<Range<const char *>> split_config_str_list(const char *s,
+                                                       char delim) {
+  size_t len = 1;
+  auto last = s + strlen(s);
+  for (const char *first = s, *d = nullptr;
+       (d = std::find(first, last, delim)) != last; ++len, first = d + 1)
+    ;
+
+  auto list = std::vector<Range<const char *>>(len);
+
+  len = 0;
+  for (auto first = s;; ++len) {
+    auto stop = std::find(first, last, delim);
+    list[len] = {first, stop};
+    if (stop == last) {
+      break;
+    }
+    first = stop + 1;
+  }
+  return list;
+}
+
+std::vector<std::string> parse_config_str_list(const char *s, char delim) {
+  auto ranges = split_config_str_list(s, delim);
+  auto res = std::vector<std::string>();
+  res.reserve(ranges.size());
+  for (const auto &range : ranges) {
+    res.emplace_back(range.first, range.second);
+  }
   return res;
 }
 

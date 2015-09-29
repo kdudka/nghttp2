@@ -122,7 +122,7 @@ static void scripted_data_feed_init2(scripted_data_feed *df,
 static ssize_t null_send_callback(nghttp2_session *session _U_,
                                   const uint8_t *data _U_, size_t len,
                                   int flags _U_, void *user_data _U_) {
-  return len;
+  return (ssize_t)len;
 }
 
 static ssize_t fail_send_callback(nghttp2_session *session _U_,
@@ -135,7 +135,7 @@ static ssize_t fixed_bytes_send_callback(nghttp2_session *session _U_,
                                          const uint8_t *data _U_, size_t len,
                                          int flags _U_, void *user_data) {
   size_t fixed_sendlen = ((my_user_data *)user_data)->fixed_sendlen;
-  return fixed_sendlen < len ? fixed_sendlen : len;
+  return (ssize_t)(fixed_sendlen < len ? fixed_sendlen : len);
 }
 
 static ssize_t scripted_recv_callback(nghttp2_session *session _U_,
@@ -149,7 +149,7 @@ static ssize_t scripted_recv_callback(nghttp2_session *session _U_,
   if (df->feedseq[df->seqidx] == 0) {
     ++df->seqidx;
   }
-  return wlen;
+  return (ssize_t)wlen;
 }
 
 static ssize_t eof_recv_callback(nghttp2_session *session _U_,
@@ -165,7 +165,7 @@ static ssize_t accumulator_send_callback(nghttp2_session *session _U_,
   assert(acc->length + len < sizeof(acc->buf));
   memcpy(acc->buf + acc->length, buf, len);
   acc->length += len;
-  return len;
+  return (ssize_t)len;
 }
 
 static int on_begin_frame_callback(nghttp2_session *session _U_,
@@ -235,7 +235,7 @@ static ssize_t select_padding_callback(nghttp2_session *session _U_,
                                        const nghttp2_frame *frame,
                                        size_t max_payloadlen, void *user_data) {
   my_user_data *ud = (my_user_data *)user_data;
-  return nghttp2_min(max_payloadlen, frame->hd.length + ud->padlen);
+  return (ssize_t)nghttp2_min(max_payloadlen, frame->hd.length + ud->padlen);
 }
 
 static ssize_t too_large_data_source_length_callback(
@@ -269,7 +269,7 @@ static ssize_t fixed_length_data_source_read_callback(
   if (ud->data_source_length == 0) {
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
   }
-  return wlen;
+  return (ssize_t)wlen;
 }
 
 static ssize_t temporal_failure_data_source_read_callback(
@@ -315,7 +315,7 @@ static ssize_t no_copy_data_source_read_callback(
   if (ud->data_source_length == 0) {
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
   }
-  return wlen;
+  return (ssize_t)wlen;
 }
 
 static int send_data_callback(nghttp2_session *session _U_,
@@ -328,7 +328,7 @@ static int send_data_callback(nghttp2_session *session _U_,
   acc->length += NGHTTP2_FRAME_HDLEN;
 
   if (frame->data.padlen) {
-    *(acc->buf + acc->length++) = frame->data.padlen - 1;
+    *(acc->buf + acc->length++) = (uint8_t)(frame->data.padlen - 1);
   }
 
   acc->length += length;
@@ -354,14 +354,13 @@ static ssize_t block_count_send_callback(nghttp2_session *session _U_,
                                          const uint8_t *data _U_, size_t len,
                                          int flags _U_, void *user_data) {
   my_user_data *ud = (my_user_data *)user_data;
-  ssize_t r;
+
   if (ud->block_count == 0) {
-    r = NGHTTP2_ERR_WOULDBLOCK;
-  } else {
-    --ud->block_count;
-    r = len;
+    return NGHTTP2_ERR_WOULDBLOCK;
   }
-  return r;
+
+  --ud->block_count;
+  return (ssize_t)len;
 }
 
 static int on_header_callback(nghttp2_session *session _U_,
@@ -446,12 +445,12 @@ void test_nghttp2_session_recv(void) {
   scripted_data_feed df;
   my_user_data user_data;
   nghttp2_bufs bufs;
-  ssize_t framelen;
+  size_t framelen;
   nghttp2_frame frame;
-  ssize_t i;
+  size_t i;
   nghttp2_outbound_item *item;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   nghttp2_hd_deflater deflater;
   int rv;
   nghttp2_mem *mem;
@@ -492,7 +491,7 @@ void test_nghttp2_session_recv(void) {
   user_data.frame_recv_cb_called = 0;
   user_data.begin_frame_cb_called = 0;
 
-  while ((ssize_t)df.seqidx < framelen) {
+  while (df.seqidx < framelen) {
     CU_ASSERT(0 == nghttp2_session_recv(session));
   }
   CU_ASSERT(1 == user_data.frame_recv_cb_called);
@@ -614,7 +613,7 @@ void test_nghttp2_session_recv_invalid_frame(void) {
   nghttp2_bufs bufs;
   nghttp2_frame frame;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   nghttp2_hd_deflater deflater;
   int rv;
   nghttp2_mem *mem;
@@ -828,7 +827,7 @@ void test_nghttp2_session_recv_data_no_auto_flow_control(void) {
   hd.flags = NGHTTP2_FLAG_PADDED;
   hd.stream_id = 1;
   nghttp2_frame_pack_frame_hd(data, &hd);
-  data[NGHTTP2_FRAME_HDLEN] = padlen;
+  data[NGHTTP2_FRAME_HDLEN] = (uint8_t)padlen;
 
   /* First create stream 1, then close it.  Check that data is
      consumed for connection in this situation */
@@ -928,7 +927,7 @@ void test_nghttp2_session_recv_continuation(void) {
   datalen = NGHTTP2_FRAME_HDLEN + 1;
   buf->pos += NGHTTP2_FRAME_HDLEN + 1;
 
-  nghttp2_put_uint32be(data, (1 << 8) + data[3]);
+  nghttp2_put_uint32be(data, (uint32_t)((1 << 8) + data[3]));
 
   /* First CONTINUATION, 2 bytes */
   nghttp2_frame_hd_init(&cont_hd, 2, NGHTTP2_CONTINUATION, NGHTTP2_FLAG_NONE,
@@ -961,6 +960,63 @@ void test_nghttp2_session_recv_continuation(void) {
   CU_ASSERT((ssize_t)datalen == rv);
   CU_ASSERT(4 == ud.header_cb_called);
   CU_ASSERT(3 == ud.begin_frame_cb_called);
+
+  nghttp2_hd_deflate_free(&deflater);
+  nghttp2_session_del(session);
+
+  /* HEADERS with padding followed by CONTINUATION */
+  nghttp2_session_server_new(&session, &callbacks, &ud);
+
+  nghttp2_hd_deflate_init(&deflater, mem);
+
+  nvlen = ARRLEN(reqnv);
+  nghttp2_nv_array_copy(&nva, reqnv, nvlen, mem);
+  nghttp2_frame_headers_init(&frame.headers, NGHTTP2_FLAG_NONE, 1,
+                             NGHTTP2_HCAT_HEADERS, NULL, nva, nvlen);
+
+  nghttp2_bufs_reset(&bufs);
+  rv = nghttp2_frame_pack_headers(&bufs, &frame.headers, &deflater);
+
+  CU_ASSERT(0 == rv);
+
+  nghttp2_frame_headers_free(&frame.headers, mem);
+
+  /* make sure that all data is in the first buf */
+  buf = &bufs.head->buf;
+  assert(nghttp2_bufs_len(&bufs) == nghttp2_buf_len(buf));
+
+  /* HEADERS payload is 3 byte (1 for padding field, 1 for padding) */
+  memcpy(data, buf->pos, NGHTTP2_FRAME_HDLEN);
+  nghttp2_put_uint32be(data, (uint32_t)((3 << 8) + data[3]));
+  data[4] |= NGHTTP2_FLAG_PADDED;
+  /* padding field */
+  data[NGHTTP2_FRAME_HDLEN] = 1;
+  data[NGHTTP2_FRAME_HDLEN + 1] = buf->pos[NGHTTP2_FRAME_HDLEN];
+  /* padding */
+  data[NGHTTP2_FRAME_HDLEN + 2] = 0;
+  datalen = NGHTTP2_FRAME_HDLEN + 3;
+  buf->pos += NGHTTP2_FRAME_HDLEN + 1;
+
+  /* CONTINUATION, rest of the bytes */
+  nghttp2_frame_hd_init(&cont_hd, nghttp2_buf_len(buf), NGHTTP2_CONTINUATION,
+                        NGHTTP2_FLAG_END_HEADERS, 1);
+  nghttp2_frame_pack_frame_hd(data + datalen, &cont_hd);
+  datalen += NGHTTP2_FRAME_HDLEN;
+
+  memcpy(data + datalen, buf->pos, cont_hd.length);
+  datalen += cont_hd.length;
+  buf->pos += cont_hd.length;
+
+  CU_ASSERT(0 == nghttp2_buf_len(buf));
+
+  ud.header_cb_called = 0;
+  ud.begin_frame_cb_called = 0;
+
+  rv = nghttp2_session_mem_recv(session, data, datalen);
+
+  CU_ASSERT((ssize_t)datalen == rv);
+  CU_ASSERT(4 == ud.header_cb_called);
+  CU_ASSERT(2 == ud.begin_frame_cb_called);
 
   nghttp2_hd_deflate_free(&deflater);
   nghttp2_session_del(session);
@@ -1069,7 +1125,7 @@ void test_nghttp2_session_recv_headers_with_priority(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(1 == ud.frame_recv_cb_called);
 
   stream = nghttp2_session_get_stream(session, 3);
@@ -1100,13 +1156,13 @@ void test_nghttp2_session_recv_headers_with_priority(void) {
   buf = &bufs.head->buf;
   /* Make payload shorter than required length to store priority
      group */
-  nghttp2_put_uint32be(buf->pos, (4 << 8) + buf->pos[3]);
+  nghttp2_put_uint32be(buf->pos, (uint32_t)((4 << 8) + buf->pos[3]));
 
   ud.frame_recv_cb_called = 0;
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(0 == ud.frame_recv_cb_called);
 
   stream = nghttp2_session_get_stream(session, 5);
@@ -1151,7 +1207,7 @@ void test_nghttp2_session_recv_headers_with_priority(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(0 == ud.frame_recv_cb_called);
 
   stream = nghttp2_session_get_stream(session, 1);
@@ -1201,7 +1257,7 @@ void test_nghttp2_session_recv_premature_headers(void) {
   nghttp2_put_uint32be(buf->pos, ((payloadlen - 1) << 8) + buf->pos[3]);
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf) - 1);
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf) - 1);
+  CU_ASSERT((ssize_t)(nghttp2_buf_len(buf) - 1) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -1233,7 +1289,7 @@ void test_nghttp2_session_recv_premature_headers(void) {
   nghttp2_put_uint32be(buf->pos, ((payloadlen - 1) << 8) + buf->pos[3]);
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf) - 1);
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf) - 1);
+  CU_ASSERT((ssize_t)(nghttp2_buf_len(buf) - 1) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -1361,7 +1417,7 @@ void test_nghttp2_session_recv_settings_header_table_size(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf));
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(1 == ud.frame_recv_cb_called);
 
   CU_ASSERT(3000 == session->remote_settings.header_table_size);
@@ -1396,7 +1452,7 @@ void test_nghttp2_session_recv_settings_header_table_size(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf));
+  CU_ASSERT((ssize_t)(nghttp2_buf_len(buf)) == rv);
   CU_ASSERT(1 == ud.frame_recv_cb_called);
 
   CU_ASSERT(3001 == session->remote_settings.header_table_size);
@@ -1438,7 +1494,7 @@ void test_nghttp2_session_recv_settings_header_table_size(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf));
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(1 == ud.frame_recv_cb_called);
 
   CU_ASSERT(4096 == session->remote_settings.header_table_size);
@@ -1481,7 +1537,7 @@ void test_nghttp2_session_recv_settings_header_table_size(void) {
 
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(rv == nghttp2_buf_len(buf));
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
   CU_ASSERT(1 == ud.frame_recv_cb_called);
 
   CU_ASSERT(0 == session->remote_settings.header_table_size);
@@ -1536,7 +1592,7 @@ void test_nghttp2_session_continue(void) {
   nghttp2_buf databuf;
   nghttp2_frame frame;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   const nghttp2_frame *recv_frame;
   nghttp2_frame_hd data_hd;
   nghttp2_hd_deflater deflater;
@@ -1717,7 +1773,7 @@ void test_nghttp2_session_add_frame(void) {
   nghttp2_outbound_item *item;
   nghttp2_frame *frame;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   nghttp2_mem *mem;
 
   mem = nghttp2_mem_default();
@@ -1740,7 +1796,7 @@ void test_nghttp2_session_add_frame(void) {
 
   nghttp2_frame_headers_init(
       &frame->headers, NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_PRIORITY,
-      session->next_stream_id, NGHTTP2_HCAT_REQUEST, NULL, nva, nvlen);
+      (int32_t)session->next_stream_id, NGHTTP2_HCAT_REQUEST, NULL, nva, nvlen);
 
   session->next_stream_id += 2;
 
@@ -2865,8 +2921,8 @@ void test_nghttp2_session_send_headers_start_stream(void) {
   frame = &item->frame;
 
   nghttp2_frame_headers_init(&frame->headers, NGHTTP2_FLAG_END_HEADERS,
-                             session->next_stream_id, NGHTTP2_HCAT_REQUEST,
-                             NULL, NULL, 0);
+                             (int32_t)session->next_stream_id,
+                             NGHTTP2_HCAT_REQUEST, NULL, NULL, 0);
   session->next_stream_id += 2;
 
   nghttp2_session_add_item(session, item);
@@ -2916,7 +2972,7 @@ void test_nghttp2_session_send_headers_frame_size_error(void) {
   nghttp2_outbound_item *item;
   nghttp2_frame *frame;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   size_t vallen = NGHTTP2_HD_MAX_NV;
   nghttp2_nv nv[28];
   size_t nnv = ARRLEN(nv);
@@ -2951,8 +3007,8 @@ void test_nghttp2_session_send_headers_frame_size_error(void) {
   frame = &item->frame;
 
   nghttp2_frame_headers_init(&frame->headers, NGHTTP2_FLAG_END_HEADERS,
-                             session->next_stream_id, NGHTTP2_HCAT_REQUEST,
-                             NULL, nva, nvlen);
+                             (int32_t)session->next_stream_id,
+                             NGHTTP2_HCAT_REQUEST, NULL, nva, nvlen);
 
   session->next_stream_id += 2;
 
@@ -3065,7 +3121,7 @@ void test_nghttp2_session_send_push_promise(void) {
 
   nghttp2_frame_push_promise_init(&frame->push_promise,
                                   NGHTTP2_FLAG_END_HEADERS, 1,
-                                  session->next_stream_id, NULL, 0);
+                                  (int32_t)session->next_stream_id, NULL, 0);
 
   session->next_stream_id += 2;
 
@@ -3160,7 +3216,7 @@ void test_nghttp2_session_upgrade(void) {
   iv[0].value = 1;
   iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
   iv[1].value = 4095;
-  settings_payloadlen = nghttp2_pack_settings_payload(
+  settings_payloadlen = (size_t)nghttp2_pack_settings_payload(
       settings_payload, sizeof(settings_payload), iv, 2);
 
   /* Check client side */
@@ -3205,7 +3261,7 @@ void test_nghttp2_session_upgrade(void) {
   nghttp2_session_del(session);
 
   /* Empty SETTINGS is OK */
-  settings_payloadlen = nghttp2_pack_settings_payload(
+  settings_payloadlen = (size_t)nghttp2_pack_settings_payload(
       settings_payload, sizeof(settings_payload), NULL, 0);
 
   nghttp2_session_client_new(&session, &callbacks, NULL);
@@ -3483,7 +3539,7 @@ static ssize_t submit_data_twice_data_source_read_callback(
     size_t len, uint32_t *data_flags, nghttp2_data_source *source _U_,
     void *user_data _U_) {
   *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-  return nghttp2_min(len, 16);
+  return (ssize_t)nghttp2_min(len, 16);
 }
 
 static int submit_data_twice_on_frame_send_callback(nghttp2_session *session,
@@ -5022,9 +5078,11 @@ void test_nghttp2_session_flow_control(void) {
      negative. */
   new_initial_window_size = 16 * 1024;
   stream->remote_window_size =
-      new_initial_window_size - (session->remote_settings.initial_window_size -
-                                 stream->remote_window_size);
-  session->remote_settings.initial_window_size = new_initial_window_size;
+      new_initial_window_size -
+      ((int32_t)session->remote_settings.initial_window_size -
+       stream->remote_window_size);
+  session->remote_settings.initial_window_size =
+      (uint32_t)new_initial_window_size;
   CU_ASSERT(-48 * 1024 == stream->remote_window_size);
 
   /* Back 48KiB to stream window */
@@ -5168,8 +5226,7 @@ void test_nghttp2_session_flow_control_data_with_padding_recv(void) {
 
   /* Create DATA frame */
   memset(data, 0, sizeof(data));
-  nghttp2_frame_hd_init(&hd, 357, NGHTTP2_DATA,
-                        NGHTTP2_FLAG_END_STREAM | NGHTTP2_FLAG_PADDED, 1);
+  nghttp2_frame_hd_init(&hd, 357, NGHTTP2_DATA, NGHTTP2_FLAG_PADDED, 1);
 
   nghttp2_frame_pack_frame_hd(data, &hd);
   /* Set Pad Length field, which itself is padding */
@@ -5183,6 +5240,58 @@ void test_nghttp2_session_flow_control_data_with_padding_recv(void) {
   CU_ASSERT((int32_t)hd.length == stream->recv_window_size);
   CU_ASSERT(256 == session->consumed_size);
   CU_ASSERT(256 == stream->consumed_size);
+  CU_ASSERT(357 == session->recv_window_size);
+  CU_ASSERT(357 == stream->recv_window_size);
+
+  /* Receive the same DATA frame, but in 2 parts: first 9 + 1 + 102
+     bytes which includes 1st padding byte, and remainder */
+  CU_ASSERT((ssize_t)(NGHTTP2_FRAME_HDLEN + 103) ==
+            nghttp2_session_mem_recv(session, data, NGHTTP2_FRAME_HDLEN + 103));
+  CU_ASSERT(258 == session->consumed_size);
+  CU_ASSERT(258 == stream->consumed_size);
+  CU_ASSERT(460 == session->recv_window_size);
+  CU_ASSERT(460 == stream->recv_window_size);
+
+  /* 357 - 103 = 254 bytes left */
+  CU_ASSERT(254 == nghttp2_session_mem_recv(session, data, 254));
+  CU_ASSERT(512 == session->consumed_size);
+  CU_ASSERT(512 == stream->consumed_size);
+  CU_ASSERT(714 == session->recv_window_size);
+  CU_ASSERT(714 == stream->recv_window_size);
+
+  /* Receive the same DATA frame, but in 2 parts: first 9 = 1 + 101
+     bytes which only includes data without padding, 2nd part is
+     padding only */
+  CU_ASSERT((ssize_t)(NGHTTP2_FRAME_HDLEN + 102) ==
+            nghttp2_session_mem_recv(session, data, NGHTTP2_FRAME_HDLEN + 102));
+  CU_ASSERT(513 == session->consumed_size);
+  CU_ASSERT(513 == stream->consumed_size);
+  CU_ASSERT(816 == session->recv_window_size);
+  CU_ASSERT(816 == stream->recv_window_size);
+
+  /* 357 - 102 = 255 bytes left */
+  CU_ASSERT(255 == nghttp2_session_mem_recv(session, data, 255));
+  CU_ASSERT(768 == session->consumed_size);
+  CU_ASSERT(768 == stream->consumed_size);
+  CU_ASSERT(1071 == session->recv_window_size);
+  CU_ASSERT(1071 == stream->recv_window_size);
+
+  /* Receive the same DATA frame, but in 2 parts: first 9 = 1 + 50
+     bytes which includes byte up to middle of data, 2nd part is the
+     remainder */
+  CU_ASSERT((ssize_t)(NGHTTP2_FRAME_HDLEN + 51) ==
+            nghttp2_session_mem_recv(session, data, NGHTTP2_FRAME_HDLEN + 51));
+  CU_ASSERT(769 == session->consumed_size);
+  CU_ASSERT(769 == stream->consumed_size);
+  CU_ASSERT(1122 == session->recv_window_size);
+  CU_ASSERT(1122 == stream->recv_window_size);
+
+  /* 357 - 51 = 306 bytes left */
+  CU_ASSERT(306 == nghttp2_session_mem_recv(session, data, 306));
+  CU_ASSERT(1024 == session->consumed_size);
+  CU_ASSERT(1024 == stream->consumed_size);
+  CU_ASSERT(1428 == session->recv_window_size);
+  CU_ASSERT(1428 == stream->recv_window_size);
 
   nghttp2_session_del(session);
 }
@@ -5523,7 +5632,7 @@ static void check_session_recv_data_with_padding(nghttp2_bufs *bufs,
   nghttp2_session_open_stream(session, 1, NGHTTP2_STREAM_FLAG_NONE,
                               &pri_spec_default, NGHTTP2_STREAM_OPENING, NULL);
 
-  inlen = nghttp2_bufs_remove(bufs, &in);
+  inlen = (size_t)nghttp2_bufs_remove(bufs, &in);
 
   ud.frame_recv_cb_called = 0;
   ud.data_chunk_len = 0;
@@ -5630,7 +5739,7 @@ void test_nghttp2_pack_settings_payload(void) {
   len = nghttp2_pack_settings_payload(buf, sizeof(buf), iv, 2);
   CU_ASSERT(2 * NGHTTP2_FRAME_SETTINGS_ENTRY_LENGTH == len);
   CU_ASSERT(0 == nghttp2_frame_unpack_settings_payload2(&resiv, &resniv, buf,
-                                                        len, mem));
+                                                        (size_t)len, mem));
   CU_ASSERT(2 == resniv);
   CU_ASSERT(NGHTTP2_SETTINGS_HEADER_TABLE_SIZE == resiv[0].settings_id);
   CU_ASSERT(1023 == resiv[0].value);
@@ -6932,7 +7041,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   stream = nghttp2_session_find_stream(session, 1);
 
@@ -6950,7 +7059,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   stream = nghttp2_session_find_stream(session, 3);
 
@@ -6992,7 +7101,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   nghttp2_bufs_reset(&bufs);
 
@@ -7063,7 +7172,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   stream = nghttp2_session_find_stream(session, 7);
 
@@ -7092,7 +7201,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   stream = nghttp2_session_find_stream(session, 2);
 
@@ -7108,7 +7217,7 @@ void test_nghttp2_session_stream_get_state(void) {
   buf = &bufs.head->buf;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf));
 
-  CU_ASSERT(nghttp2_buf_len(buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) == rv);
 
   stream = nghttp2_session_find_stream(session, 2);
 
@@ -7476,7 +7585,7 @@ void test_nghttp2_session_on_header_temporal_failure(void) {
   ud.header_cb_called = 0;
   rv = nghttp2_session_mem_recv(session, buf->pos, nghttp2_bufs_len(&bufs));
 
-  CU_ASSERT(rv == nghttp2_bufs_len(&bufs));
+  CU_ASSERT((ssize_t)nghttp2_bufs_len(&bufs) == rv);
   CU_ASSERT(1 == ud.header_cb_called);
 
   item = nghttp2_session_get_next_ob_item(session);
@@ -7506,7 +7615,7 @@ void test_nghttp2_session_on_header_temporal_failure(void) {
   ud.header_cb_called = 0;
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_bufs_len(&bufs));
-  CU_ASSERT(nghttp2_bufs_len(&bufs) == rv);
+  CU_ASSERT((ssize_t)nghttp2_bufs_len(&bufs) == rv);
   CU_ASSERT(1 == ud.header_cb_called);
 
   item = nghttp2_session_get_next_ob_item(session);
@@ -7648,7 +7757,7 @@ void test_nghttp2_session_cancel_reserved_remote(void) {
   nghttp2_stream *stream;
   nghttp2_frame frame;
   nghttp2_nv *nva;
-  ssize_t nvlen;
+  size_t nvlen;
   nghttp2_hd_deflater deflater;
   nghttp2_mem *mem;
   nghttp2_bufs bufs;
@@ -7688,7 +7797,7 @@ void test_nghttp2_session_cancel_reserved_remote(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   /* stream is not dangling, so assign NULL */
   stream = NULL;
@@ -7716,7 +7825,7 @@ void test_nghttp2_session_cancel_reserved_remote(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(1 == nghttp2_outbound_queue_size(&session->ob_reg));
 
@@ -7856,7 +7965,7 @@ void test_nghttp2_session_on_begin_headers_temporal_failure(void) {
   ud.frame_recv_cb_called = 0;
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_bufs_len(&bufs));
-  CU_ASSERT(nghttp2_bufs_len(&bufs) == rv);
+  CU_ASSERT((ssize_t)nghttp2_bufs_len(&bufs) == rv);
   CU_ASSERT(0 == ud.header_cb_called);
   CU_ASSERT(0 == ud.frame_recv_cb_called);
 
@@ -7884,7 +7993,7 @@ void test_nghttp2_session_on_begin_headers_temporal_failure(void) {
   ud.frame_recv_cb_called = 0;
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_bufs_len(&bufs));
-  CU_ASSERT(nghttp2_bufs_len(&bufs) == rv);
+  CU_ASSERT((ssize_t)nghttp2_bufs_len(&bufs) == rv);
   CU_ASSERT(0 == ud.header_cb_called);
   CU_ASSERT(0 == ud.frame_recv_cb_called);
 
@@ -7981,6 +8090,76 @@ void test_nghttp2_session_detach_item_from_closed_stream(void) {
   nghttp2_session_del(session);
 }
 
+void test_nghttp2_session_flooding(void) {
+  nghttp2_session *session;
+  nghttp2_session_callbacks callbacks;
+  nghttp2_bufs bufs;
+  nghttp2_buf *buf;
+  nghttp2_frame frame;
+  nghttp2_mem *mem;
+
+  mem = nghttp2_mem_default();
+
+  frame_pack_bufs_init(&bufs);
+
+  memset(&callbacks, 0, sizeof(callbacks));
+
+  /* PING ACK */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+
+  nghttp2_frame_ping_init(&frame.ping, NGHTTP2_FLAG_NONE, NULL);
+  nghttp2_frame_pack_ping(&bufs, &frame.ping);
+  nghttp2_frame_ping_free(&frame.ping);
+
+  buf = &bufs.head->buf;
+
+  for (int i = 0; i < NGHTTP2_MAX_OBQ_FLOOD_ITEM; ++i) {
+    CU_ASSERT(
+        (ssize_t)nghttp2_buf_len(buf) ==
+        nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf)));
+  }
+
+  CU_ASSERT(1 == nghttp2_session_want_read(session));
+  CU_ASSERT(1 == nghttp2_session_want_write(session));
+
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) ==
+            nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf)));
+
+  CU_ASSERT(0 == nghttp2_session_want_read(session));
+  CU_ASSERT(0 == nghttp2_session_want_write(session));
+
+  nghttp2_session_del(session);
+
+  /* SETTINGS ACK */
+  nghttp2_bufs_reset(&bufs);
+
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+
+  nghttp2_frame_settings_init(&frame.settings, NGHTTP2_FLAG_NONE, NULL, 0);
+  nghttp2_frame_pack_settings(&bufs, &frame.settings);
+  nghttp2_frame_settings_free(&frame.settings, mem);
+
+  buf = &bufs.head->buf;
+
+  for (int i = 0; i < NGHTTP2_MAX_OBQ_FLOOD_ITEM; ++i) {
+    CU_ASSERT(
+        (ssize_t)nghttp2_buf_len(buf) ==
+        nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf)));
+  }
+
+  CU_ASSERT(1 == nghttp2_session_want_read(session));
+  CU_ASSERT(1 == nghttp2_session_want_write(session));
+
+  CU_ASSERT((ssize_t)nghttp2_buf_len(buf) ==
+            nghttp2_session_mem_recv(session, buf->pos, nghttp2_buf_len(buf)));
+
+  CU_ASSERT(0 == nghttp2_session_want_read(session));
+  CU_ASSERT(0 == nghttp2_session_want_write(session));
+
+  nghttp2_session_del(session);
+  nghttp2_bufs_free(&bufs);
+}
+
 static void check_nghttp2_http_recv_headers_fail(
     nghttp2_session *session, nghttp2_hd_deflater *deflater, int32_t stream_id,
     int stream_state, const nghttp2_nv *nva, size_t nvlen) {
@@ -7997,7 +8176,8 @@ static void check_nghttp2_http_recv_headers_fail(
 
   if (stream_state != -1) {
     nghttp2_session_open_stream(session, stream_id, NGHTTP2_STREAM_FLAG_NONE,
-                                &pri_spec_default, stream_state, NULL);
+                                &pri_spec_default,
+                                (nghttp2_stream_state)stream_state, NULL);
   }
 
   rv = pack_headers(&bufs, deflater, stream_id, NGHTTP2_FLAG_END_HEADERS, nva,
@@ -8009,7 +8189,7 @@ static void check_nghttp2_http_recv_headers_fail(
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -8036,7 +8216,8 @@ static void check_nghttp2_http_recv_headers_ok(
 
   if (stream_state != -1) {
     nghttp2_session_open_stream(session, stream_id, NGHTTP2_STREAM_FLAG_NONE,
-                                &pri_spec_default, stream_state, NULL);
+                                &pri_spec_default,
+                                (nghttp2_stream_state)stream_state, NULL);
   }
 
   rv = pack_headers(&bufs, deflater, stream_id, NGHTTP2_FLAG_END_HEADERS, nva,
@@ -8048,7 +8229,7 @@ static void check_nghttp2_http_recv_headers_ok(
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
   CU_ASSERT(1 == ud->frame_recv_cb_called);
 
@@ -8290,7 +8471,7 @@ void test_nghttp2_http_content_length(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
   CU_ASSERT(9000000000LL == stream->content_length);
   CU_ASSERT(200 == stream->status_code);
@@ -8313,7 +8494,7 @@ void test_nghttp2_http_content_length(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   stream = nghttp2_session_get_stream(session, 1);
 
@@ -8360,7 +8541,7 @@ void test_nghttp2_http_content_length_mismatch(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
   CU_ASSERT(NGHTTP2_RST_STREAM == item->frame.hd.type);
@@ -8381,7 +8562,7 @@ void test_nghttp2_http_content_length_mismatch(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
   CU_ASSERT(NGHTTP2_RST_STREAM == item->frame.hd.type);
@@ -8402,7 +8583,7 @@ void test_nghttp2_http_content_length_mismatch(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
   CU_ASSERT(NGHTTP2_RST_STREAM == item->frame.hd.type);
@@ -8453,7 +8634,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
   CU_ASSERT(NGHTTP2_RST_STREAM == item->frame.hd.type);
@@ -8477,7 +8658,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
   CU_ASSERT(NGHTTP2_RST_STREAM == item->frame.hd.type);
@@ -8502,7 +8683,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8524,7 +8705,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -8545,7 +8726,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   nghttp2_bufs_reset(&bufs);
 
@@ -8556,7 +8737,7 @@ void test_nghttp2_http_non_final_response(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8599,7 +8780,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   nghttp2_bufs_reset(&bufs);
 
@@ -8611,7 +8792,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8625,7 +8806,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   nghttp2_bufs_reset(&bufs);
 
@@ -8636,7 +8817,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -8654,7 +8835,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   nghttp2_bufs_reset(&bufs);
 
@@ -8665,7 +8846,7 @@ void test_nghttp2_http_trailer_headers(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 
@@ -8698,7 +8879,7 @@ void test_nghttp2_http_ignore_regular_header(void) {
   const nghttp2_nv bad_ansnv[] = {
       MAKE_NV(":authority", "localhost"), MAKE_NV(":scheme", "https"),
       MAKE_NV(":path", "/"), MAKE_NV(":method", "GET"), MAKE_NV("bar", "buzz")};
-  ssize_t proclen;
+  size_t proclen;
   size_t i;
 
   mem = nghttp2_mem_default();
@@ -8723,7 +8904,7 @@ void test_nghttp2_http_ignore_regular_header(void) {
     rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos + proclen,
                                   nghttp2_buf_len(&bufs.head->buf) - proclen);
     CU_ASSERT_FATAL(rv > 0);
-    proclen += rv;
+    proclen += (size_t)rv;
     CU_ASSERT(nghttp2_nv_equal(&bad_ansnv[i], &ud.nv));
   }
 
@@ -8733,7 +8914,7 @@ void test_nghttp2_http_ignore_regular_header(void) {
   /* header field "foo" must be ignored because it has illegal value.
      So we have "bar" header field for 5th header. */
   CU_ASSERT(nghttp2_nv_equal(&bad_ansnv[4], &ud.nv));
-  proclen += rv;
+  proclen += (size_t)rv;
 
   CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == proclen);
 
@@ -8778,7 +8959,7 @@ void test_nghttp2_http_ignore_content_length(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8800,7 +8981,7 @@ void test_nghttp2_http_ignore_content_length(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8853,7 +9034,7 @@ void test_nghttp2_http_record_request_method(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT((NGHTTP2_HTTP_FLAG_METH_CONNECT & stream->http_flags) > 0);
   CU_ASSERT(-1 == stream->content_length);
@@ -8895,7 +9076,7 @@ void test_nghttp2_http_push_promise(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8912,7 +9093,7 @@ void test_nghttp2_http_push_promise(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   CU_ASSERT(NULL == nghttp2_session_get_next_ob_item(session));
 
@@ -8929,7 +9110,7 @@ void test_nghttp2_http_push_promise(void) {
   rv = nghttp2_session_mem_recv(session, bufs.head->buf.pos,
                                 nghttp2_buf_len(&bufs.head->buf));
 
-  CU_ASSERT(nghttp2_buf_len(&bufs.head->buf) == rv);
+  CU_ASSERT((ssize_t)nghttp2_buf_len(&bufs.head->buf) == rv);
 
   item = nghttp2_session_get_next_ob_item(session);
 

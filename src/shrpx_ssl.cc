@@ -88,6 +88,8 @@ int verify_callback(int preverify_ok, X509_STORE_CTX *ctx) {
 }
 } // namespace
 
+// This function is meant be called from master process, hence the
+// call exit(3).
 std::vector<unsigned char>
 set_alpn_prefs(const std::vector<std::string> &protos) {
   size_t len = 0;
@@ -95,7 +97,7 @@ set_alpn_prefs(const std::vector<std::string> &protos) {
   for (const auto &proto : protos) {
     if (proto.size() > 255) {
       LOG(FATAL) << "Too long ALPN identifier: " << proto.size();
-      DIE();
+      exit(EXIT_FAILURE);
     }
 
     len += 1 + proto.size();
@@ -103,7 +105,7 @@ set_alpn_prefs(const std::vector<std::string> &protos) {
 
   if (len > (1 << 16) - 1) {
     LOG(FATAL) << "Too long ALPN identifier list: " << len;
-    DIE();
+    exit(EXIT_FAILURE);
   }
 
   auto out = std::vector<unsigned char>(len);
@@ -151,6 +153,7 @@ int servername_callback(SSL *ssl, int *al, void *arg) {
 }
 } // namespace
 
+#ifndef OPENSSL_IS_BORINGSSL
 namespace {
 std::shared_ptr<std::vector<uint8_t>>
 get_ocsp_data(TLSContextData *tls_ctx_data) {
@@ -185,6 +188,7 @@ int ocsp_resp_cb(SSL *ssl, void *arg) {
   return SSL_TLSEXT_ERR_OK;
 }
 } // namespace
+#endif // OPENSSL_IS_BORINGSSL
 
 constexpr char MEMCACHED_SESSION_CACHE_KEY_PREFIX[] =
     "nghttpx:tls-session-cache:";
@@ -454,8 +458,12 @@ long int create_tls_proto_mask(const std::vector<std::string> &tls_proto_list) {
   return res;
 }
 
-SSL_CTX *create_ssl_context(const char *private_key_file,
-                            const char *cert_file) {
+SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file
+#ifdef HAVE_NEVERBLEED
+                            ,
+                            neverbleed_t *nb
+#endif // HAVE_NEVERBLEED
+                            ) {
   auto ssl_ctx = SSL_CTX_new(SSLv23_server_method());
   if (!ssl_ctx) {
     LOG(FATAL) << ERR_error_string(ERR_get_error(), nullptr);
@@ -541,12 +549,22 @@ SSL_CTX *create_ssl_context(const char *private_key_file,
     SSL_CTX_set_default_passwd_cb(ssl_ctx, ssl_pem_passwd_cb);
     SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, (void *)get_config());
   }
+
+#ifndef HAVE_NEVERBLEED
   if (SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key_file,
                                   SSL_FILETYPE_PEM) != 1) {
     LOG(FATAL) << "SSL_CTX_use_PrivateKey_file failed: "
                << ERR_error_string(ERR_get_error(), nullptr);
+  }
+#else  // HAVE_NEVERBLEED
+  std::array<char, NEVERBLEED_ERRBUF_SIZE> errbuf;
+  if (neverbleed_load_private_key_file(nb, ssl_ctx, private_key_file,
+                                       errbuf.data()) != 1) {
+    LOG(FATAL) << "neverbleed_load_private_key_file failed: " << errbuf.data();
     DIE();
   }
+#endif // HAVE_NEVERBLEED
+
   if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_file) != 1) {
     LOG(FATAL) << "SSL_CTX_use_certificate_file failed: "
                << ERR_error_string(ERR_get_error(), nullptr);
@@ -588,7 +606,9 @@ SSL_CTX *create_ssl_context(const char *private_key_file,
   }
   SSL_CTX_set_tlsext_servername_callback(ssl_ctx, servername_callback);
   SSL_CTX_set_tlsext_ticket_key_cb(ssl_ctx, ticket_key_cb);
+#ifndef OPENSSL_IS_BORINGSSL
   SSL_CTX_set_tlsext_status_cb(ssl_ctx, ocsp_resp_cb);
+#endif // OPENSSL_IS_BORINGSSL
   SSL_CTX_set_info_callback(ssl_ctx, info_callback);
 
   // NPN advertisement
@@ -619,7 +639,11 @@ int select_next_proto_cb(SSL *ssl, unsigned char **out, unsigned char *outlen,
 }
 } // namespace
 
-SSL_CTX *create_ssl_client_context() {
+SSL_CTX *create_ssl_client_context(
+#ifdef HAVE_NEVERBLEED
+    neverbleed_t *nb
+#endif // HAVE_NEVERBLEED
+    ) {
   auto ssl_ctx = SSL_CTX_new(SSLv23_client_method());
   if (!ssl_ctx) {
     LOG(FATAL) << ERR_error_string(ERR_get_error(), nullptr);
@@ -665,6 +689,7 @@ SSL_CTX *create_ssl_client_context() {
   }
 
   if (get_config()->client_private_key_file) {
+#ifndef HAVE_NEVERBLEED
     if (SSL_CTX_use_PrivateKey_file(ssl_ctx,
                                     get_config()->client_private_key_file.get(),
                                     SSL_FILETYPE_PEM) != 1) {
@@ -673,6 +698,16 @@ SSL_CTX *create_ssl_client_context() {
                  << ERR_error_string(ERR_get_error(), nullptr);
       DIE();
     }
+#else  // HAVE_NEVERBLEED
+    std::array<char, NEVERBLEED_ERRBUF_SIZE> errbuf;
+    if (neverbleed_load_private_key_file(
+            nb, ssl_ctx, get_config()->client_private_key_file.get(),
+            errbuf.data()) != 1) {
+      LOG(FATAL) << "neverbleed_load_private_key_file failed: "
+                 << errbuf.data();
+      DIE();
+    }
+#endif // HAVE_NEVERBLEED
   }
   if (get_config()->client_cert_file) {
     if (SSL_CTX_use_certificate_chain_file(
@@ -721,11 +756,11 @@ ClientHandler *accept_connection(Worker *worker, int fd, sockaddr *addr,
     return nullptr;
   }
 
-  int val = 1;
-  rv = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&val),
-                  sizeof(val));
-  if (rv == -1) {
-    LOG(WARN) << "Setting option TCP_NODELAY failed: errno=" << errno;
+  if (addr->sa_family != AF_UNIX) {
+    rv = util::make_socket_nodelay(fd);
+    if (rv == -1) {
+      LOG(WARN) << "Setting option TCP_NODELAY failed: errno=" << errno;
+    }
   }
   SSL *ssl = nullptr;
   auto ssl_ctx = worker->get_sv_ssl_ctx();
@@ -1094,13 +1129,23 @@ bool in_proto_list(const std::vector<std::string> &protos,
 }
 
 SSL_CTX *setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
-                                  CertLookupTree *cert_tree) {
+                                  CertLookupTree *cert_tree
+#ifdef HAVE_NEVERBLEED
+                                  ,
+                                  neverbleed_t *nb
+#endif // HAVE_NEVERBLEED
+                                  ) {
   if (get_config()->upstream_no_tls) {
     return nullptr;
   }
 
   auto ssl_ctx = ssl::create_ssl_context(get_config()->private_key_file.get(),
-                                         get_config()->cert_file.get());
+                                         get_config()->cert_file.get()
+#ifdef HAVE_NEVERBLEED
+                                         ,
+                                         nb
+#endif // HAVE_NEVERBLEED
+                                         );
 
   all_ssl_ctx.push_back(ssl_ctx);
 
@@ -1116,7 +1161,12 @@ SSL_CTX *setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
 
   for (auto &keycert : get_config()->subcerts) {
     auto ssl_ctx =
-        ssl::create_ssl_context(keycert.first.c_str(), keycert.second.c_str());
+        ssl::create_ssl_context(keycert.first.c_str(), keycert.second.c_str()
+#ifdef HAVE_NEVERBLEED
+                                ,
+                                nb
+#endif // HAVE_NEVERBLEED
+                                );
     all_ssl_ctx.push_back(ssl_ctx);
     if (ssl::cert_lookup_tree_add_cert_from_file(
             cert_tree, ssl_ctx, keycert.second.c_str()) == -1) {
@@ -1134,15 +1184,28 @@ SSL_CTX *setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
   return ssl_ctx;
 }
 
-SSL_CTX *setup_client_ssl_context() {
+bool downstream_tls_enabled() {
   if (get_config()->client_mode) {
-    return get_config()->downstream_no_tls ? nullptr
-                                           : ssl::create_ssl_client_context();
+    return !get_config()->downstream_no_tls;
   }
 
-  return get_config()->http2_bridge && !get_config()->downstream_no_tls
-             ? ssl::create_ssl_client_context()
-             : nullptr;
+  return get_config()->http2_bridge && !get_config()->downstream_no_tls;
+}
+
+SSL_CTX *setup_client_ssl_context(
+#ifdef HAVE_NEVERBLEED
+    neverbleed_t *nb
+#endif // HAVE_NEVERBLEED
+    ) {
+  if (!downstream_tls_enabled()) {
+    return nullptr;
+  }
+
+  return ssl::create_ssl_client_context(
+#ifdef HAVE_NEVERBLEED
+      nb
+#endif // HAVE_NEVERBLEED
+      );
 }
 
 CertLookupTree *create_cert_lookup_tree() {

@@ -146,7 +146,14 @@ int shrpx_bio_write(BIO *b, const char *buf, int len) {
   if (conn->tls.initial_handshake_done) {
     // After handshake finished, send |buf| of length |len| to the
     // socket directly.
-    assert(wbuf.rleft() == 0);
+
+    // Only when TLS session was prematurely ended before server sent
+    // all handshake message, this condition is true.  This could be
+    // alert from SSL_shutdown().  Since connection is already down,
+    // just return error.
+    if (wbuf.rleft()) {
+      return -1;
+    }
     auto nwrite = conn->write_clear(buf, len);
     if (nwrite < 0) {
       return -1;
@@ -531,11 +538,7 @@ ssize_t Connection::write_tls(const void *data, size_t len) {
 
   auto rv = SSL_write(tls.ssl, data, len);
 
-  if (rv == 0) {
-    return SHRPX_ERR_NETWORK;
-  }
-
-  if (rv < 0) {
+  if (rv <= 0) {
     auto err = SSL_get_error(tls.ssl, rv);
     switch (err) {
     case SSL_ERROR_WANT_READ:

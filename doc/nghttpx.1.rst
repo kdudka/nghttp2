@@ -137,6 +137,10 @@ Connections
     be     specified    by     :option:`--backend-read-timeout`    and
     :option:`--backend-write-timeout` options.
 
+.. option:: --accept-proxy-protocol
+
+    Accept PROXY protocol version 1 on frontend connection.
+
 
 Performance
 ~~~~~~~~~~~
@@ -904,6 +908,18 @@ SIGUSR2
   path with same command-line arguments and environment variables.
   After new process comes up, sending SIGQUIT to the original process
   to perform hot swapping.
+
+.. note::
+
+  nghttpx consists of 2 processes: one process for processing these
+  signals, and another one for processing requests.  The former spawns
+  the latter.  The former is called master process, and the latter is
+  called worker process.  The above signal must be sent to the master
+  process.  If the worker process receives one of them, it is ignored.
+  This behaviour of worker process may change in the future release.
+  In other words, in the future release, worker process may terminate
+  upon the reception of these signals.  Therefore these signals should
+  not be sent to the worker process.
 
 SERVER PUSH
 -----------

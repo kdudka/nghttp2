@@ -50,6 +50,7 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include "shrpx_router.h"
 #include "template.h"
 
 using namespace nghttp2;
@@ -185,6 +186,7 @@ constexpr char SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL[] =
     "tls-ticket-key-memcached-max-fail";
 constexpr char SHRPX_OPT_REQUEST_PHASE_FILE[] = "request-phase-file";
 constexpr char SHRPX_OPT_RESPONSE_PHASE_FILE[] = "response-phase-file";
+constexpr char SHRPX_OPT_ACCEPT_PROXY_PROTOCOL[] = "accept-proxy-protocol";
 
 union sockaddr_union {
   sockaddr_storage storage;
@@ -228,8 +230,13 @@ struct DownstreamAddr {
 };
 
 struct DownstreamAddrGroup {
-  DownstreamAddrGroup(std::string pattern) : pattern(std::move(pattern)) {}
-  std::string pattern;
+  DownstreamAddrGroup(const std::string &pattern) : pattern(strcopy(pattern)) {}
+  DownstreamAddrGroup(const DownstreamAddrGroup &other);
+  DownstreamAddrGroup(DownstreamAddrGroup &&) = default;
+  DownstreamAddrGroup &operator=(const DownstreamAddrGroup &other);
+  DownstreamAddrGroup &operator=(DownstreamAddrGroup &&) = default;
+
+  std::unique_ptr<char[]> pattern;
   std::vector<DownstreamAddr> addrs;
 };
 
@@ -271,6 +278,7 @@ struct Config {
   Address downstream_http_proxy_addr;
   Address session_cache_memcached_addr;
   Address tls_ticket_key_memcached_addr;
+  Router router;
   std::chrono::seconds tls_session_timeout;
   ev_tstamp http2_upstream_read_timeout;
   ev_tstamp upstream_read_timeout;
@@ -326,6 +334,7 @@ struct Config {
   nghttp2_option *http2_client_option;
   const EVP_CIPHER *tls_ticket_key_cipher;
   const char *server_name;
+  char **original_argv;
   char **argv;
   char *cwd;
   size_t num_worker;
@@ -409,6 +418,7 @@ struct Config {
   bool no_ocsp;
   // true if --tls-ticket-key-cipher is used
   bool tls_ticket_key_cipher_given;
+  bool accept_proxy_protocol;
 };
 
 const Config *get_config();
@@ -431,20 +441,6 @@ int load_config(const char *filename, std::set<std::string> &include_set);
 // Read passwd from |filename|
 std::string read_passwd_from_file(const char *filename);
 
-template <typename T> using Range = std::pair<T, T>;
-
-// Parses delimited strings in |s| and returns the array of substring,
-// delimited by |delim|.  The any white spaces around substring are
-// treated as a part of substring.
-std::vector<std::string> parse_config_str_list(const char *s, char delim = ',');
-
-// Parses delimited strings in |s| and returns the array of pointers,
-// each element points to the beginning and one beyond last of
-// substring in |s|.  The delimiter is given by |delim|.  The any
-// white spaces around substring are treated as a part of substring.
-std::vector<Range<const char *>> split_config_str_list(const char *s,
-                                                       char delim);
-
 // Parses header field in |optarg|.  We expect header field is formed
 // like "NAME: VALUE".  We require that NAME is non empty string.  ":"
 // is allowed at the start of the NAME, but NAME == ":" is not
@@ -452,24 +448,6 @@ std::vector<Range<const char *>> split_config_str_list(const char *s,
 std::pair<std::string, std::string> parse_header(const char *optarg);
 
 std::vector<LogFragment> parse_log_format(const char *optarg);
-
-// Returns a copy of NULL-terminated string [first, last).
-template <typename InputIt>
-std::unique_ptr<char[]> strcopy(InputIt first, InputIt last) {
-  auto res = make_unique<char[]>(last - first + 1);
-  *std::copy(first, last, res.get()) = '\0';
-  return res;
-}
-
-// Returns a copy of NULL-terminated string |val|.
-inline std::unique_ptr<char[]> strcopy(const char *val) {
-  return strcopy(val, val + strlen(val));
-}
-
-// Returns a copy of val.c_str().
-inline std::unique_ptr<char[]> strcopy(const std::string &val) {
-  return strcopy(std::begin(val), std::end(val));
-}
 
 // Returns string for syslog |facility|.
 const char *str_syslog_facility(int facility);
@@ -494,7 +472,7 @@ read_tls_ticket_key_file(const std::vector<std::string> &files,
 // group.  The catch-all group index is given in |catch_all|.  All
 // patterns are given in |groups|.
 size_t match_downstream_addr_group(
-    const std::string &hostport, const std::string &path,
+    const Router &router, const std::string &hostport, const std::string &path,
     const std::vector<DownstreamAddrGroup> &groups, size_t catch_all);
 
 } // namespace shrpx

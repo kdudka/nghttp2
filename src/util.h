@@ -58,6 +58,9 @@ constexpr const char NGHTTP2_H2_16[] = "h2-16";
 constexpr const char NGHTTP2_H2_14_ALPN[] = "\x5h2-14";
 constexpr const char NGHTTP2_H2_14[] = "h2-14";
 
+constexpr const char NGHTTP2_H1_1_ALPN[] = "\x8http/1.1";
+constexpr const char NGHTTP2_H1_1[] = "http/1.1";
+
 namespace util {
 
 extern const char DEFAULT_STRIP_CHARSET[];
@@ -158,11 +161,15 @@ std::string joinPath(InputIterator first, InputIterator last) {
   return strjoin(elements.begin(), elements.end(), "/");
 }
 
-bool isAlpha(const char c);
+inline bool isAlpha(const char c) {
+  return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z');
+}
 
-bool isDigit(const char c);
+inline bool isDigit(const char c) { return '0' <= c && c <= '9'; }
 
-bool isHexDigit(const char c);
+inline bool isHexDigit(const char c) {
+  return isDigit(c) || ('A' <= c && c <= 'F') || ('a' <= c && c <= 'f');
+}
 
 bool inRFC3986UnreservedChars(const char c);
 
@@ -512,6 +519,8 @@ void write_uri_field(std::ostream &o, const char *uri, const http_parser_url &u,
 
 bool numeric_host(const char *hostname);
 
+bool numeric_host(const char *hostname, int family);
+
 // Returns numeric address string of |addr|.  If getnameinfo() is
 // failed, "unknown" is returned.
 std::string numeric_name(const struct sockaddr *sa, socklen_t salen);
@@ -566,9 +575,29 @@ bool check_h2_is_selected(const unsigned char *alpn, size_t len);
 bool select_h2(const unsigned char **out, unsigned char *outlen,
                const unsigned char *in, unsigned int inlen);
 
+// Selects protocol ALPN ID if one of identifiers contained in |protolist| is
+// present in |in| of length inlen.  Returns true if identifier is
+// selected.
+bool select_protocol(const unsigned char **out, unsigned char *outlen,
+               const unsigned char *in, unsigned int inlen, std::vector<std::string> proto_list);
+
 // Returns default ALPN protocol list, which only contains supported
 // HTTP/2 protocol identifier.
 std::vector<unsigned char> get_default_alpn();
+
+template <typename T> using Range = std::pair<T, T>;
+
+// Parses delimited strings in |s| and returns the array of substring,
+// delimited by |delim|.  The any white spaces around substring are
+// treated as a part of substring.
+std::vector<std::string> parse_config_str_list(const char *s, char delim = ',');
+
+// Parses delimited strings in |s| and returns the array of pointers,
+// each element points to the beginning and one beyond last of
+// substring in |s|.  The delimiter is given by |delim|.  The any
+// white spaces around substring are treated as a part of substring.
+std::vector<Range<const char *>> split_config_str_list(const char *s,
+                                                       char delim);
 
 // Returns given time |tp| in Common Log format (e.g.,
 // 03/Jul/2014:00:19:38 +0900)
@@ -586,6 +615,13 @@ template <typename T> std::string format_iso8601(const T &tp) {
   auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
       tp.time_since_epoch());
   return iso8601_date(t.count());
+}
+
+// Returns given time |tp| in HTTP date format.
+template <typename T> std::string format_http_date(const T &tp) {
+  auto t =
+      std::chrono::duration_cast<std::chrono::seconds>(tp.time_since_epoch());
+  return http_date(t.count());
 }
 
 // Return the system precision of the template parameter |Clock| as

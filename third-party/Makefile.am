@@ -30,6 +30,11 @@ libhttp_parser_la_SOURCES = \
 	http-parser/http_parser.c \
 	http-parser/http_parser.h
 
+if HAVE_NEVERBLEED
+noinst_LTLIBRARIES += libneverbleed.la
+libneverbleed_la_SOURCES = neverbleed/neverbleed.c neverbleed/neverbleed.h
+endif # HAVE_NEVERBLEED
+
 if HAVE_MRUBY
 
 EXTRA_DIST = build_config.rb mruby/*
@@ -39,7 +44,10 @@ EXTRA_DIST = build_config.rb mruby/*
 mruby:
 	MRUBY_CONFIG="${srcdir}/build_config.rb" \
 	BUILD_DIR="${abs_builddir}/mruby/build" \
+	INSTALL_DIR="${abs_builddir}/mruby/build/install/bin" \
 	CC="${CC}" CXX="${CXX}" LD="${LD}" \
+	CFLAGS="${CPPFLAGS} ${CFLAGS}" CXXFLAGS="${CPPFLAGS} ${CXXFLAGS}" \
+	LDFLAGS="${LDFLAGS}" \
 	"${srcdir}/mruby/minirake" -f "${srcdir}/mruby/Rakefile"
 
 all-local: mruby

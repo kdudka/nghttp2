@@ -277,6 +277,7 @@ int main(int argc _U_, char *argv[] _U_) {
                    test_nghttp2_session_defer_then_close) ||
       !CU_add_test(pSuite, "session_detach_item_from_closed_stream",
                    test_nghttp2_session_detach_item_from_closed_stream) ||
+      !CU_add_test(pSuite, "session_flooding", test_nghttp2_session_flooding) ||
       !CU_add_test(pSuite, "http_mandatory_headers",
                    test_nghttp2_http_mandatory_headers) ||
       !CU_add_test(pSuite, "http_content_length",
@@ -377,7 +378,7 @@ int main(int argc _U_, char *argv[] _U_) {
   num_tests_failed = CU_get_number_of_tests_failed();
   CU_cleanup_registry();
   if (CU_get_error() == CUE_SUCCESS) {
-    return num_tests_failed;
+    return (int)num_tests_failed;
   } else {
     printf("CUnit Error: %s\n", CU_get_error_msg());
     return CU_get_error();

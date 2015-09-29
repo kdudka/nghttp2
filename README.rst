@@ -121,7 +121,17 @@ directory.  Currently, mruby support for nghttpx is disabled by
 default.  To enable mruby support, use ``--with-mruby`` configure
 option.  Note that at the time of this writing, libmruby-dev and mruby
 packages in Debian/Ubuntu are not usable for nghttp2, since they do
-not enable C++ ABI.
+not enable C++ ABI.  To build mruby, the following packages are
+required:
+
+* ruby
+* bison
+
+nghttpx supports `neverbleed <https://github.com/h2o/neverbleed>`_,
+privilege separation engine for OpenSSL / LibreSSL.  In short, it
+minimizes the risk of private key leakage when serious bug like
+Heartbleed is exploited.  The neverbleed is disabled by default.  To
+enable it, use ``--with-neverbleed`` configure option.
 
 Building from git
 -----------------

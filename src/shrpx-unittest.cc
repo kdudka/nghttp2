@@ -29,8 +29,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <CUnit/Basic.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 // include test cases' include files here
 #include "shrpx_ssl_test.h"
 #include "shrpx_downstream_test.h"
@@ -41,6 +39,7 @@
 #include "buffer_test.h"
 #include "memchunk_test.h"
 #include "shrpx_config.h"
+#include "ssl.h"
 
 static int init_suite1(void) { return 0; }
 
@@ -50,9 +49,7 @@ int main(int argc, char *argv[]) {
   CU_pSuite pSuite = NULL;
   unsigned int num_tests_failed;
 
-  OpenSSL_add_all_algorithms();
-  SSL_load_error_strings();
-  SSL_library_init();
+  nghttp2::ssl::libssl_init();
 
   shrpx::create_config();
 
@@ -118,8 +115,6 @@ int main(int argc, char *argv[]) {
                    shrpx::test_downstream_assemble_request_cookie) ||
       !CU_add_test(pSuite, "downstream_rewrite_location_response_header",
                    shrpx::test_downstream_rewrite_location_response_header) ||
-      !CU_add_test(pSuite, "config_parse_config_str_list",
-                   shrpx::test_shrpx_config_parse_config_str_list) ||
       !CU_add_test(pSuite, "config_parse_header",
                    shrpx::test_shrpx_config_parse_header) ||
       !CU_add_test(pSuite, "config_parse_log_format",
@@ -169,6 +164,8 @@ int main(int argc, char *argv[]) {
       !CU_add_test(pSuite, "util_localtime_date",
                    shrpx::test_util_localtime_date) ||
       !CU_add_test(pSuite, "util_get_uint64", shrpx::test_util_get_uint64) ||
+      !CU_add_test(pSuite, "util_parse_config_str_list",
+                   shrpx::test_util_parse_config_str_list) ||
       !CU_add_test(pSuite, "gzip_inflate", test_nghttp2_gzip_inflate) ||
       !CU_add_test(pSuite, "buffer_write", nghttp2::test_buffer_write) ||
       !CU_add_test(pSuite, "pool_recycle", nghttp2::test_pool_recycle) ||

@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -203,8 +204,20 @@ func (st *serverTester) Close() {
 		st.conn.Close()
 	}
 	if st.cmd != nil {
-		st.cmd.Process.Kill()
-		st.cmd.Wait()
+		done := make(chan struct{})
+		go func() {
+			st.cmd.Wait()
+			done <- struct{}{}
+		}()
+
+		st.cmd.Process.Signal(syscall.SIGQUIT)
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			st.cmd.Process.Kill()
+			<-done
+		}
 	}
 	if st.ts != nil {
 		st.ts.Close()
