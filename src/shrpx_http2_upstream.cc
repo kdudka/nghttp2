@@ -679,17 +679,18 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
     // Http2Upstream::remove_downstream().
     upstream->set_pending_data_downstream(downstream, length - nwrite);
   }
-
   if (wb->rleft() == 0) {
     downstream->disable_upstream_wtimer();
   } else {
     downstream->reset_upstream_wtimer();
   }
 
-  if (length > 0 && downstream->resume_read(SHRPX_NO_BUFFER, length) != 0) {
+  if (nwrite > 0 && downstream->resume_read(SHRPX_NO_BUFFER, nwrite) != 0) {
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
 
+  // We have to add length here, so that we can log this amount of
+  // data transferred.
   if (length > 0) {
     downstream->add_response_sent_bodylen(length);
   }
@@ -938,16 +939,23 @@ int Http2Upstream::on_write() {
 
       data_pending_ = nullptr;
     } else {
-      auto n = std::min(wb_.wleft(), data_pendinglen_);
+      auto nwrite = std::min(wb_.wleft(), data_pendinglen_);
       DefaultMemchunks *body;
       if (pending_data_downstream_) {
         body = pending_data_downstream_->get_response_buf();
       } else {
         body = &pending_response_buf_;
       }
-      body->remove(wb_.last, n);
-      wb_.write(n);
-      data_pendinglen_ -= n;
+      body->remove(wb_.last, nwrite);
+      wb_.write(nwrite);
+      data_pendinglen_ -= nwrite;
+
+      if (pending_data_downstream_ && nwrite > 0) {
+        if (pending_data_downstream_->resume_read(SHRPX_NO_BUFFER, nwrite) !=
+            0) {
+          return -1;
+        }
+      }
 
       if (data_pendinglen_ > 0) {
         return 0;
