@@ -74,8 +74,8 @@ namespace h2load {
 Config::Config()
     : data_length(-1), addrs(nullptr), nreqs(1), nclients(1), nthreads(1),
       max_concurrent_streams(-1), window_bits(30), connection_window_bits(30),
-      rate(0), rate_period(1.0), conn_active_timeout(0),
-      conn_inactivity_timeout(0), no_tls_proto(PROTO_HTTP2), data_fd(-1),
+      rate(0), rate_period(1.0), conn_active_timeout(0.),
+      conn_inactivity_timeout(0.), no_tls_proto(PROTO_HTTP2), data_fd(-1),
       port(0), default_port(0), verbose(false), timing_script(false) {}
 
 Config::~Config() {
@@ -296,7 +296,7 @@ int Client::connect() {
 
   record_start_time(&worker->stats);
 
-  if (worker->config->conn_inactivity_timeout > 0) {
+  if (worker->config->conn_inactivity_timeout > 0.) {
     ev_timer_again(worker->loop, &conn_inactivity_watcher);
   }
 
@@ -342,7 +342,7 @@ void Client::timeout() {
 }
 
 void Client::restart_timeout() {
-  if (worker->config->conn_inactivity_timeout > 0) {
+  if (worker->config->conn_inactivity_timeout > 0.) {
     ev_timer_again(worker->loop, &conn_inactivity_watcher);
   }
 }
@@ -395,7 +395,7 @@ void Client::submit_request() {
 
   // if an active timeout is set and this is the last request to be submitted
   // on this connection, start the active timeout.
-  if (worker->config->conn_active_timeout > 0 && req_started >= req_todo) {
+  if (worker->config->conn_active_timeout > 0. && req_started >= req_todo) {
     ev_timer_start(worker->loop, &conn_active_watcher);
   }
 }
@@ -1261,7 +1261,7 @@ std::unique_ptr<Worker> create_worker(uint32_t id, SSL_CTX *ssl_ctx,
   std::stringstream rate_report;
   if (config.is_rate_mode() && nclients > rate) {
     rate_report << "Up to " << rate << " client(s) will be created every "
-                << std::setprecision(3) << config.rate_period << " seconds. ";
+                << util::duration_str(config.rate_period) << " ";
   }
 
   std::cout << "spawning thread #" << id << ": " << nclients
@@ -1379,26 +1379,26 @@ Options:
               will run  as it  normally does, creating  connections at
               whatever variable rate it  wants.  The default value for
               this option is 0.
-  --rate-period=<N>
-              Specifies the time period  between creating connections.
-              The  period  must be a positive  number  greater than or
-              equal to 1.0,  representing the length of  the period in
-              seconds.  This option is  ignored if the rate  option is
-              not used. The default value for this option is 1.0.
-  -T, --connection-active-timeout=<N>
+  --rate-period=<DURATION>
+              Specifies the time  period between creating connections.
+              The period  must be a positive  number, representing the
+              length of the period in time.  This option is ignored if
+              the rate option is not used.  The default value for this
+              option is 1s.
+  -T, --connection-active-timeout=<DURATION>
               Specifies  the maximum  time that  h2load is  willing to
               keep a  connection open,  regardless of the  activity on
-              said  connection.   <N>  must  be  a  positive  integer,
-              specifying  the  number of  seconds  to  wait.  When  no
-              timeout value is set (either active or inactive), h2load
-              will keep a connection  open indefinitely, waiting for a
+              said connection.  <DURATION> must be a positive integer,
+              specifying the amount of time  to wait.  When no timeout
+              value is  set (either  active or inactive),  h2load will
+              keep  a  connection  open indefinitely,  waiting  for  a
               response.
-  -N, --connection-inactivity-timeout=<N>
+  -N, --connection-inactivity-timeout=<DURATION>
               Specifies the amount  of time that h2load  is willing to
-              wait to see activity on a given connection.  <N> must be
-              a positive integer, specifying  the number of seconds to
-              wait.  When  no timeout value  is set (either  active or
-              inactive),   h2load   will   keep  a   connection   open
+              wait to see activity  on a given connection.  <DURATION>
+              must  be a  positive integer,  specifying the  amount of
+              time  to wait.   When no  timeout value  is set  (either
+              active or inactive), h2load  will keep a connection open
               indefinitely, waiting for a response.
   --timing-script-file=<PATH>
               Path of a file containing one or more lines separated by
@@ -1434,7 +1434,14 @@ Options:
   -v, --verbose
               Output debug information.
   --version   Display version information and exit.
-  -h, --help  Display this help and exit.)" << std::endl;
+  -h, --help  Display this help and exit.
+
+--
+
+  The <DURATION> argument is an integer and an optional unit (e.g., 1s
+  is 1 second and 500ms is 500 milliseconds).  Units are h, m, s or ms
+  (hours, minutes, seconds and milliseconds, respectively).  If a unit
+  is omitted, a second is used as unit.)" << std::endl;
 }
 } // namespace
 
@@ -1579,18 +1586,18 @@ int main(int argc, char **argv) {
       }
       break;
     case 'T':
-      config.conn_active_timeout = strtoul(optarg, nullptr, 10);
-      if (config.conn_active_timeout <= 0) {
-        std::cerr << "-T: the conn_active_timeout wait time "
-                  << "must be positive." << std::endl;
+      config.conn_active_timeout = util::parse_duration_with_unit(optarg);
+      if (!std::isfinite(config.conn_active_timeout)) {
+        std::cerr << "-T: bad value for the conn_active_timeout wait time: "
+                  << optarg << std::endl;
         exit(EXIT_FAILURE);
       }
       break;
     case 'N':
-      config.conn_inactivity_timeout = strtoul(optarg, nullptr, 10);
-      if (config.conn_inactivity_timeout <= 0) {
-        std::cerr << "-N: the conn_inactivity_timeout wait time "
-                  << "must be positive." << std::endl;
+      config.conn_inactivity_timeout = util::parse_duration_with_unit(optarg);
+      if (!std::isfinite(config.conn_inactivity_timeout)) {
+        std::cerr << "-N: bad value for the conn_inactivity_timeout wait time: "
+                  << optarg << std::endl;
         exit(EXIT_FAILURE);
       }
       break;
@@ -1629,25 +1636,14 @@ int main(int argc, char **argv) {
         // npn-list option
         config.npn_list = util::parse_config_str_list(optarg);
         break;
-      case 5: {
+      case 5:
         // rate-period
-        const char *start = optarg;
-        char *end;
-        errno = 0;
-        auto v = std::strtod(start, &end);
-
-        if (v < 1.0 || !std::isfinite(v) || end == start || errno != 0) {
-          auto error = errno;
-          std::cerr << "Rate period value error " << optarg << std::endl;
-          if (error != 0) {
-            std::cerr << "\n\t" << strerror(error) << std::endl;
-          }
+        config.rate_period = util::parse_duration_with_unit(optarg);
+        if (!std::isfinite(config.rate_period)) {
+          std::cerr << "--rate-period: value error " << optarg << std::endl;
           exit(EXIT_FAILURE);
         }
-
-        config.rate_period = v;
         break;
-      }
       }
       break;
     default:
