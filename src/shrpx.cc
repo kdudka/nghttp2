@@ -111,7 +111,7 @@ namespace shrpx {
 #define _KERNEL_FASTOPEN
 // conditional define for TCP_FASTOPEN mostly on ubuntu
 #ifndef TCP_FASTOPEN
-#define TCP_FASTOPEN   23
+#define TCP_FASTOPEN 23
 #endif
 
 // conditional define for SOL_TCP mostly on ubuntu
@@ -618,10 +618,10 @@ int create_tcp_server_socket(int family) {
       continue;
     }
 
-    if(get_config()->fastopen > 0) {
+    if (get_config()->fastopen > 0) {
       val = get_config()->fastopen;
       if (setsockopt(fd, SOL_TCP, TCP_FASTOPEN, &val,
-                   static_cast<socklen_t>(sizeof(val))) == -1) {
+                     static_cast<socklen_t>(sizeof(val))) == -1) {
         LOG(WARN) << "Failed to set TCP_FASTOPEN option to listener socket";
       }
     }
@@ -1240,13 +1240,11 @@ Performance:
       << util::utos_with_unit(get_config()->downstream_response_buffer_size)
       << R"(
   --fastopen=<N>
-              enables “TCP Fast Open” for the listening socket 
-              and limits the maximum length for the queue of connections 
-              that have not yet completed the three-way handshake.
-              If value is 0 then fast open is disabled.
-              Default: )"
-      << util::utos_with_unit(get_config()->fastopen)
-      << R"(
+              Enables  "TCP Fast  Open" for  the listening  socket and
+              limits the  maximum length for the  queue of connections
+              that have not yet completed the three-way handshake.  If
+              value is 0 then fast open is disabled.
+              Default: )" << get_config()->fastopen << R"(
 Timeout:
   --frontend-http2-read-timeout=<DURATION>
               Specify  read  timeout  for  HTTP/2  and  SPDY  frontend
@@ -1348,7 +1346,10 @@ SSL/TLS:
               and   TLSv1.0.    The   name   matching   is   done   in
               case-insensitive   manner.    The  parameter   must   be
               delimited by  a single comma  only and any  white spaces
-              are treated as a part of protocol string.
+              are  treated  as a  part  of  protocol string.   If  the
+              protocol list advertised by client does not overlap this
+              list,  you  will  receive  the  error  message  "unknown
+              protocol".
               Default: )" << DEFAULT_TLS_PROTO_LIST << R"(
   --tls-ticket-key-file=<PATH>
               Path to file that contains  random data to construct TLS
