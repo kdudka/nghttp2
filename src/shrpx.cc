@@ -1423,24 +1423,23 @@ SSL/TLS:
               cache.   This  enables   shared  session  cache  between
               multiple nghttpx instances.
   --tls-dyn-rec-warmup-threshold=<SIZE>
-              Specify the threshold  size for  TLS dynamic record size
-              behaviour. During  a  TLS  session,  after the threshold
-              number of bytes have  been  written, the TLS record size
-              will be increased  to the maximum allowed (16K). The max
-              record size will continue  to  be used on the active TLS
-              session. After tls-dyn-rec-idle-timeout has elapsed, the
-              record size  is  reduced  to  1300  bytes.  Specify 0 to
-              always use the maximum  record  size, regardless of idle
-              period.  This  behaviour   applies   to  all  TLS  based
+              Specify the  threshold size for TLS  dynamic record size
+              behaviour.  During  a TLS  session, after  the threshold
+              number of bytes  have been written, the  TLS record size
+              will be increased to the maximum allowed (16K).  The max
+              record size will  continue to be used on  the active TLS
+              session.  After  --tls-dyn-rec-idle-timeout has elapsed,
+              the record size is reduced  to 1300 bytes.  Specify 0 to
+              always use  the maximum record size,  regardless of idle
+              period.   This  behaviour  applies   to  all  TLS  based
               frontends, and TLS HTTP/2 backends.
               Default: )"
-      << util::utos_with_unit(get_config()->tls_dyn_rec_warmup_threshold)
-      << R"(
+      << util::utos_with_unit(get_config()->tls_dyn_rec_warmup_threshold) << R"(
   --tls-dyn-rec-idle-timeout=<DURATION>
-              Specify TLS dynamic record  size  behaviour timeout. See
-              tls-dyn-rec-warmup-threshold  for more information. This
-              behaviour applies to all  TLS  based  frontends, and TLS
-              HTTP/2 backends.
+              Specify TLS dynamic record  size behaviour timeout.  See
+              --tls-dyn-rec-warmup-threshold  for   more  information.
+              This behaviour  applies to all TLS  based frontends, and
+              TLS HTTP/2 backends.
               Default: )"
       << util::duration_str(get_config()->tls_dyn_rec_idle_timeout) << R"(
 
@@ -1645,14 +1644,8 @@ Process:
               be used to drop root privileges.
 
 Scripting:
-  --request-phase-file=<PATH>
-              Set  mruby  script  file  which will  be  executed  when
-              request  header  fields  are  completely  received  from
-              frontend.  This hook is called request phase hook.
-  --response-phase-file=<PATH>
-              Set  mruby  script  file  which will  be  executed  when
-              response  header  fields  are completely  received  from
-              backend.  This hook is called response phase hook.
+  --mruby-file=<PATH>
+              Set mruby script file
 
 Misc:
   --conf=<PATH>
