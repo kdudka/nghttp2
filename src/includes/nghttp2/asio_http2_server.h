@@ -59,6 +59,9 @@ public:
   // Application must not call this directly.
   request_impl &impl() const;
 
+  // Returns the remote endpoint of the request
+  const boost::asio::ip::tcp::endpoint &remote_endpoint() const;
+
 private:
   std::unique_ptr<request_impl> impl_;
 };
@@ -200,6 +203,10 @@ public:
 
   // Join on http2 server and wait for it to fully stop
   void join();
+
+  // Get access to the io_service objects.
+  const std::vector<std::shared_ptr<boost::asio::io_service>> &
+  get_io_services() const;
 
 private:
   std::unique_ptr<http2_impl> impl_;

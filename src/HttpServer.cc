@@ -53,6 +53,7 @@
 #include <deque>
 
 #include <openssl/err.h>
+#include <openssl/dh.h>
 
 #include <zlib.h>
 
@@ -315,15 +316,15 @@ public:
 
     for (auto it = range.first; it != range.second;) {
       auto &ent = (*it).second;
-      if (ent.stale) {
+      if (ent->stale) {
         ++it;
         continue;
       }
-      if (need_validation_file_entry(&ent, now) &&
-          !validate_file_entry(&ent, now)) {
-        if (ent.usecount == 0) {
-          fd_cache_lru_.remove(&ent);
-          close(ent.fd);
+      if (need_validation_file_entry(ent.get(), now) &&
+          !validate_file_entry(ent.get(), now)) {
+        if (ent->usecount == 0) {
+          fd_cache_lru_.remove(ent.get());
+          close(ent->fd);
           it = fd_cache_.erase(it);
           continue;
         }
@@ -331,24 +332,25 @@ public:
         continue;
       }
 
-      fd_cache_lru_.remove(&ent);
-      fd_cache_lru_.append(&ent);
+      fd_cache_lru_.remove(ent.get());
+      fd_cache_lru_.append(ent.get());
 
-      ++ent.usecount;
-      return &ent;
+      ++ent->usecount;
+      return ent.get();
     }
     return nullptr;
   }
   FileEntry *cache_fd(const std::string &path, const FileEntry &ent) {
 #ifdef HAVE_STD_MAP_EMPLACE
-    auto rv = fd_cache_.emplace(path, ent);
+    auto rv = fd_cache_.emplace(path, make_unique<FileEntry>(ent));
 #else  // !HAVE_STD_MAP_EMPLACE
     // for gcc-4.7
-    auto rv = fd_cache_.insert(std::make_pair(path, ent));
+    auto rv =
+        fd_cache_.insert(std::make_pair(path, make_unique<FileEntry>(ent)));
 #endif // !HAVE_STD_MAP_EMPLACE
     auto &res = (*rv).second;
-    res.it = rv;
-    fd_cache_lru_.append(&res);
+    res->it = rv;
+    fd_cache_lru_.append(res.get());
 
     while (fd_cache_.size() > FILE_ENTRY_EVICT_THRES) {
       auto ent = fd_cache_lru_.head;
@@ -360,7 +362,7 @@ public:
       fd_cache_.erase(ent->it);
     }
 
-    return &res;
+    return res.get();
   }
   void release_fd(FileEntry *target) {
     --target->usecount;
@@ -378,13 +380,13 @@ public:
   void release_unused_fd() {
     for (auto i = std::begin(fd_cache_); i != std::end(fd_cache_);) {
       auto &ent = (*i).second;
-      if (ent.usecount != 0) {
+      if (ent->usecount != 0) {
         ++i;
         continue;
       }
 
-      fd_cache_lru_.remove(&ent);
-      close(ent.fd);
+      fd_cache_lru_.remove(ent.get());
+      close(ent->fd);
       i = fd_cache_.erase(i);
     }
   }
@@ -394,7 +396,7 @@ public:
 private:
   std::set<Http2Handler *> handlers_;
   // cache for file descriptors to read file.
-  std::multimap<std::string, FileEntry> fd_cache_;
+  std::multimap<std::string, std::unique_ptr<FileEntry>> fd_cache_;
   DList<FileEntry> fd_cache_lru_;
   HttpServer *sv_;
   struct ev_loop *loop_;
@@ -1173,7 +1175,7 @@ void prepare_response(Stream *stream, Http2Handler *hd,
 
   auto sessions = hd->get_sessions();
 
-  url = util::percentDecode(std::begin(url), std::end(url));
+  url = util::percent_decode(std::begin(url), std::end(url));
   if (!util::check_path(url)) {
     if (stream->file_ent) {
       sessions->release_fd(stream->file_ent);
@@ -1227,7 +1229,7 @@ void prepare_response(Stream *stream, Http2Handler *hd,
       close(file);
 
       if (query_pos == std::string::npos) {
-        reqpath += "/";
+        reqpath += '/';
       } else {
         reqpath.insert(query_pos, "/");
       }
