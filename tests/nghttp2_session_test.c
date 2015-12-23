@@ -7634,7 +7634,7 @@ void test_nghttp2_session_keep_closed_stream(void) {
   nghttp2_session_callbacks callbacks;
   const size_t max_concurrent_streams = 5;
   nghttp2_settings_entry iv = {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-                               max_concurrent_streams};
+                               (uint32_t)max_concurrent_streams};
   size_t i;
 
   memset(&callbacks, 0, sizeof(callbacks));
@@ -7669,6 +7669,7 @@ void test_nghttp2_session_keep_closed_stream(void) {
   CU_ASSERT(NULL == session->closed_stream_head->closed_prev);
 
   open_stream(session, 11);
+  nghttp2_session_adjust_closed_stream(session);
 
   CU_ASSERT(1 == session->num_closed_streams);
   CU_ASSERT(5 == session->closed_stream_tail->stream_id);
@@ -7677,6 +7678,7 @@ void test_nghttp2_session_keep_closed_stream(void) {
   CU_ASSERT(NULL == session->closed_stream_head->closed_next);
 
   open_stream(session, 13);
+  nghttp2_session_adjust_closed_stream(session);
 
   CU_ASSERT(0 == session->num_closed_streams);
   CU_ASSERT(NULL == session->closed_stream_tail);
@@ -7689,6 +7691,7 @@ void test_nghttp2_session_keep_closed_stream(void) {
 
   /* server initiated stream is not counted to max concurrent limit */
   open_stream(session, 2);
+  nghttp2_session_adjust_closed_stream(session);
 
   CU_ASSERT(1 == session->num_closed_streams);
   CU_ASSERT(3 == session->closed_stream_head->stream_id);
@@ -7706,8 +7709,9 @@ void test_nghttp2_session_keep_idle_stream(void) {
   nghttp2_session_callbacks callbacks;
   const size_t max_concurrent_streams = 1;
   nghttp2_settings_entry iv = {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-                               max_concurrent_streams};
+                               (uint32_t)max_concurrent_streams};
   int i;
+  int32_t stream_id;
 
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.send_callback = null_send_callback;
@@ -7716,25 +7720,29 @@ void test_nghttp2_session_keep_idle_stream(void) {
 
   nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, &iv, 1);
 
-  /* We at least allow 2 idle streams even if max concurrent streams
-     is very low. */
-  for (i = 0; i < 2; ++i) {
+  /* We at least allow NGHTTP2_MIN_IDLE_STREAM idle streams even if
+     max concurrent streams is very low. */
+  for (i = 0; i < NGHTTP2_MIN_IDLE_STREAMS; ++i) {
     nghttp2_session_open_stream(session, i * 2 + 1, NGHTTP2_STREAM_FLAG_NONE,
                                 &pri_spec_default, NGHTTP2_STREAM_IDLE, NULL);
+    nghttp2_session_adjust_idle_stream(session);
   }
 
-  CU_ASSERT(2 == session->num_idle_streams);
+  CU_ASSERT(NGHTTP2_MIN_IDLE_STREAMS == session->num_idle_streams);
 
+  stream_id = (NGHTTP2_MIN_IDLE_STREAMS - 1) * 2 + 1;
   CU_ASSERT(1 == session->idle_stream_head->stream_id);
-  CU_ASSERT(3 == session->idle_stream_tail->stream_id);
+  CU_ASSERT(stream_id == session->idle_stream_tail->stream_id);
 
-  nghttp2_session_open_stream(session, 5, NGHTTP2_FLAG_NONE, &pri_spec_default,
-                              NGHTTP2_STREAM_IDLE, NULL);
+  stream_id += 2;
 
-  CU_ASSERT(2 == session->num_idle_streams);
+  nghttp2_session_open_stream(session, stream_id, NGHTTP2_FLAG_NONE,
+                              &pri_spec_default, NGHTTP2_STREAM_IDLE, NULL);
+  nghttp2_session_adjust_idle_stream(session);
 
+  CU_ASSERT(NGHTTP2_MIN_IDLE_STREAMS == session->num_idle_streams);
   CU_ASSERT(3 == session->idle_stream_head->stream_id);
-  CU_ASSERT(5 == session->idle_stream_tail->stream_id);
+  CU_ASSERT(stream_id == session->idle_stream_tail->stream_id);
 
   nghttp2_session_del(session);
 }
@@ -8630,6 +8638,57 @@ void test_nghttp2_session_create_idle_stream(void) {
   rv = nghttp2_session_create_idle_stream(session, 18, &pri_spec);
 
   CU_ASSERT(NGHTTP2_ERR_INVALID_ARGUMENT == rv);
+
+  nghttp2_session_del(session);
+}
+
+void test_nghttp2_session_repeated_priority_change(void) {
+  nghttp2_session *session;
+  nghttp2_session_callbacks callbacks;
+  nghttp2_frame frame;
+  nghttp2_priority_spec pri_spec;
+  int32_t stream_id, last_stream_id;
+  int32_t max_streams = 20;
+
+  memset(&callbacks, 0, sizeof(callbacks));
+
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+
+  session->local_settings.max_concurrent_streams = (uint32_t)max_streams;
+
+  /* 1 -> 0 */
+  nghttp2_priority_spec_init(&pri_spec, 0, 16, 0);
+  nghttp2_frame_priority_init(&frame.priority, 1, &pri_spec);
+
+  CU_ASSERT(0 == nghttp2_session_on_priority_received(session, &frame));
+
+  nghttp2_frame_priority_free(&frame.priority);
+
+  last_stream_id = max_streams * 2 + 1;
+
+  for (stream_id = 3; stream_id < last_stream_id; stream_id += 2) {
+    /* 1 -> stream_id */
+    nghttp2_priority_spec_init(&pri_spec, stream_id, 16, 0);
+    nghttp2_frame_priority_init(&frame.priority, 1, &pri_spec);
+
+    CU_ASSERT(0 == nghttp2_session_on_priority_received(session, &frame));
+
+    nghttp2_frame_priority_free(&frame.priority);
+  }
+
+  CU_ASSERT(20 == session->num_idle_streams);
+  CU_ASSERT(1 == session->idle_stream_head->stream_id);
+
+  /* 1 -> last_stream_id */
+  nghttp2_priority_spec_init(&pri_spec, last_stream_id, 16, 0);
+  nghttp2_frame_priority_init(&frame.priority, 1, &pri_spec);
+
+  CU_ASSERT(0 == nghttp2_session_on_priority_received(session, &frame));
+
+  nghttp2_frame_priority_free(&frame.priority);
+
+  CU_ASSERT(20 == session->num_idle_streams);
+  CU_ASSERT(3 == session->idle_stream_head->stream_id);
 
   nghttp2_session_del(session);
 }
