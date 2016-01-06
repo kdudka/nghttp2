@@ -112,7 +112,6 @@ struct Config {
 };
 
 struct RequestStat {
-  RequestStat();
   // time point when request was sent
   std::chrono::steady_clock::time_point request_time;
   // time point when stream was closed
@@ -208,8 +207,21 @@ enum ClientState { CLIENT_IDLE, CLIENT_CONNECTED };
 
 struct Client;
 
+// We use systematic sampling method
+struct Sampling {
+  // sampling interval
+  double interval;
+  // cumulative value of interval, and the next point is the integer
+  // rounded up from this value.
+  double point;
+  // number of samples seen, including discarded samples.
+  size_t n;
+};
+
 struct Worker {
   Stats stats;
+  Sampling request_times_smp;
+  Sampling client_smp;
   struct ev_loop *loop;
   SSL_CTX *ssl_ctx;
   Config *config;
@@ -225,9 +237,6 @@ struct Worker {
   // at most nreqs_rem clients get an extra request
   size_t nreqs_rem;
   size_t rate;
-  // every successful request_times_sampling_step-th request's
-  // req_stat will get sampled.
-  size_t request_times_sampling_step;
   ev_timer timeout_watcher;
   // The next client ID this worker assigns
   uint32_t next_client_id;
@@ -238,6 +247,7 @@ struct Worker {
   Worker(Worker &&o) = default;
   void run();
   void sample_req_stat(RequestStat *req_stat);
+  void sample_client_stat(ClientStat *cstat);
   void report_progress();
   void report_rate_progress();
 };
@@ -250,6 +260,7 @@ struct Stream {
 
 struct Client {
   std::unordered_map<int32_t, Stream> streams;
+  ClientStat cstat;
   std::unique_ptr<Session> session;
   ev_io wev;
   ev_io rev;
