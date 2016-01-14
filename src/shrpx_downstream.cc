@@ -112,13 +112,11 @@ void downstream_wtimeoutcb(struct ev_loop *loop, ev_timer *w, int revents) {
 
 // upstream could be nullptr for unittests
 Downstream::Downstream(Upstream *upstream, MemchunkPool *mcpool,
-                       int32_t stream_id, int32_t priority)
-    : dlnext(nullptr), dlprev(nullptr),
+                       int32_t stream_id)
+    : dlnext(nullptr), dlprev(nullptr), response_sent_body_length(0),
       request_start_time_(std::chrono::high_resolution_clock::now()),
-      request_buf_(mcpool), response_buf_(mcpool), request_bodylen_(0),
-      response_bodylen_(0), response_sent_bodylen_(0), upstream_(upstream),
-      blocked_link_(nullptr), request_datalen_(0), response_datalen_(0),
-      num_retry_(0), stream_id_(stream_id), priority_(priority),
+      request_buf_(mcpool), response_buf_(mcpool), upstream_(upstream),
+      blocked_link_(nullptr), num_retry_(0), stream_id_(stream_id),
       downstream_stream_id_(-1),
       response_rst_stream_error_code_(NGHTTP2_NO_ERROR),
       request_state_(INITIAL), response_state_(INITIAL),
@@ -518,12 +516,12 @@ int Downstream::push_upload_data_chunk(const uint8_t *data, size_t datalen) {
     DLOG(INFO, this) << "dconn_ is NULL";
     return -1;
   }
-  request_bodylen_ += datalen;
+  req_.recv_body_length += datalen;
   if (dconn_->push_upload_data_chunk(data, datalen) != 0) {
     return -1;
   }
 
-  request_datalen_ += datalen;
+  req_.unconsumed_body_length += datalen;
 
   return 0;
 }
@@ -606,14 +604,6 @@ int Downstream::on_read() {
   return dconn_->on_read();
 }
 
-int Downstream::change_priority(int32_t pri) {
-  if (!dconn_) {
-    DLOG(INFO, this) << "dconn_ is NULL";
-    return -1;
-  }
-  return dconn_->on_priority_change(pri);
-}
-
 void Downstream::set_response_state(int state) { response_state_ = state; }
 
 int Downstream::get_response_state() const { return response_state_; }
@@ -629,30 +619,16 @@ bool Downstream::response_buf_full() {
   }
 }
 
-void Downstream::add_response_bodylen(size_t amount) {
-  response_bodylen_ += amount;
-}
-
-int64_t Downstream::get_response_bodylen() const { return response_bodylen_; }
-
-void Downstream::add_response_sent_bodylen(size_t amount) {
-  response_sent_bodylen_ += amount;
-}
-
-int64_t Downstream::get_response_sent_bodylen() const {
-  return response_sent_bodylen_;
-}
-
-bool Downstream::validate_request_bodylen() const {
+bool Downstream::validate_request_recv_body_length() const {
   if (req_.fs.content_length == -1) {
     return true;
   }
 
-  if (req_.fs.content_length != request_bodylen_) {
+  if (req_.fs.content_length != req_.recv_body_length) {
     if (LOG_ENABLED(INFO)) {
       DLOG(INFO, this) << "request invalid bodylen: content-length="
                        << req_.fs.content_length
-                       << ", received=" << request_bodylen_;
+                       << ", received=" << req_.recv_body_length;
     }
     return false;
   }
@@ -660,26 +636,22 @@ bool Downstream::validate_request_bodylen() const {
   return true;
 }
 
-bool Downstream::validate_response_bodylen() const {
+bool Downstream::validate_response_recv_body_length() const {
   if (!expect_response_body() || resp_.fs.content_length == -1) {
     return true;
   }
 
-  if (resp_.fs.content_length != response_bodylen_) {
+  if (resp_.fs.content_length != resp_.recv_body_length) {
     if (LOG_ENABLED(INFO)) {
       DLOG(INFO, this) << "response invalid bodylen: content-length="
                        << resp_.fs.content_length
-                       << ", received=" << response_bodylen_;
+                       << ", received=" << resp_.recv_body_length;
     }
     return false;
   }
 
   return true;
 }
-
-void Downstream::set_priority(int32_t pri) { priority_ = pri; }
-
-int32_t Downstream::get_priority() const { return priority_; }
 
 void Downstream::check_upgrade_fulfilled() {
   if (req_.method == HTTP_CONNECT) {
@@ -705,9 +677,7 @@ void Downstream::inspect_http2_request() {
 void Downstream::inspect_http1_request() {
   if (req_.method == HTTP_CONNECT) {
     req_.upgrade_request = true;
-  }
-
-  if (!req_.upgrade_request) {
+  } else {
     auto upgrade = req_.fs.header(http2::HD_UPGRADE);
     if (upgrade) {
       const auto &val = upgrade->value;
@@ -791,26 +761,6 @@ void Downstream::set_expect_final_response(bool f) {
 bool Downstream::get_expect_final_response() const {
   return expect_final_response_;
 }
-
-size_t Downstream::get_request_datalen() const { return request_datalen_; }
-
-void Downstream::dec_request_datalen(size_t len) {
-  assert(request_datalen_ >= len);
-  request_datalen_ -= len;
-}
-
-void Downstream::reset_request_datalen() { request_datalen_ = 0; }
-
-void Downstream::add_response_datalen(size_t len) { response_datalen_ += len; }
-
-void Downstream::dec_response_datalen(size_t len) {
-  assert(response_datalen_ >= len);
-  response_datalen_ -= len;
-}
-
-size_t Downstream::get_response_datalen() const { return response_datalen_; }
-
-void Downstream::reset_response_datalen() { response_datalen_ = 0; }
 
 bool Downstream::expect_response_body() const {
   return http2::expect_response_body(req_.method, resp_.http_status);

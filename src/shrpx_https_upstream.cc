@@ -71,9 +71,7 @@ int htp_msg_begin(http_parser *htp) {
 
   auto handler = upstream->get_client_handler();
 
-  // TODO specify 0 as priority for now
-  auto downstream =
-      make_unique<Downstream>(upstream, handler->get_mcpool(), 0, 0);
+  auto downstream = make_unique<Downstream>(upstream, handler->get_mcpool(), 0);
 
   upstream->attach_downstream(std::move(downstream));
 
@@ -563,8 +561,8 @@ int HttpsUpstream::on_write() {
 
   if (output->rleft() == 0 && dconn &&
       downstream->get_response_state() != Downstream::MSG_COMPLETE) {
-    if (downstream->resume_read(SHRPX_NO_BUFFER,
-                                downstream->get_response_datalen()) != 0) {
+    if (downstream->resume_read(SHRPX_NO_BUFFER, resp.unconsumed_body_length) !=
+        0) {
       return -1;
     }
 
@@ -601,8 +599,7 @@ int HttpsUpstream::on_write() {
     }
   }
 
-  return downstream->resume_read(SHRPX_NO_BUFFER,
-                                 downstream->get_response_datalen());
+  return downstream->resume_read(SHRPX_NO_BUFFER, resp.unconsumed_body_length);
 }
 
 int HttpsUpstream::on_event() { return 0; }
@@ -800,7 +797,7 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   output->append(body, bodylen);
 
-  downstream->add_response_sent_bodylen(bodylen);
+  downstream->response_sent_body_length += bodylen;
   downstream->set_response_state(Downstream::MSG_COMPLETE);
 
   return 0;
@@ -811,8 +808,7 @@ void HttpsUpstream::error_reply(unsigned int status_code) {
   auto downstream = get_downstream();
 
   if (!downstream) {
-    attach_downstream(
-        make_unique<Downstream>(this, handler_->get_mcpool(), 1, 1));
+    attach_downstream(make_unique<Downstream>(this, handler_->get_mcpool(), 1));
     downstream = get_downstream();
   }
 
@@ -843,7 +839,7 @@ void HttpsUpstream::error_reply(unsigned int status_code) {
                  "charset=UTF-8\r\nConnection: close\r\n\r\n");
   output->append(html.c_str(), html.size());
 
-  downstream->add_response_sent_bodylen(html.size());
+  downstream->response_sent_body_length += html.size();
   downstream->set_response_state(Downstream::MSG_COMPLETE);
 }
 
@@ -1049,7 +1045,7 @@ int HttpsUpstream::on_downstream_body(Downstream *downstream,
   }
   output->append(data, len);
 
-  downstream->add_response_sent_bodylen(len);
+  downstream->response_sent_body_length += len;
 
   if (downstream->get_chunked_response()) {
     output->append("\r\n");
@@ -1076,7 +1072,7 @@ int HttpsUpstream::on_downstream_body_complete(Downstream *downstream) {
     DLOG(INFO, downstream) << "HTTP response completed";
   }
 
-  if (!downstream->validate_response_bodylen()) {
+  if (!downstream->validate_response_recv_body_length()) {
     resp.connection_close = true;
   }
 

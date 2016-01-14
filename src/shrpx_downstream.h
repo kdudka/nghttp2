@@ -124,9 +124,15 @@ private:
 
 struct Request {
   Request()
-      : fs(16), method(-1), http_major(1), http_minor(1),
-        upgrade_request(false), http2_upgrade_seen(false),
-        connection_close(false), http2_expect_body(false) {}
+      : fs(16), recv_body_length(0), unconsumed_body_length(0), method(-1),
+        http_major(1), http_minor(1), upgrade_request(false),
+        http2_upgrade_seen(false), connection_close(false),
+        http2_expect_body(false) {}
+
+  void consume(size_t len) {
+    assert(unconsumed_body_length >= len);
+    unconsumed_body_length -= len;
+  }
 
   FieldStore fs;
   // Request scheme.  For HTTP/2, this is :scheme header field value.
@@ -142,6 +148,10 @@ struct Request {
   // request-target.  For HTTP/2, this is :path header field value.
   // For CONNECT request, this is empty.
   std::string path;
+  // the length of request body received so far
+  int64_t recv_body_length;
+  // The number of bytes not consumed by the application yet.
+  size_t unconsumed_body_length;
   int method;
   // HTTP major and minor version
   int http_major, http_minor;
@@ -159,10 +169,20 @@ struct Request {
 
 struct Response {
   Response()
-      : fs(32), http_status(0), http_major(1), http_minor(1),
-        connection_close(false) {}
+      : fs(32), recv_body_length(0), unconsumed_body_length(0), http_status(0),
+        http_major(1), http_minor(1), connection_close(false) {}
+
+  void consume(size_t len) {
+    assert(unconsumed_body_length >= len);
+    unconsumed_body_length -= len;
+  }
 
   FieldStore fs;
+  // the length of response body received so far
+  int64_t recv_body_length;
+  // The number of bytes not consumed by the application yet.  This is
+  // mainly for HTTP/2 backend.
+  size_t unconsumed_body_length;
   // HTTP status code
   unsigned int http_status;
   int http_major, http_minor;
@@ -171,15 +191,12 @@ struct Response {
 
 class Downstream {
 public:
-  Downstream(Upstream *upstream, MemchunkPool *mcpool, int32_t stream_id,
-             int32_t priority);
+  Downstream(Upstream *upstream, MemchunkPool *mcpool, int32_t stream_id);
   ~Downstream();
   void reset_upstream(Upstream *upstream);
   Upstream *get_upstream() const;
   void set_stream_id(int32_t stream_id);
   int32_t get_stream_id() const;
-  void set_priority(int32_t pri);
-  int32_t get_priority() const;
   void pause_read(IOCtrlReason reason);
   int resume_read(IOCtrlReason reason, size_t consumed);
   void force_resume_read();
@@ -234,12 +251,9 @@ public:
   void set_chunked_request(bool f);
   int push_upload_data_chunk(const uint8_t *data, size_t datalen);
   int end_upload_data();
-  size_t get_request_datalen() const;
-  void dec_request_datalen(size_t len);
-  void reset_request_datalen();
   // Validates that received request body length and content-length
   // matches.
-  bool validate_request_bodylen() const;
+  bool validate_request_recv_body_length() const;
   void set_request_downstream_host(std::string host);
   bool expect_response_body() const;
   enum {
@@ -280,13 +294,9 @@ public:
   int get_response_state() const;
   DefaultMemchunks *get_response_buf();
   bool response_buf_full();
-  void add_response_bodylen(size_t amount);
-  int64_t get_response_bodylen() const;
-  void add_response_sent_bodylen(size_t amount);
-  int64_t get_response_sent_bodylen() const;
   // Validates that received response body length and content-length
   // matches.
-  bool validate_response_bodylen() const;
+  bool validate_response_recv_body_length() const;
   uint32_t get_response_rst_stream_error_code() const;
   void set_response_rst_stream_error_code(uint32_t error_code);
   // Inspects HTTP/1 response.  This checks tranfer-encoding etc.
@@ -298,20 +308,10 @@ public:
   bool get_non_final_response() const;
   void set_expect_final_response(bool f);
   bool get_expect_final_response() const;
-  void add_response_datalen(size_t len);
-  void dec_response_datalen(size_t len);
-  size_t get_response_datalen() const;
-  void reset_response_datalen();
 
   // Call this method when there is incoming data in downstream
   // connection.
   int on_read();
-
-  // Change the priority of downstream
-  int change_priority(int32_t pri);
-
-  bool get_rst_stream_after_end_stream() const;
-  void set_rst_stream_after_end_stream(bool f);
 
   // Resets upstream read timer.  If it is active, timeout value is
   // reset.  If it is not active, timer will be started.
@@ -370,6 +370,9 @@ public:
 
   Downstream *dlnext, *dlprev;
 
+  // the length of response body sent to upstream client
+  int64_t response_sent_body_length;
+
 private:
   Request req_;
   Response resp_;
@@ -390,46 +393,33 @@ private:
   ev_timer downstream_rtimer_;
   ev_timer downstream_wtimer_;
 
-  // the length of request body received so far
-  int64_t request_bodylen_;
-  // the length of response body received so far
-  int64_t response_bodylen_;
-
-  // the length of response body sent to upstream client
-  int64_t response_sent_bodylen_;
-
   Upstream *upstream_;
   std::unique_ptr<DownstreamConnection> dconn_;
 
   // only used by HTTP/2 or SPDY upstream
   BlockedLink *blocked_link_;
-
-  // The number of bytes not consumed by the application yet.
-  size_t request_datalen_;
-  size_t response_datalen_;
-
+  // How many times we tried in backend connection
   size_t num_retry_;
-
+  // The stream ID in frontend connection
   int32_t stream_id_;
-  int32_t priority_;
   // stream ID in backend connection
   int32_t downstream_stream_id_;
-
   // RST_STREAM error_code from downstream HTTP2 connection
   uint32_t response_rst_stream_error_code_;
-
+  // request state
   int request_state_;
+  // response state
   int response_state_;
-
   // only used by HTTP/2 or SPDY upstream
   int dispatch_state_;
-
-  // true if the connection is upgraded (HTTP Upgrade or CONNECT)
+  // true if the connection is upgraded (HTTP Upgrade or CONNECT),
+  // excluding upgrade to HTTP/2.
   bool upgraded_;
-
+  // true if backend request uses chunked transfer-encoding
   bool chunked_request_;
+  // true if response to client uses chunked transfer-encoding
   bool chunked_response_;
-
+  // true if we have not got final response code
   bool expect_final_response_;
   // true if downstream request is pending because backend connection
   // has not been established or should be checked before use;

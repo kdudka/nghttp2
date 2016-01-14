@@ -71,10 +71,12 @@ Http2DownstreamConnection::~Http2DownstreamConnection() {
         downstream_->get_downstream_stream_id() != -1) {
       submit_rst_stream(downstream_, error_code);
 
-      http2session_->consume(downstream_->get_downstream_stream_id(),
-                             downstream_->get_response_datalen());
+      auto &resp = downstream_->response();
 
-      downstream_->reset_response_datalen();
+      http2session_->consume(downstream_->get_downstream_stream_id(),
+                             resp.unconsumed_body_length);
+
+      resp.unconsumed_body_length = 0;
 
       http2session_->signal_write();
     }
@@ -105,15 +107,18 @@ void Http2DownstreamConnection::detach_downstream(Downstream *downstream) {
   if (LOG_ENABLED(INFO)) {
     DCLOG(INFO, this) << "Detaching from DOWNSTREAM:" << downstream;
   }
+
+  auto &resp = downstream_->response();
+
   if (submit_rst_stream(downstream) == 0) {
     http2session_->signal_write();
   }
 
   if (downstream_->get_downstream_stream_id() != -1) {
     http2session_->consume(downstream_->get_downstream_stream_id(),
-                           downstream_->get_response_datalen());
+                           resp.unconsumed_body_length);
 
-    downstream_->reset_response_datalen();
+    resp.unconsumed_body_length = 0;
 
     http2session_->signal_write();
   }
@@ -385,11 +390,9 @@ int Http2DownstreamConnection::push_request_headers() {
     nghttp2_data_provider data_prd;
     data_prd.source.ptr = this;
     data_prd.read_callback = http2_data_read_callback;
-    rv = http2session_->submit_request(this, downstream_->get_priority(),
-                                       nva.data(), nva.size(), &data_prd);
+    rv = http2session_->submit_request(this, nva.data(), nva.size(), &data_prd);
   } else {
-    rv = http2session_->submit_request(this, downstream_->get_priority(),
-                                       nva.data(), nva.size(), nullptr);
+    rv = http2session_->submit_request(this, nva.data(), nva.size(), nullptr);
   }
   if (rv != 0) {
     DCLOG(FATAL, this) << "nghttp2_submit_request() failed";
@@ -449,8 +452,6 @@ int Http2DownstreamConnection::resume_read(IOCtrlReason reason,
   }
 
   if (consumed > 0) {
-    assert(downstream_->get_response_datalen() >= consumed);
-
     rv = http2session_->consume(downstream_->get_downstream_stream_id(),
                                 consumed);
 
@@ -458,7 +459,9 @@ int Http2DownstreamConnection::resume_read(IOCtrlReason reason,
       return -1;
     }
 
-    downstream_->dec_response_datalen(consumed);
+    auto &resp = downstream_->response();
+
+    resp.unconsumed_body_length -= consumed;
 
     http2session_->signal_write();
   }
@@ -489,24 +492,6 @@ StreamData *Http2DownstreamConnection::detach_stream_data() {
     return sd;
   }
   return nullptr;
-}
-
-int Http2DownstreamConnection::on_priority_change(int32_t pri) {
-  int rv;
-  if (downstream_->get_priority() == pri) {
-    return 0;
-  }
-  downstream_->set_priority(pri);
-  if (http2session_->get_state() != Http2Session::CONNECTED) {
-    return 0;
-  }
-  rv = http2session_->submit_priority(this, pri);
-  if (rv != 0) {
-    DLOG(FATAL, this) << "nghttp2_submit_priority() failed";
-    return -1;
-  }
-  http2session_->signal_write();
-  return 0;
 }
 
 int Http2DownstreamConnection::on_timeout() {

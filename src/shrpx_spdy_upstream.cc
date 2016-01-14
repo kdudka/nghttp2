@@ -102,9 +102,11 @@ void on_stream_close_callback(spdylay_session *session, int32_t stream_id,
     return;
   }
 
-  upstream->consume(stream_id, downstream->get_request_datalen());
+  auto &req = downstream->request();
 
-  downstream->reset_request_datalen();
+  upstream->consume(stream_id, req.unconsumed_body_length);
+
+  req.unconsumed_body_length = 0;
 
   if (downstream->get_request_state() == Downstream::CONNECT_FAIL) {
     upstream->remove_downstream(downstream);
@@ -144,8 +146,8 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
                            << frame->syn_stream.stream_id;
     }
 
-    auto downstream = upstream->add_pending_downstream(
-        frame->syn_stream.stream_id, frame->syn_stream.pri);
+    auto downstream =
+        upstream->add_pending_downstream(frame->syn_stream.stream_id);
 
     auto &req = downstream->request();
 
@@ -263,7 +265,7 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
 #endif // HAVE_MRUBY
 
     if (frame->syn_stream.hd.flags & SPDYLAY_CTRL_FLAG_FIN) {
-      if (!downstream->validate_request_bodylen()) {
+      if (!downstream->validate_request_recv_body_length()) {
         upstream->rst_stream(downstream, SPDYLAY_PROTOCOL_ERROR);
         return;
       }
@@ -386,7 +388,7 @@ void on_data_recv_callback(spdylay_session *session, uint8_t flags,
   auto downstream = static_cast<Downstream *>(
       spdylay_session_get_stream_user_data(session, stream_id));
   if (downstream && (flags & SPDYLAY_DATA_FLAG_FIN)) {
-    if (!downstream->validate_request_bodylen()) {
+    if (!downstream->validate_request_recv_body_length()) {
       upstream->rst_stream(downstream, SPDYLAY_PROTOCOL_ERROR);
       return;
     }
@@ -802,7 +804,7 @@ ssize_t spdy_data_read_callback(spdylay_session *session, int32_t stream_id,
   }
 
   if (nread > 0) {
-    downstream->add_response_sent_bodylen(nread);
+    downstream->response_sent_body_length += nread;
   }
 
   return nread;
@@ -911,10 +913,9 @@ int SpdyUpstream::error_reply(Downstream *downstream,
   return 0;
 }
 
-Downstream *SpdyUpstream::add_pending_downstream(int32_t stream_id,
-                                                 int32_t priority) {
-  auto downstream = make_unique<Downstream>(this, handler_->get_mcpool(),
-                                            stream_id, priority);
+Downstream *SpdyUpstream::add_pending_downstream(int32_t stream_id) {
+  auto downstream =
+      make_unique<Downstream>(this, handler_->get_mcpool(), stream_id);
   spdylay_session_set_stream_user_data(session_, stream_id, downstream.get());
   auto res = downstream.get();
 
@@ -1093,7 +1094,7 @@ int SpdyUpstream::on_downstream_body_complete(Downstream *downstream) {
 
   auto &resp = downstream->response();
 
-  if (!downstream->validate_response_bodylen()) {
+  if (!downstream->validate_response_recv_body_length()) {
     rst_stream(downstream, SPDYLAY_PROTOCOL_ERROR);
     resp.connection_close = true;
     return 0;
@@ -1112,13 +1113,13 @@ void SpdyUpstream::pause_read(IOCtrlReason reason) {}
 int SpdyUpstream::resume_read(IOCtrlReason reason, Downstream *downstream,
                               size_t consumed) {
   if (get_flow_control()) {
-    assert(downstream->get_request_datalen() >= consumed);
-
     if (consume(downstream->get_stream_id(), consumed) != 0) {
       return -1;
     }
 
-    downstream->dec_request_datalen(consumed);
+    auto &req = downstream->request();
+
+    req.consume(consumed);
   }
 
   handler_->signal_write();

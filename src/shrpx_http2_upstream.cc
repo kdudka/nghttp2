@@ -66,9 +66,11 @@ int on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
     return 0;
   }
 
-  upstream->consume(stream_id, downstream->get_request_datalen());
+  auto &req = downstream->request();
 
-  downstream->reset_request_datalen();
+  upstream->consume(stream_id, req.unconsumed_body_length);
+
+  req.unconsumed_body_length = 0;
 
   if (downstream->get_request_state() == Downstream::CONNECT_FAIL) {
     upstream->remove_downstream(downstream);
@@ -125,7 +127,6 @@ int Http2Upstream::upgrade_upstream(HttpsUpstream *http) {
   downstream->set_stream_id(1);
   downstream->reset_upstream_rtimer();
   downstream->set_stream_id(1);
-  downstream->set_priority(0);
 
   auto ptr = downstream.get();
 
@@ -224,9 +225,8 @@ int on_begin_headers_callback(nghttp2_session *session,
 
   auto handler = upstream->get_client_handler();
 
-  // TODO Use priority 0 for now
   auto downstream = make_unique<Downstream>(upstream, handler->get_mcpool(),
-                                            frame->hd.stream_id, 0);
+                                            frame->hd.stream_id);
   nghttp2_session_set_stream_user_data(session, frame->hd.stream_id,
                                        downstream.get());
 
@@ -551,7 +551,7 @@ int on_frame_send_callback(nghttp2_session *session, const nghttp2_frame *frame,
     }
 
     auto downstream = make_unique<Downstream>(upstream, handler->get_mcpool(),
-                                              promised_stream_id, 0);
+                                              promised_stream_id);
     auto &req = downstream->request();
 
     // As long as we use nghttp2_session_mem_send(), setting stream
@@ -726,9 +726,7 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
 
   // We have to add length here, so that we can log this amount of
   // data transferred.
-  if (length > 0) {
-    downstream->add_response_sent_bodylen(length);
-  }
+  downstream->response_sent_body_length += length;
 
   return (nwrite < length || npadwrite < padlen) ? NGHTTP2_ERR_PAUSE : 0;
 }
@@ -1624,7 +1622,7 @@ int Http2Upstream::on_downstream_body_complete(Downstream *downstream) {
 
   auto &resp = downstream->response();
 
-  if (!downstream->validate_response_bodylen()) {
+  if (!downstream->validate_response_recv_body_length()) {
     rst_stream(downstream, NGHTTP2_PROTOCOL_ERROR);
     resp.connection_close = true;
     return 0;
@@ -1643,13 +1641,13 @@ void Http2Upstream::pause_read(IOCtrlReason reason) {}
 int Http2Upstream::resume_read(IOCtrlReason reason, Downstream *downstream,
                                size_t consumed) {
   if (get_flow_control()) {
-    assert(downstream->get_request_datalen() >= consumed);
-
     if (consume(downstream->get_stream_id(), consumed) != 0) {
       return -1;
     }
 
-    downstream->dec_request_datalen(consumed);
+    auto &req = downstream->request();
+
+    req.consume(consumed);
   }
 
   handler_->signal_write();
@@ -1953,7 +1951,7 @@ Http2Upstream::on_downstream_push_promise(Downstream *downstream,
   // promised_stream_id is for backend HTTP/2 session, not for
   // frontend.
   auto promised_downstream =
-      make_unique<Downstream>(this, handler_->get_mcpool(), 0, 0);
+      make_unique<Downstream>(this, handler_->get_mcpool(), 0);
   auto &promised_req = promised_downstream->request();
 
   promised_downstream->set_downstream_stream_id(promised_stream_id);
