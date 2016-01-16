@@ -245,8 +245,8 @@ struct DownstreamAddr {
   Address addr;
   // backend address.  If |host_unix| is true, this is UNIX domain
   // socket path.
-  std::unique_ptr<char[]> host;
-  std::unique_ptr<char[]> hostport;
+  VString host;
+  VString hostport;
   // backend port.  0 if |host_unix| is true.
   uint16_t port;
   // true if |host| contains UNIX domain socket path.
@@ -310,6 +310,8 @@ struct Config {
   // field.  This is only used when user defined static obfuscated
   // string is provided.
   std::string forwarded_for_obfuscated;
+  std::string backend_tls_sni_name;
+  StringAdaptor server_name;
   std::chrono::seconds tls_session_timeout;
   ev_tstamp http2_upstream_read_timeout;
   ev_tstamp upstream_read_timeout;
@@ -329,7 +331,6 @@ struct Config {
   std::unique_ptr<char[]> private_key_passwd;
   std::unique_ptr<char[]> cert_file;
   std::unique_ptr<char[]> dh_param_file;
-  std::unique_ptr<char[]> backend_tls_sni_name;
   std::unique_ptr<char[]> pid_file;
   std::unique_ptr<char[]> conf_path;
   std::unique_ptr<char[]> ciphers;
@@ -363,7 +364,6 @@ struct Config {
   nghttp2_option *http2_option;
   nghttp2_option *http2_client_option;
   const EVP_CIPHER *tls_ticket_key_cipher;
-  const char *server_name;
   char **original_argv;
   char **argv;
   char *cwd;
