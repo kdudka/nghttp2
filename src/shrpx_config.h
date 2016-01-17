@@ -283,6 +283,15 @@ struct TicketKeys {
   std::vector<TicketKey> keys;
 };
 
+struct HttpProxy {
+  Address addr;
+  // host in http proxy URI
+  std::string host;
+  // userinfo in http proxy URI, not percent-encoded form
+  std::string userinfo;
+  uint16_t port;
+};
+
 struct Config {
   // The list of (private key file, certificate file) pair
   std::vector<std::pair<std::string, std::string>> subcerts;
@@ -298,11 +307,10 @@ struct Config {
   std::vector<std::string> npn_list;
   // list of supported SSL/TLS protocol strings.
   std::vector<std::string> tls_proto_list;
-  // binary form of http proxy host and port
-  Address downstream_http_proxy_addr;
   Address session_cache_memcached_addr;
   Address tls_ticket_key_memcached_addr;
   Router router;
+  HttpProxy downstream_http_proxy;
   // obfuscated value used in "by" parameter of Forwarded header
   // field.
   std::string forwarded_by_obfuscated;
@@ -335,16 +343,8 @@ struct Config {
   std::unique_ptr<char[]> conf_path;
   std::unique_ptr<char[]> ciphers;
   std::unique_ptr<char[]> cacert;
-  // userinfo in http proxy URI, not percent-encoded form
-  std::unique_ptr<char[]> downstream_http_proxy_userinfo;
-  // host in http proxy URI
-  std::unique_ptr<char[]> downstream_http_proxy_host;
   std::unique_ptr<char[]> http2_upstream_dump_request_header_file;
   std::unique_ptr<char[]> http2_upstream_dump_response_header_file;
-  // // Rate limit configuration per connection
-  // ev_token_bucket_cfg *rate_limit_cfg;
-  // // Rate limit configuration per worker (thread)
-  // ev_token_bucket_cfg *worker_rate_limit_cfg;
   // Path to file containing CA certificate solely used for client
   // certificate validation
   std::unique_ptr<char[]> verify_client_cacert;
