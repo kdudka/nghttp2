@@ -542,7 +542,8 @@ std::vector<LogFragment> parse_log_format(const char *optarg) {
     }
 
     if (literal_start < var_start) {
-      res.emplace_back(SHRPX_LOGF_LITERAL, strcopy(literal_start, var_start));
+      res.emplace_back(SHRPX_LOGF_LITERAL,
+                       ImmutableString(literal_start, var_start));
     }
 
     literal_start = p;
@@ -552,17 +553,18 @@ std::vector<LogFragment> parse_log_format(const char *optarg) {
       continue;
     }
 
-    res.emplace_back(type, strcopy(value, var_name + var_namelen));
-    auto &v = res.back().value;
-    for (size_t i = 0; v[i]; ++i) {
-      if (v[i] == '_') {
-        v[i] = '-';
+    auto name = std::string(value, var_name + var_namelen);
+    for (auto &c : name) {
+      if (c == '_') {
+        c = '-';
       }
     }
+
+    res.emplace_back(type, ImmutableString(name));
   }
 
   if (literal_start != eop) {
-    res.emplace_back(SHRPX_LOGF_LITERAL, strcopy(literal_start, eop));
+    res.emplace_back(SHRPX_LOGF_LITERAL, ImmutableString(literal_start, eop));
   }
 
   return res;
@@ -1393,7 +1395,7 @@ int parse_config(const char *opt, const char *optarg,
     DownstreamAddr addr;
     if (util::istarts_with(optarg, SHRPX_UNIX_PATH_PREFIX)) {
       auto path = optarg + str_size(SHRPX_UNIX_PATH_PREFIX);
-      addr.host = VString(path, pat_delim);
+      addr.host = ImmutableString(path, pat_delim);
       addr.host_unix = true;
     } else {
       if (split_host_port(host, sizeof(host), &port, optarg,
@@ -1401,7 +1403,7 @@ int parse_config(const char *opt, const char *optarg,
         return -1;
       }
 
-      addr.host = VString(host);
+      addr.host = ImmutableString(host);
       addr.port = port;
     }
 

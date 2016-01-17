@@ -211,58 +211,159 @@ inline std::unique_ptr<char[]> strcopy(const std::unique_ptr<char[]> &val,
   return strcopy(val.get(), val.get() + n);
 }
 
-// VString represents string.  It has c_str() and size() functions to
-// mimic std::string.  It manages buffer by itself.  Just like
-// std::string, c_str() returns NULL-terminated string, but NULL
-// character may appear before the final terminal NULL.
-struct VString {
-  VString() : len(0) {}
-  VString(const char *s, size_t slen) : len(slen), base(strcopy(s, len)) {}
-  VString(const char *s) : len(strlen(s)), base(strcopy(s, len)) {}
-  VString(const std::string &s) : len(s.size()), base(strcopy(s)) {}
+// ImmutableString represents string that is immutable unlike
+// std::string.  It has c_str() and size() functions to mimic
+// std::string.  It manages buffer by itself.  Just like std::string,
+// c_str() returns NULL-terminated string, but NULL character may
+// appear before the final terminal NULL.
+class ImmutableString {
+public:
+  using traits_type = std::char_traits<char>;
+  using value_type = traits_type::char_type;
+  using allocator_type = std::allocator<char>;
+  using size_type = std::allocator_traits<allocator_type>::size_type;
+  using difference_type =
+      std::allocator_traits<allocator_type>::difference_type;
+  using const_reference = const value_type &;
+  using const_pointer = const value_type *;
+  using const_iterator = const_pointer;
+
+  ImmutableString() : len(0), base("") {}
+  ImmutableString(const char *s, size_t slen)
+      : len(slen), holder(strcopy(s, len)), base(holder.get()) {}
+  ImmutableString(const char *s)
+      : len(strlen(s)), holder(strcopy(s, len)), base(holder.get()) {}
+  ImmutableString(std::unique_ptr<char[]> s)
+      : len(strlen(s.get())), holder(std::move(s)), base(holder.get()) {}
+  ImmutableString(std::unique_ptr<char[]> s, size_t slen)
+      : len(slen), holder(std::move(s)), base(holder.get()) {}
+  ImmutableString(const std::string &s)
+      : len(s.size()), holder(strcopy(s)), base(holder.get()) {}
   template <typename InputIt>
-  VString(InputIt first, InputIt last)
-      : len(std::distance(first, last)), base(strcopy(first, last)) {}
-  VString(const VString &other)
-      : len(other.len), base(strcopy(other.base, other.len)) {}
-  VString(VString &&) = default;
-  VString &operator=(const VString &other) {
+  ImmutableString(InputIt first, InputIt last)
+      : len(std::distance(first, last)), holder(strcopy(first, last)),
+        base(holder.get()) {}
+  ImmutableString(const ImmutableString &other)
+      : len(other.len), holder(strcopy(other.holder, other.len)),
+        base(holder.get()) {}
+  ImmutableString(ImmutableString &&other) noexcept
+      : len(other.len),
+        holder(std::move(other.holder)),
+        base(holder.get()) {
+    other.len = 0;
+    other.base = "";
+  }
+
+  ImmutableString &operator=(const ImmutableString &other) {
     if (this == &other) {
       return *this;
     }
     len = other.len;
-    base = strcopy(other.base, other.len);
+    holder = strcopy(other.holder, other.len);
+    base = holder.get();
     return *this;
   }
-  VString &operator=(VString &&other) = default;
+  ImmutableString &operator=(ImmutableString &&other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    len = other.len;
+    holder = std::move(other.holder);
+    base = holder.get();
+    other.len = 0;
+    other.base = "";
+    return *this;
+  }
 
-  const char *c_str() const { return base.get(); }
-  size_t size() const { return len; }
-
-  size_t len;
-  std::unique_ptr<char[]> base;
-};
-
-// StringAdaptor behaves like simple string, but it does not own
-// pointer.  When it is default constructed, it has empty string.  You
-// can freely copy or move around this struct, but never free its
-// pointer.  str() function can be used to export the content as
-// std::string.
-struct StringAdaptor {
-  StringAdaptor() : base(""), len(0) {}
-  template <typename T>
-  StringAdaptor(const T &s)
-      : base(s.c_str()), len(s.size()) {}
-  StringAdaptor(const char *s) : base(s), len(strlen(s)) {}
+  template <size_t N> static ImmutableString from_lit(const char(&s)[N]) {
+    return ImmutableString(s, N - 1);
+  }
 
   const char *c_str() const { return base; }
-  size_t size() const { return len; }
+  size_type size() const { return len; }
+
+private:
+  size_type len;
+  std::unique_ptr<char[]> holder;
+  const char *base;
+};
+
+// StringRef is a reference to a string owned by something else.  So
+// it behaves like simple string, but it does not own pointer.  When
+// it is default constructed, it has empty string.  You can freely
+// copy or move around this struct, but never free its pointer.  str()
+// function can be used to export the content as std::string.
+class StringRef {
+public:
+  using traits_type = std::char_traits<char>;
+  using value_type = traits_type::char_type;
+  using allocator_type = std::allocator<char>;
+  using size_type = std::allocator_traits<allocator_type>::size_type;
+  using difference_type =
+      std::allocator_traits<allocator_type>::difference_type;
+  using const_reference = const value_type &;
+  using const_pointer = const value_type *;
+  using const_iterator = const_pointer;
+
+  StringRef() : base(""), len(0) {}
+  StringRef(const std::string &s) : base(s.c_str()), len(s.size()) {}
+  StringRef(const ImmutableString &s) : base(s.c_str()), len(s.size()) {}
+  StringRef(const char *s) : base(s), len(strlen(s)) {}
+  StringRef(const char *s, size_t n) : base(s), len(n) {}
+
+  template <size_t N> static StringRef from_lit(const char(&s)[N]) {
+    return StringRef(s, N - 1);
+  }
+
+  const_iterator begin() const { return base; };
+  const_iterator cbegin() const { return base; };
+
+  const_iterator end() const { return base + len; };
+  const_iterator cend() const { return base + len; };
+
+  const char *c_str() const { return base; }
+  size_type size() const { return len; }
 
   std::string str() const { return std::string(base, len); }
 
+private:
   const char *base;
-  size_t len;
+  size_type len;
 };
+
+inline bool operator==(const StringRef &lhs, const std::string &rhs) {
+  return lhs.size() == rhs.size() &&
+         std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs));
+}
+
+inline bool operator==(const std::string &lhs, const StringRef &rhs) {
+  return rhs == lhs;
+}
+
+inline bool operator==(const StringRef &lhs, const char *rhs) {
+  return lhs.size() == strlen(rhs) &&
+         std::equal(std::begin(lhs), std::end(lhs), rhs);
+}
+
+inline bool operator==(const char *lhs, const StringRef &rhs) {
+  return rhs == lhs;
+}
+
+inline bool operator!=(const StringRef &lhs, const std::string &rhs) {
+  return !(lhs == rhs);
+}
+
+inline bool operator!=(const std::string &lhs, const StringRef &rhs) {
+  return !(rhs == lhs);
+}
+
+inline bool operator!=(const StringRef &lhs, const char *rhs) {
+  return !(lhs == rhs);
+}
+
+inline bool operator!=(const char *lhs, const StringRef &rhs) {
+  return !(rhs == lhs);
+}
 
 inline int run_app(std::function<int(int, char **)> app, int argc,
                    char **argv) {

@@ -183,6 +183,14 @@ std::pair<OutputIterator, size_t> copy(const std::string &src, size_t avail,
 } // namespace
 
 namespace {
+template <typename OutputIterator>
+std::pair<OutputIterator, size_t> copy(const StringRef &src, size_t avail,
+                                       OutputIterator oitr) {
+  return copy(src.c_str(), src.size(), avail, oitr);
+}
+} // namespace
+
+namespace {
 template <size_t N, typename OutputIterator>
 std::pair<OutputIterator, size_t> copy_l(const char(&src)[N], size_t avail,
                                          OutputIterator oitr) {
@@ -235,7 +243,7 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
   for (auto &lf : lfv) {
     switch (lf.type) {
     case SHRPX_LOGF_LITERAL:
-      std::tie(p, avail) = copy(lf.value.get(), avail, p);
+      std::tie(p, avail) = copy(lf.value, avail, p);
       break;
     case SHRPX_LOGF_REMOTE_ADDR:
       std::tie(p, avail) = copy(lgsp.remote_addr, avail, p);
@@ -265,7 +273,7 @@ void upstream_accesslog(const std::vector<LogFragment> &lfv,
       break;
     case SHRPX_LOGF_HTTP:
       if (req) {
-        auto hd = req->fs.header(lf.value.get());
+        auto hd = req->fs.header(lf.value);
         if (hd) {
           std::tie(p, avail) = copy((*hd).value, avail, p);
           break;

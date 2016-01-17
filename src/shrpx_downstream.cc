@@ -224,8 +224,8 @@ void Downstream::force_resume_read() {
 }
 
 namespace {
-const Headers::value_type *get_header_linear(const Headers &headers,
-                                             const std::string &name) {
+const Headers::value_type *search_header_linear(const Headers &headers,
+                                                const StringRef &name) {
   const Headers::value_type *res = nullptr;
   for (auto &kv : headers) {
     if (kv.name == name) {
@@ -395,8 +395,8 @@ Headers::value_type *FieldStore::header(int16_t token) {
   return http2::get_header(hdidx_, token, headers_);
 }
 
-const Headers::value_type *FieldStore::header(const std::string &name) const {
-  return get_header_linear(headers_, name);
+const Headers::value_type *FieldStore::header(const StringRef &name) const {
+  return search_header_linear(headers_, name);
 }
 
 void FieldStore::add_header(std::string name, std::string value) {
@@ -662,7 +662,7 @@ void Downstream::inspect_http1_request() {
   auto transfer_encoding = req_.fs.header(http2::HD_TRANSFER_ENCODING);
   if (transfer_encoding) {
     req_.fs.content_length = -1;
-    if (util::strifind(transfer_encoding->value.c_str(), "chunked")) {
+    if (util::iends_with_l(transfer_encoding->value, "chunked")) {
       chunked_request_ = true;
     }
   }
@@ -672,7 +672,7 @@ void Downstream::inspect_http1_response() {
   auto transfer_encoding = resp_.fs.header(http2::HD_TRANSFER_ENCODING);
   if (transfer_encoding) {
     resp_.fs.content_length = -1;
-    if (util::strifind(transfer_encoding->value.c_str(), "chunked")) {
+    if (util::iends_with_l(transfer_encoding->value, "chunked")) {
       chunked_response_ = true;
     }
   }
