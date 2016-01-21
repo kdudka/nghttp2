@@ -933,7 +933,6 @@ void fill_default_config() {
     dyn_recconf.idle_timeout = 1_s;
 
     tlsconf.session_timeout = std::chrono::hours(12);
-    tlsconf.curves = "P-256";
   }
 
   auto &httpconf = mod_config()->http;
@@ -1438,12 +1437,6 @@ SSL/TLS:
               TLS HTTP/2 backends.
               Default: )"
       << util::duration_str(get_config()->tls.dyn_rec.idle_timeout) << R"(
-  --curves=<CURVES>
-              Specify  supported  elliptic   curves  in  frontend  TLS
-              connection.  The <CURVES> must be a colon separated list
-              of curves.   The curve name  is either NIST  name (e.g.,
-              "P-256") or OpenSSL OID name (e.g., "prime256v1").
-              Default: )" << get_config()->tls.curves << R"(
 
 HTTP/2 and SPDY:
   -c, --http2-max-concurrent-streams=<N>
@@ -1603,16 +1596,13 @@ HTTP:
               consists of  character set [A-Za-z0-9._-],  as described
               in RFC 7239.
               Default: obfuscated
-  --forwarded-for=(obfuscated|ip|<VALUE>)
+  --forwarded-for=(obfuscated|ip)
               Specify  the   parameter  value  sent  out   with  "for"
               parameter of Forwarded header field.  If "obfuscated" is
               given, the string is  randomly generated for each client
               connection.  If "ip" is given, the remote client address
               of  the connection,  without port  number, is  sent with
-              "for"  parameter.   User  can also  specify  the  static
-              obfuscated string.  The limitation is that it must start
-              with   "_",  and   only   consists   of  character   set
-              [A-Za-z0-9._-], as described in RFC 7239.
+              "for" parameter.
               Default: obfuscated
   --no-via    Don't append to  Via header field.  If  Via header field
               is received, it is left unaltered.
@@ -2219,7 +2209,6 @@ int main(int argc, char **argv) {
         {SHRPX_OPT_STRIP_INCOMING_FORWARDED, no_argument, &flag, 98},
         {SHRPX_OPT_FORWARDED_BY, required_argument, &flag, 99},
         {SHRPX_OPT_FORWARDED_FOR, required_argument, &flag, 100},
-        {SHRPX_OPT_CURVES, required_argument, &flag, 101},
         {nullptr, 0, nullptr, 0}};
 
     int option_index = 0;
@@ -2648,10 +2637,6 @@ int main(int argc, char **argv) {
       case 100:
         // --forwarded-for
         cmdcfgs.emplace_back(SHRPX_OPT_FORWARDED_FOR, optarg);
-        break;
-      case 101:
-        // --curves
-        cmdcfgs.emplace_back(SHRPX_OPT_CURVES, optarg);
         break;
       default:
         break;

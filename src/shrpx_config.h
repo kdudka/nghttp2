@@ -196,7 +196,6 @@ constexpr char SHRPX_OPT_STRIP_INCOMING_FORWARDED[] =
     "strip-incoming-forwarded";
 constexpr static char SHRPX_OPT_FORWARDED_BY[] = "forwarded-by";
 constexpr char SHRPX_OPT_FORWARDED_FOR[] = "forwarded-for";
-constexpr char SHRPX_OPT_CURVES[] = "curves";
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
@@ -367,9 +366,6 @@ struct TLSConfig {
   // passed to SSL_CTX_set_options().
   long int tls_proto_mask;
   std::string backend_sni_name;
-  // Supported elliptic curves, separated by colon (':').  This is
-  // directly passed to OpenSSL configuration function.
-  std::string curves;
   std::chrono::seconds session_timeout;
   std::unique_ptr<char[]> private_key_file;
   std::unique_ptr<char[]> private_key_passwd;
@@ -383,12 +379,9 @@ struct TLSConfig {
 struct HttpConfig {
   struct {
     // obfuscated value used in "by" parameter of Forwarded header
-    // field.
-    std::string by_obfuscated;
-    // obfuscated value used in "for" parameter of Forwarded header
     // field.  This is only used when user defined static obfuscated
     // string is provided.
-    std::string for_obfuscated;
+    std::string by_obfuscated;
     // bitwise-OR of one or more of shrpx_forwarded_param values.
     uint32_t params;
     // type of value recorded in "by" parameter of Forwarded header

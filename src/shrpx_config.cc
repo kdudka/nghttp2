@@ -694,7 +694,6 @@ enum {
   SHRPX_OPTID_CLIENT_PRIVATE_KEY_FILE,
   SHRPX_OPTID_CLIENT_PROXY,
   SHRPX_OPTID_CONF,
-  SHRPX_OPTID_CURVES,
   SHRPX_OPTID_DAEMON,
   SHRPX_OPTID_DH_PARAM_FILE,
   SHRPX_OPTID_ERRORLOG_FILE,
@@ -802,11 +801,6 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 'n':
       if (util::strieq_l("daemo", name, 5)) {
         return SHRPX_OPTID_DAEMON;
-      }
-      break;
-    case 's':
-      if (util::strieq_l("curve", name, 5)) {
-        return SHRPX_OPTID_CURVES;
       }
       break;
     case 't':
@@ -2129,7 +2123,8 @@ int parse_config(const char *opt, const char *optarg,
   case SHRPX_OPTID_FORWARDED_FOR: {
     auto type = parse_forwarded_node_type(optarg);
 
-    if (type == -1) {
+    if (type == -1 ||
+        (optid == SHRPX_OPTID_FORWARDED_FOR && optarg[0] == '_')) {
       LOG(ERROR) << opt << ": unknown node type or illegal obfuscated string "
                  << optarg;
       return -1;
@@ -2148,23 +2143,11 @@ int parse_config(const char *opt, const char *optarg,
       break;
     case SHRPX_OPTID_FORWARDED_FOR:
       fwdconf.for_node_type = static_cast<shrpx_forwarded_node_type>(type);
-      if (optarg[0] == '_') {
-        fwdconf.for_obfuscated = optarg;
-      } else {
-        fwdconf.for_obfuscated = "";
-      }
       break;
     }
 
     return 0;
   }
-  case SHRPX_OPTID_CURVES:
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
-    mod_config()->tls.curves = optarg;
-#else  // OPENSSL_VERSION_NUMBER < 0x10002000L
-    LOG(WARN) << opt << ": this option requires OpenSSL >= 1.0.2.";
-#endif // OPENSSL_VERSION_NUMBER < 0x10002000L
-    return 0;
   case SHRPX_OPTID_CONF:
     LOG(WARN) << "conf: ignored";
 
