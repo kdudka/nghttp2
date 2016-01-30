@@ -189,9 +189,19 @@ else
 d])
 fi
 
+ac_save_CXXFLAGS="$CXXFLAGS"
+CXXFLAGS=
+
 AX_CXX_COMPILE_STDCXX_11([noext], [optional])
 
+CXX1XCXXFLAGS="$CXXFLAGS"
+CXXFLAGS="$ac_save_CXXFLAGS"
+AC_SUBST([CXX1XCXXFLAGS])
+
 AC_LANG_PUSH(C++)
+
+ac_save_CXXFLAGS="$CXXFLAGS"
+CXXFLAGS="$CXXFLAGS $CXX1XCXXFLAGS"
 
 # Check that std::future is available.
 AC_MSG_CHECKING([whether std::future is available])
@@ -226,6 +236,8 @@ std::map<int, int>().emplace(1, 2);
     [have_std_map_emplace=no
      AC_MSG_RESULT([no])])
 
+CXXFLAGS=$ac_save_CXXFLAGS
+
 AC_LANG_POP()
 
 # Checks for libraries.
@@ -256,9 +268,9 @@ if test "x${have_zlib}" = "xno"; then
 fi
 
 # dl: openssl requires libdl when it is statically linked.
-LIBS_OLD=$LIBS
+ac_save_LIBS=$LIBS
 AC_SEARCH_LIBS([dlopen], [dl], [APPLDFLAGS="-ldl $APPLDFLAGS"], [], [])
-LIBS=$LIBS_OLD
+LIBS=$ac_save_LIBS
 
 # cunit
 PKG_CHECK_MODULES([CUNIT], [cunit >= 2.1], [have_cunit=yes], [have_cunit=no])
@@ -291,7 +303,7 @@ AM_CONDITIONAL([HAVE_CUNIT], [ test "x${have_cunit}" = "xyes" ])
 
 # libev (for src)
 # libev does not have pkg-config file.  Check it in an old way.
-LIBS_OLD=$LIBS
+ac_save_LIBS=$LIBS
 # android requires -lm for floor
 AC_CHECK_LIB([ev], [ev_time], [have_libev=yes], [have_libev=no], [-lm])
 if test "x${have_libev}" = "xyes"; then
@@ -303,7 +315,7 @@ if test "x${have_libev}" = "xyes"; then
     AC_SUBST([LIBEV_CFLAGS])
   fi
 fi
-LIBS=$LIBS_OLD
+LIBS=$ac_save_LIBS
 
 # openssl (for src)
 PKG_CHECK_MODULES([OPENSSL], [openssl >= 1.0.1],
@@ -349,7 +361,7 @@ AM_CONDITIONAL([HAVE_LIBXML2], [ test "x${have_libxml2}" = "xyes" ])
 # jemalloc
 have_jemalloc=no
 if test "x${request_jemalloc}" != "xno"; then
-  LIBS_OLD=$LIBS
+  ac_save_LIBS=$LIBS
   AC_SEARCH_LIBS([malloc_stats_print], [jemalloc], [have_jemalloc=yes], [],
                  [$PTHREAD_LDFLAGS])
 
@@ -365,7 +377,7 @@ if test "x${request_jemalloc}" != "xno"; then
     fi
   fi
 
-  LIBS=$LIBS_OLD
+  LIBS=$ac_save_LIBS
 
   if test "x${have_jemalloc}" = "xyes" &&
      test "x${jemalloc_libs}" != "xnone required"; then
@@ -797,6 +809,7 @@ AC_MSG_NOTICE([summary of build options:
       C preprocessor: ${CPP}
       CPPFLAGS:       ${CPPFLAGS}
       WARNCFLAGS:     ${WARNCFLAGS}
+      CXX1XCXXFLAGS:  ${CXX1XCXXFLAGS}
       EXTRACFLAG:     ${EXTRACFLAG}
       LIBS:           ${LIBS}
     Library:
