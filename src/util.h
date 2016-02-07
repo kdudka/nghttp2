@@ -54,14 +54,14 @@ namespace nghttp2 {
 // The additional HTTP/2 protocol ALPN protocol identifier we also
 // supports for our applications to make smooth migration into final
 // h2 ALPN ID.
-constexpr const char NGHTTP2_H2_16_ALPN[] = "\x5h2-16";
-constexpr const char NGHTTP2_H2_16[] = "h2-16";
+constexpr char NGHTTP2_H2_16_ALPN[] = "\x5h2-16";
+constexpr char NGHTTP2_H2_16[] = "h2-16";
 
-constexpr const char NGHTTP2_H2_14_ALPN[] = "\x5h2-14";
-constexpr const char NGHTTP2_H2_14[] = "h2-14";
+constexpr char NGHTTP2_H2_14_ALPN[] = "\x5h2-14";
+constexpr char NGHTTP2_H2_14[] = "h2-14";
 
-constexpr const char NGHTTP2_H1_1_ALPN[] = "\x8http/1.1";
-constexpr const char NGHTTP2_H1_1[] = "http/1.1";
+constexpr char NGHTTP2_H1_1_ALPN[] = "\x8http/1.1";
+constexpr char NGHTTP2_H1_1[] = "http/1.1";
 
 namespace util {
 
@@ -217,8 +217,8 @@ bool istarts_with(InputIt a, size_t an, const char *b) {
 
 bool istarts_with(const char *a, const char *b);
 
-template <size_t N>
-bool istarts_with_l(const std::string &a, const char(&b)[N]) {
+template <typename CharT, size_t N>
+bool istarts_with_l(const std::string &a, const CharT(&b)[N]) {
   return istarts_with(std::begin(a), std::end(a), b, b + N - 1);
 }
 
@@ -248,7 +248,8 @@ inline bool iends_with(const std::string &a, const std::string &b) {
   return iends_with(std::begin(a), std::end(a), std::begin(b), std::end(b));
 }
 
-template <size_t N> bool iends_with_l(const std::string &a, const char(&b)[N]) {
+template <typename CharT, size_t N>
+bool iends_with_l(const std::string &a, const CharT(&b)[N]) {
   return iends_with(std::begin(a), std::end(a), b, b + N - 1);
 }
 
@@ -291,12 +292,13 @@ inline bool strieq(const char *a, const std::string &b) {
   return strieq(a, b.c_str(), b.size());
 }
 
-template <typename InputIt, size_t N>
-bool strieq_l(const char(&a)[N], InputIt b, size_t blen) {
+template <typename CharT, typename InputIt, size_t N>
+bool strieq_l(const CharT(&a)[N], InputIt b, size_t blen) {
   return strieq(a, N - 1, b, blen);
 }
 
-template <size_t N> bool strieq_l(const char(&a)[N], const std::string &b) {
+template <typename CharT, size_t N>
+bool strieq_l(const CharT(&a)[N], const std::string &b) {
   return strieq(a, N - 1, std::begin(b), b.size());
 }
 
@@ -325,12 +327,13 @@ inline bool streq(const char *a, const char *b) {
   return streq(a, strlen(a), b, strlen(b));
 }
 
-template <typename InputIt, size_t N>
-bool streq_l(const char(&a)[N], InputIt b, size_t blen) {
+template <typename CharT, typename InputIt, size_t N>
+bool streq_l(const CharT(&a)[N], InputIt b, size_t blen) {
   return streq(a, N - 1, b, blen);
 }
 
-template <size_t N> bool streq_l(const char(&a)[N], const std::string &b) {
+template <typename CharT, size_t N>
+bool streq_l(const CharT(&a)[N], const std::string &b) {
   return streq(a, N - 1, std::begin(b), b.size());
 }
 
