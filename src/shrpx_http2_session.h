@@ -90,7 +90,7 @@ public:
   int do_read();
   int do_write();
 
-  int on_read();
+  int on_read(const uint8_t *data, size_t datalen);
   int on_write();
 
   int connected();
@@ -100,13 +100,15 @@ public:
   int read_tls();
   int write_tls();
 
-  int downstream_read_proxy();
+  int downstream_read_proxy(const uint8_t *data, size_t datalen);
   int downstream_connect_proxy();
 
-  int downstream_read();
+  int downstream_read(const uint8_t *data, size_t datalen);
   int downstream_write();
 
   int noop();
+  int read_noop(const uint8_t *data, size_t datalen);
+  int write_noop();
 
   void signal_write();
 
@@ -183,10 +185,10 @@ public:
   };
 
   using ReadBuf = Buffer<8_k>;
-  using WriteBuf = Buffer<32768>;
 
 private:
   Connection conn_;
+  DefaultMemchunks wb_;
   ev_timer settings_timer_;
   // This timer has 2 purpose: when it first timeout, set
   // connection_check_state_ = CONNECTION_CHECK_REQUIRED.  After
@@ -196,7 +198,8 @@ private:
   DList<Http2DownstreamConnection> dconns_;
   DList<StreamData> streams_;
   std::function<int(Http2Session &)> read_, write_;
-  std::function<int(Http2Session &)> on_read_, on_write_;
+  std::function<int(Http2Session &, const uint8_t *, size_t)> on_read_;
+  std::function<int(Http2Session &)> on_write_;
   // Used to parse the response from HTTP proxy
   std::unique_ptr<http_parser> proxy_htp_;
   Worker *worker_;
@@ -206,8 +209,6 @@ private:
   // Address of remote endpoint
   const DownstreamAddr *addr_;
   nghttp2_session *session_;
-  const uint8_t *data_pending_;
-  size_t data_pendinglen_;
   size_t group_;
   // index inside group, this is used to pin frontend to certain
   // HTTP/2 backend for better throughput.
@@ -215,8 +216,6 @@ private:
   int state_;
   int connection_check_state_;
   bool flow_control_;
-  WriteBuf wb_;
-  ReadBuf rb_;
 };
 
 nghttp2_session_callbacks *create_http2_downstream_callbacks();
