@@ -209,6 +209,23 @@ constexpr char SHRPX_OPT_NO_HTTP2_CIPHER_BLACK_LIST[] =
 constexpr char SHRPX_OPT_BACKEND_HTTP1_TLS[] = "backend-http1-tls";
 constexpr char SHRPX_OPT_BACKEND_TLS_SESSION_CACHE_PER_WORKER[] =
     "backend-tls-session-cache-per-worker";
+constexpr char SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_TLS[] =
+    "tls-session-cache-memcached-tls";
+constexpr char SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE[] =
+    "tls-session-cache-memcached-cert-file";
+constexpr char SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE[] =
+    "tls-session-cache-memcached-private-key-file";
+constexpr char SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY[] =
+    "tls-session-cache-memcached-address-family";
+constexpr char SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_TLS[] =
+    "tls-ticket-key-memcached-tls";
+constexpr char SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_CERT_FILE[] =
+    "tls-ticket-key-memcached-cert-file";
+constexpr char SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE[] =
+    "tls-ticket-key-memcached-private-key-file";
+constexpr char SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY[] =
+    "tls-ticket-key-memcached-address-family";
+constexpr char SHRPX_OPT_BACKEND_ADDRESS_FAMILY[] = "backend-address-family";
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
@@ -335,6 +352,9 @@ struct TLSConfig {
       Address addr;
       uint16_t port;
       std::unique_ptr<char[]> host;
+      // Client private key and certificate for authentication
+      ImmutableString private_key_file;
+      ImmutableString cert_file;
       ev_tstamp interval;
       // Maximum number of retries when getting TLS ticket key from
       // mamcached, due to network error.
@@ -342,6 +362,10 @@ struct TLSConfig {
       // Maximum number of consecutive error from memcached, when this
       // limit reached, TLS ticket is disabled.
       size_t max_fail;
+      // Address family of memcached connection.  One of either
+      // AF_INET, AF_INET6 or AF_UNSPEC.
+      int family;
+      bool tls;
     } memcached;
     std::vector<std::string> files;
     const EVP_CIPHER *cipher;
@@ -355,6 +379,13 @@ struct TLSConfig {
       Address addr;
       uint16_t port;
       std::unique_ptr<char[]> host;
+      // Client private key and certificate for authentication
+      ImmutableString private_key_file;
+      ImmutableString cert_file;
+      // Address family of memcached connection.  One of either
+      // AF_INET, AF_INET6 or AF_UNSPEC.
+      int family;
+      bool tls;
     } memcached;
   } session_cache;
 
@@ -537,13 +568,12 @@ struct ConnectionConfig {
     size_t response_buffer_size;
     // downstream protocol; this will be determined by given options.
     shrpx_proto proto;
+    // Address family of backend connection.  One of either AF_INET,
+    // AF_INET6 or AF_UNSPEC.  This is ignored if backend connection
+    // is made via Unix domain socket.
+    int family;
     bool no_tls;
     bool http1_tls;
-    // true if IPv4 only; ipv4 and ipv6 are mutually exclusive; and
-    // (ipv4 && ipv6) must be false.
-    bool ipv4;
-    // true if IPv6 only
-    bool ipv6;
   } downstream;
 };
 

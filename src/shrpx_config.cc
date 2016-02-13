@@ -576,6 +576,26 @@ std::vector<LogFragment> parse_log_format(const char *optarg) {
 }
 
 namespace {
+int parse_address_family(int *dest, const char *opt, const char *optarg) {
+  if (util::strieq("auto", optarg)) {
+    *dest = AF_UNSPEC;
+    return 0;
+  }
+  if (util::strieq("IPv4", optarg)) {
+    *dest = AF_INET;
+    return 0;
+  }
+  if (util::strieq("IPv6", optarg)) {
+    *dest = AF_INET6;
+    return 0;
+  }
+
+  LOG(ERROR) << opt << ": bad value: '" << optarg << "'";
+  return -1;
+}
+} // namespace
+
+namespace {
 int parse_duration(ev_tstamp *dest, const char *opt, const char *optarg) {
   auto t = util::parse_duration_with_unit(optarg);
   if (t == std::numeric_limits<double>::infinity()) {
@@ -673,6 +693,7 @@ enum {
   SHRPX_OPTID_ADD_X_FORWARDED_FOR,
   SHRPX_OPTID_ALTSVC,
   SHRPX_OPTID_BACKEND,
+  SHRPX_OPTID_BACKEND_ADDRESS_FAMILY,
   SHRPX_OPTID_BACKEND_HTTP_PROXY_URI,
   SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND,
   SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_HOST,
@@ -758,12 +779,20 @@ enum {
   SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD,
   SHRPX_OPTID_TLS_PROTO_LIST,
   SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS,
   SHRPX_OPTID_TLS_TICKET_KEY_CIPHER,
   SHRPX_OPTID_TLS_TICKET_KEY_FILE,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_INTERVAL,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE,
+  SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS,
   SHRPX_OPTID_USER,
   SHRPX_OPTID_VERIFY_CLIENT,
   SHRPX_OPTID_VERIFY_CLIENT_CACERT,
@@ -1204,6 +1233,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_FRONTEND_WRITE_TIMEOUT;
       }
       break;
+    case 'y':
+      if (util::strieq_l("backend-address-famil", name, 21)) {
+        return SHRPX_OPTID_BACKEND_ADDRESS_FAMILY;
+      }
+      break;
     }
     break;
   case 23:
@@ -1325,6 +1359,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("http2-max-concurrent-stream", name, 27)) {
         return SHRPX_OPTID_HTTP2_MAX_CONCURRENT_STREAMS;
       }
+      if (util::strieq_l("tls-ticket-key-memcached-tl", name, 27)) {
+        return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS;
+      }
       break;
     }
     break;
@@ -1333,6 +1370,15 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 'r':
       if (util::strieq_l("strip-incoming-x-forwarded-fo", name, 29)) {
         return SHRPX_OPTID_STRIP_INCOMING_X_FORWARDED_FOR;
+      }
+      break;
+    }
+    break;
+  case 31:
+    switch (name[30]) {
+    case 's':
+      if (util::strieq_l("tls-session-cache-memcached-tl", name, 30)) {
+        return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS;
       }
       break;
     }
@@ -1351,6 +1397,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 34:
     switch (name[33]) {
+    case 'e':
+      if (util::strieq_l("tls-ticket-key-memcached-cert-fil", name, 33)) {
+        return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE;
+      }
+      break;
     case 'r':
       if (util::strieq_l("frontend-http2-dump-request-heade", name, 33)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_DUMP_REQUEST_HEADER;
@@ -1396,6 +1447,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 37:
     switch (name[36]) {
+    case 'e':
+      if (util::strieq_l("tls-session-cache-memcached-cert-fil", name, 36)) {
+        return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE;
+      }
+      break;
     case 's':
       if (util::strieq_l("frontend-http2-connection-window-bit", name, 36)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS;
@@ -1408,6 +1464,45 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 'd':
       if (util::strieq_l("backend-http1-connections-per-fronten", name, 37)) {
         return SHRPX_OPTID_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND;
+      }
+      break;
+    }
+    break;
+  case 39:
+    switch (name[38]) {
+    case 'y':
+      if (util::strieq_l("tls-ticket-key-memcached-address-famil", name, 38)) {
+        return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY;
+      }
+      break;
+    }
+    break;
+  case 41:
+    switch (name[40]) {
+    case 'e':
+      if (util::strieq_l("tls-ticket-key-memcached-private-key-fil", name,
+                         40)) {
+        return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE;
+      }
+      break;
+    }
+    break;
+  case 42:
+    switch (name[41]) {
+    case 'y':
+      if (util::strieq_l("tls-session-cache-memcached-address-famil", name,
+                         41)) {
+        return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY;
+      }
+      break;
+    }
+    break;
+  case 44:
+    switch (name[43]) {
+    case 'e':
+      if (util::strieq_l("tls-session-cache-memcached-private-key-fil", name,
+                         43)) {
+        return SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE;
       }
       break;
     }
@@ -1765,11 +1860,17 @@ int parse_config(const char *opt, const char *optarg,
 
     return 0;
   case SHRPX_OPTID_BACKEND_IPV4:
-    mod_config()->conn.downstream.ipv4 = util::strieq(optarg, "yes");
+    LOG(WARN) << opt
+              << ": deprecated.  Use backend-address-family=IPv4 instead.";
+
+    mod_config()->conn.downstream.family = AF_INET;
 
     return 0;
   case SHRPX_OPTID_BACKEND_IPV6:
-    mod_config()->conn.downstream.ipv6 = util::strieq(optarg, "yes");
+    LOG(WARN) << opt
+              << ": deprecated.  Use backend-address-family=IPv6 instead.";
+
+    mod_config()->conn.downstream.family = AF_INET6;
 
     return 0;
   case SHRPX_OPTID_BACKEND_HTTP_PROXY_URI: {
@@ -2229,6 +2330,39 @@ int parse_config(const char *opt, const char *optarg,
   case SHRPX_OPTID_BACKEND_TLS_SESSION_CACHE_PER_WORKER:
     return parse_uint(&mod_config()->tls.downstream_session_cache_per_worker,
                       opt, optarg);
+  case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_TLS:
+    mod_config()->tls.session_cache.memcached.tls = util::strieq(optarg, "yes");
+
+    return 0;
+  case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE:
+    mod_config()->tls.session_cache.memcached.cert_file = optarg;
+
+    return 0;
+  case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE:
+    mod_config()->tls.session_cache.memcached.private_key_file = optarg;
+
+    return 0;
+  case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS:
+    mod_config()->tls.ticket.memcached.tls = util::strieq(optarg, "yes");
+
+    return 0;
+  case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_CERT_FILE:
+    mod_config()->tls.ticket.memcached.cert_file = optarg;
+
+    return 0;
+  case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE:
+    mod_config()->tls.ticket.memcached.private_key_file = optarg;
+
+    return 0;
+  case SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY:
+    return parse_address_family(&mod_config()->tls.ticket.memcached.family, opt,
+                                optarg);
+  case SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY:
+    return parse_address_family(
+        &mod_config()->tls.session_cache.memcached.family, opt, optarg);
+  case SHRPX_OPTID_BACKEND_ADDRESS_FAMILY:
+    return parse_address_family(&mod_config()->conn.downstream.family, opt,
+                                optarg);
   case SHRPX_OPTID_CONF:
     LOG(WARN) << "conf: ignored";
 
