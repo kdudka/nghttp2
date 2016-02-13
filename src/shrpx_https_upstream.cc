@@ -798,6 +798,15 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
     output->append("\r\n");
   }
 
+  auto &httpconf = get_config()->http;
+
+  for (auto &p : httpconf.add_response_headers) {
+    output->append(p.name);
+    output->append(": ");
+    output->append(p.value);
+    output->append("\r\n");
+  }
+
   output->append("\r\n");
 
   output->append(body, bodylen);
@@ -1022,9 +1031,9 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
   }
 
   for (auto &p : httpconf.add_response_headers) {
-    buf->append(p.first);
+    buf->append(p.name);
     buf->append(": ");
-    buf->append(p.second);
+    buf->append(p.value);
     buf->append("\r\n");
   }
 
