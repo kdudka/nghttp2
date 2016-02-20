@@ -142,7 +142,7 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
             Downstream::HTTP1_REQUEST_HEADER_TOO_LARGE);
         return -1;
       }
-      req.fs.add_header(std::string(data, len), "");
+      req.fs.add_header_lower(StringRef{data, len}, StringRef{}, false);
     }
   } else {
     // trailer part
@@ -156,7 +156,7 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
         }
         return -1;
       }
-      req.fs.add_trailer(std::string(data, len), "");
+      req.fs.add_trailer_lower(StringRef{data, len}, StringRef{}, false);
     }
   }
   return 0;
@@ -270,7 +270,7 @@ int htp_hdrs_completecb(http_parser *htp) {
     ULOG(INFO, upstream) << "HTTP request headers\n" << ss.str();
   }
 
-  if (req.fs.index_headers() != 0) {
+  if (req.fs.parse_content_length() != 0) {
     return -1;
   }
 

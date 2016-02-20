@@ -201,17 +201,18 @@ int on_header_callback(nghttp2_session *session, const nghttp2_frame *frame,
     return 0;
   }
 
+  auto token = http2::lookup_token(name, namelen);
+  auto no_index = flags & NGHTTP2_NV_FLAG_NO_INDEX;
+
   if (frame->headers.cat == NGHTTP2_HCAT_HEADERS) {
     // just store header fields for trailer part
-    req.fs.add_trailer(name, namelen, value, valuelen,
-                       flags & NGHTTP2_NV_FLAG_NO_INDEX, -1);
+    req.fs.add_trailer_token(StringRef{name, namelen},
+                             StringRef{value, valuelen}, no_index, token);
     return 0;
   }
 
-  auto token = http2::lookup_token(name, namelen);
-
-  req.fs.add_header(name, namelen, value, valuelen,
-                    flags & NGHTTP2_NV_FLAG_NO_INDEX, token);
+  req.fs.add_header_token(StringRef{name, namelen}, StringRef{value, valuelen},
+                          no_index, token);
   return 0;
 }
 } // namespace
@@ -593,8 +594,9 @@ int on_frame_send_callback(nghttp2_session *session, const nghttp2_frame *frame,
         req.path = http2::rewrite_clean_path(nv.value, nv.value + nv.valuelen);
         break;
       }
-      req.fs.add_header(nv.name, nv.namelen, nv.value, nv.valuelen,
-                        nv.flags & NGHTTP2_NV_FLAG_NO_INDEX, token);
+      req.fs.add_header_token(StringRef{nv.name, nv.namelen},
+                              StringRef{nv.value, nv.valuelen},
+                              nv.flags & NGHTTP2_NV_FLAG_NO_INDEX, token);
     }
 
     promised_downstream->inspect_http2_request();

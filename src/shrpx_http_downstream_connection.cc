@@ -572,7 +572,7 @@ int htp_hdrs_completecb(http_parser *htp) {
   resp.http_major = htp->http_major;
   resp.http_minor = htp->http_minor;
 
-  if (resp.fs.index_headers() != 0) {
+  if (resp.fs.parse_content_length() != 0) {
     downstream->set_response_state(Downstream::MSG_BAD_HEADER);
     return -1;
   }
@@ -691,7 +691,7 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
       if (ensure_max_header_fields(downstream, httpconf) != 0) {
         return -1;
       }
-      resp.fs.add_header(std::string(data, len), "");
+      resp.fs.add_header_lower(StringRef{data, len}, StringRef{}, false);
     }
   } else {
     // trailer part
@@ -704,7 +704,7 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
         // wrong place or crash if trailer fields are currently empty.
         return -1;
       }
-      resp.fs.add_trailer(std::string(data, len), "");
+      resp.fs.add_trailer_lower(StringRef(data, len), StringRef{}, false);
     }
   }
   return 0;
