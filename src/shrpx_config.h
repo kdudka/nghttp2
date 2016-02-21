@@ -53,12 +53,14 @@
 #include "shrpx_router.h"
 #include "template.h"
 #include "http2.h"
+#include "network.h"
 
 using namespace nghttp2;
 
 namespace shrpx {
 
 struct LogFragment;
+class ConnectBlocker;
 
 namespace ssl {
 
@@ -230,19 +232,6 @@ constexpr char SHRPX_OPT_BACKEND_ADDRESS_FAMILY[] = "backend-address-family";
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
-union sockaddr_union {
-  sockaddr_storage storage;
-  sockaddr sa;
-  sockaddr_in6 in6;
-  sockaddr_in in;
-  sockaddr_un un;
-};
-
-struct Address {
-  size_t len;
-  union sockaddr_union su;
-};
-
 enum shrpx_proto { PROTO_HTTP2, PROTO_HTTP };
 
 enum shrpx_forwarded_param {
@@ -288,12 +277,23 @@ struct UpstreamAddr {
   int fd;
 };
 
+struct TLSSessionCache {
+  // ASN1 representation of SSL_SESSION object.  See
+  // i2d_SSL_SESSION(3SSL).
+  std::vector<uint8_t> session_data;
+  // The last time stamp when this cache entry is created or updated.
+  ev_tstamp last_updated;
+};
+
 struct DownstreamAddr {
   Address addr;
   // backend address.  If |host_unix| is true, this is UNIX domain
   // socket path.
   ImmutableString host;
   ImmutableString hostport;
+  ConnectBlocker *connect_blocker;
+  // Client side TLS session cache
+  TLSSessionCache tls_session_cache;
   // backend port.  0 if |host_unix| is true.
   uint16_t port;
   // true if |host| contains UNIX domain socket path.
