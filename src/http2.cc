@@ -865,30 +865,53 @@ bool check_link_param_empty(const char *first, const char *last,
 } // namespace
 
 namespace {
+// Returns true if link-param consists of only parmname, and it
+// matches string [pat, pat + patlen).
+bool check_link_param_without_value(const char *first, const char *last,
+                                    const char *pat, size_t patlen) {
+  if (first + patlen > last) {
+    return false;
+  }
+
+  if (first + patlen == last) {
+    return std::equal(pat, pat + patlen, first, util::CaseCmp());
+  }
+
+  switch (*(first + patlen)) {
+  case ';':
+  case ',':
+    return std::equal(pat, pat + patlen, first, util::CaseCmp());
+  }
+
+  return false;
+}
+} // namespace
+
+namespace {
 std::pair<LinkHeader, const char *>
 parse_next_link_header_once(const char *first, const char *last) {
   first = skip_to_next_field(first, last);
   if (first == last || *first != '<') {
-    return {{{nullptr, nullptr}}, last};
+    return {{StringRef{}}, last};
   }
   auto url_first = ++first;
   first = std::find(first, last, '>');
   if (first == last) {
-    return {{{nullptr, nullptr}}, first};
+    return {{StringRef{}}, first};
   }
   auto url_last = first++;
   if (first == last) {
-    return {{{nullptr, nullptr}}, first};
+    return {{StringRef{}}, first};
   }
   // we expect ';' or ',' here
   switch (*first) {
   case ',':
-    return {{{nullptr, nullptr}}, ++first};
+    return {{StringRef{}}, ++first};
   case ';':
     ++first;
     break;
   default:
-    return {{{nullptr, nullptr}}, last};
+    return {{StringRef{}}, last};
   }
 
   auto ok = false;
@@ -896,103 +919,113 @@ parse_next_link_header_once(const char *first, const char *last) {
   for (;;) {
     first = skip_lws(first, last);
     if (first == last) {
-      return {{{nullptr, nullptr}}, first};
+      return {{StringRef{}}, first};
     }
     // we expect link-param
 
-    // rel can take several relations using quoted form.
-    static constexpr char PLP[] = "rel=\"";
-    static constexpr size_t PLPLEN = sizeof(PLP) - 1;
+    if (!ign) {
+      // rel can take several relations using quoted form.
+      static constexpr char PLP[] = "rel=\"";
+      static constexpr size_t PLPLEN = str_size(PLP);
 
-    static constexpr char PLT[] = "preload";
-    static constexpr size_t PLTLEN = sizeof(PLT) - 1;
-    if (first + PLPLEN < last && *(first + PLPLEN - 1) == '"' &&
-        std::equal(PLP, PLP + PLPLEN, first, util::CaseCmp())) {
-      // we have to search preload in whitespace separated list:
-      // rel="preload something http://example.org/foo"
-      first += PLPLEN;
-      auto start = first;
-      for (; first != last;) {
-        if (*first != ' ' && *first != '"') {
+      static constexpr char PLT[] = "preload";
+      static constexpr size_t PLTLEN = str_size(PLT);
+      if (first + PLPLEN < last && *(first + PLPLEN - 1) == '"' &&
+          std::equal(PLP, PLP + PLPLEN, first, util::CaseCmp())) {
+        // we have to search preload in whitespace separated list:
+        // rel="preload something http://example.org/foo"
+        first += PLPLEN;
+        auto start = first;
+        for (; first != last;) {
+          if (*first != ' ' && *first != '"') {
+            ++first;
+            continue;
+          }
+
+          if (start == first) {
+            return {{StringRef{}}, last};
+          }
+
+          if (!ok && start + PLTLEN == first &&
+              std::equal(PLT, PLT + PLTLEN, start, util::CaseCmp())) {
+            ok = true;
+          }
+
+          if (*first == '"') {
+            break;
+          }
+          first = skip_lws(first, last);
+          start = first;
+        }
+        if (first == last) {
+          return {{StringRef{}}, first};
+        }
+        assert(*first == '"');
+        ++first;
+        if (first == last || *first == ',') {
+          goto almost_done;
+        }
+        if (*first == ';') {
           ++first;
+          // parse next link-param
           continue;
         }
-
-        if (start == first) {
-          return {{{nullptr, nullptr}}, last};
+        return {{StringRef{}}, last};
+      }
+      // we are only interested in rel=preload parameter.  Others are
+      // simply skipped.
+      static constexpr char PL[] = "rel=preload";
+      static constexpr size_t PLLEN = str_size(PL);
+      if (first + PLLEN == last) {
+        if (std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
+          // ok = true;
+          // this is the end of sequence
+          return {{{url_first, url_last}}, last};
         }
-
-        if (!ok && start + PLTLEN == first &&
-            std::equal(PLT, PLT + PLTLEN, start, util::CaseCmp())) {
+      } else if (first + PLLEN + 1 <= last) {
+        switch (*(first + PLLEN)) {
+        case ',':
+          if (!std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
+            break;
+          }
+          // ok = true;
+          // skip including ','
+          first += PLLEN + 1;
+          return {{{url_first, url_last}}, first};
+        case ';':
+          if (!std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
+            break;
+          }
           ok = true;
+          // skip including ';'
+          first += PLLEN + 1;
+          // continue parse next link-param
+          continue;
         }
+      }
+      // we have to reject URI if we have nonempty anchor parameter.
+      static constexpr char ANCHOR[] = "anchor=";
+      static constexpr size_t ANCHORLEN = str_size(ANCHOR);
+      if (!ign && !check_link_param_empty(first, last, ANCHOR, ANCHORLEN)) {
+        ign = true;
+      }
 
-        if (*first == '"') {
-          break;
-        }
-        first = skip_lws(first, last);
-        start = first;
+      // reject URI if we have non-empty loadpolicy.  This could be
+      // tightened up to just pick up "next" or "insert".
+      static constexpr char LOADPOLICY[] = "loadpolicy=";
+      static constexpr size_t LOADPOLICYLEN = str_size(LOADPOLICY);
+      if (!ign &&
+          !check_link_param_empty(first, last, LOADPOLICY, LOADPOLICYLEN)) {
+        ign = true;
       }
-      if (first == last) {
-        return {{{nullptr, nullptr}}, first};
-      }
-      assert(*first == '"');
-      ++first;
-      if (first == last || *first == ',') {
-        goto almost_done;
-      }
-      if (*first == ';') {
-        ++first;
-        // parse next link-param
-        continue;
-      }
-      return {{{nullptr, nullptr}}, last};
-    }
-    // we are only interested in rel=preload parameter.  Others are
-    // simply skipped.
-    static constexpr char PL[] = "rel=preload";
-    static constexpr size_t PLLEN = sizeof(PL) - 1;
-    if (first + PLLEN == last) {
-      if (std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
-        // ok = true;
-        // this is the end of sequence
-        return {{{url_first, url_last}}, last};
-      }
-    } else if (first + PLLEN + 1 <= last) {
-      switch (*(first + PLLEN)) {
-      case ',':
-        if (!std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
-          break;
-        }
-        // ok = true;
-        // skip including ','
-        first += PLLEN + 1;
-        return {{{url_first, url_last}}, first};
-      case ';':
-        if (!std::equal(PL, PL + PLLEN, first, util::CaseCmp())) {
-          break;
-        }
-        ok = true;
-        // skip including ';'
-        first += PLLEN + 1;
-        // continue parse next link-param
-        continue;
-      }
-    }
-    // we have to reject URI if we have nonempty anchor parameter.
-    static constexpr char ANCHOR[] = "anchor=";
-    static constexpr size_t ANCHORLEN = sizeof(ANCHOR) - 1;
-    if (!ign && !check_link_param_empty(first, last, ANCHOR, ANCHORLEN)) {
-      ign = true;
-    }
 
-    // reject URI if we have non-empty loadpolicy.  This could be
-    // tightened up to just pick up "next" or "insert".
-    static constexpr char LOADPOLICY[] = "loadpolicy=";
-    static constexpr size_t LOADPOLICYLEN = sizeof(LOADPOLICY) - 1;
-    if (!ign &&
-        !check_link_param_empty(first, last, LOADPOLICY, LOADPOLICYLEN)) {
-      ign = true;
+      // reject URI if we have nopush attribute.
+      static constexpr char NOPUSH[] = "nopush";
+      static constexpr size_t NOPUSHLEN = str_size(NOPUSH);
+      if (!ign &&
+          check_link_param_without_value(first, last, NOPUSH, NOPUSHLEN)) {
+        ign = true;
+      }
     }
 
     auto param_first = first;
@@ -1012,11 +1045,11 @@ parse_next_link_header_once(const char *first, const char *last) {
       if (*first == '=' || *first == ';' || *first == ',') {
         break;
       }
-      return {{{nullptr, nullptr}}, last};
+      return {{StringRef{}}, last};
     }
     if (param_first == first) {
       // empty parmname
-      return {{{nullptr, nullptr}}, last};
+      return {{StringRef{}}, last};
     }
     // link-param without value is acceptable (see link-extension) if
     // it is not followed by '='
@@ -1033,13 +1066,13 @@ parse_next_link_header_once(const char *first, const char *last) {
     ++first;
     if (first == last) {
       // empty value is not acceptable
-      return {{{nullptr, nullptr}}, first};
+      return {{StringRef{}}, first};
     }
     if (*first == '"') {
       // quoted-string
       first = skip_to_right_dquote(first + 1, last);
       if (first == last) {
-        return {{{nullptr, nullptr}}, first};
+        return {{StringRef{}}, first};
       }
       ++first;
       if (first == last || *first == ',') {
@@ -1050,12 +1083,12 @@ parse_next_link_header_once(const char *first, const char *last) {
         // parse next link-param
         continue;
       }
-      return {{{nullptr, nullptr}}, last};
+      return {{StringRef{}}, last};
     }
     // not quoted-string, skip to next ',' or ';'
     if (*first == ',' || *first == ';') {
       // empty value
-      return {{{nullptr, nullptr}}, last};
+      return {{StringRef{}}, last};
     }
     for (; first != last; ++first) {
       if (*first == ',' || *first == ';') {
@@ -1079,7 +1112,7 @@ almost_done:
   if (ok && !ign) {
     return {{{url_first, url_last}}, first};
   }
-  return {{{nullptr, nullptr}}, first};
+  return {{StringRef{}}, first};
 }
 } // namespace
 
@@ -1090,8 +1123,9 @@ std::vector<LinkHeader> parse_link_header(const char *src, size_t len) {
   for (; first != last;) {
     auto rv = parse_next_link_header_once(first, last);
     first = rv.second;
-    if (rv.first.uri.first != nullptr && rv.first.uri.second != nullptr) {
-      res.push_back(rv.first);
+    auto &link = rv.first;
+    if (!link.uri.empty()) {
+      res.push_back(link);
     }
   }
   return res;
@@ -1151,39 +1185,37 @@ void eat_dir(std::string &path) {
 }
 } // namespace
 
-std::string path_join(const char *base_path, size_t base_pathlen,
-                      const char *base_query, size_t base_querylen,
-                      const char *rel_path, size_t rel_pathlen,
-                      const char *rel_query, size_t rel_querylen) {
+std::string path_join(const StringRef &base_path, const StringRef &base_query,
+                      const StringRef &rel_path, const StringRef &rel_query) {
   std::string res;
-  if (rel_pathlen == 0) {
-    if (base_pathlen == 0) {
+  if (rel_path.empty()) {
+    if (base_path.empty()) {
       res = "/";
     } else {
-      res.assign(base_path, base_pathlen);
+      res.assign(std::begin(base_path), std::end(base_path));
     }
-    if (rel_querylen == 0) {
-      if (base_querylen) {
+    if (rel_query.empty()) {
+      if (!base_query.empty()) {
         res += '?';
-        res.append(base_query, base_querylen);
+        res.append(std::begin(base_query), std::end(base_query));
       }
       return res;
     }
     res += '?';
-    res.append(rel_query, rel_querylen);
+    res.append(std::begin(rel_query), std::end(rel_query));
     return res;
   }
 
-  auto first = rel_path;
-  auto last = rel_path + rel_pathlen;
+  auto first = std::begin(rel_path);
+  auto last = std::end(rel_path);
 
   if (rel_path[0] == '/') {
     res = "/";
     ++first;
-  } else if (base_pathlen == 0) {
+  } else if (base_path.empty()) {
     res = "/";
   } else {
-    res.assign(base_path, base_pathlen);
+    res.assign(std::begin(base_path), std::end(base_path));
   }
 
   for (; first != last;) {
@@ -1220,9 +1252,9 @@ std::string path_join(const char *base_path, size_t base_pathlen,
     for (; first != last && *first == '/'; ++first)
       ;
   }
-  if (rel_querylen) {
+  if (!rel_query.empty()) {
     res += '?';
-    res.append(rel_query, rel_querylen);
+    res.append(std::begin(rel_query), std::end(rel_query));
   }
   return res;
 }
@@ -1421,40 +1453,32 @@ StringRef to_method_string(int method_token) {
   return StringRef{http_method_str(static_cast<http_method>(method_token))};
 }
 
-int get_pure_path_component(const char **base, size_t *baselen,
-                            const std::string &uri) {
+StringRef get_pure_path_component(const std::string &uri) {
   int rv;
 
   http_parser_url u{};
   rv = http_parser_parse_url(uri.c_str(), uri.size(), 0, &u);
   if (rv != 0) {
-    return -1;
+    return StringRef{};
   }
 
   if (u.field_set & (1 << UF_PATH)) {
     auto &f = u.field_data[UF_PATH];
-    *base = uri.c_str() + f.off;
-    *baselen = f.len;
-
-    return 0;
+    return StringRef{uri.c_str() + f.off, f.len};
   }
 
-  *base = "/";
-  *baselen = 1;
-
-  return 0;
+  return StringRef::from_lit("/");
 }
 
 int construct_push_component(std::string &scheme, std::string &authority,
-                             std::string &path, const char *base,
-                             size_t baselen, const char *uri, size_t len) {
+                             std::string &path, const StringRef &base,
+                             const StringRef &uri) {
   int rv;
-  const char *rel, *relq = nullptr;
-  size_t rellen, relqlen = 0;
+  StringRef rel, relq;
 
   http_parser_url u{};
 
-  rv = http_parser_parse_url(uri, len, 0, &u);
+  rv = http_parser_parse_url(uri.c_str(), uri.size(), 0, &u);
 
   if (rv != 0) {
     if (uri[0] == '/') {
@@ -1462,22 +1486,20 @@ int construct_push_component(std::string &scheme, std::string &authority,
     }
 
     // treat link_url as relative URI.
-    auto end = std::find(uri, uri + len, '#');
-    auto q = std::find(uri, end, '?');
+    auto end = std::find(std::begin(uri), std::end(uri), '#');
+    auto q = std::find(std::begin(uri), end, '?');
 
-    rel = uri;
-    rellen = q - uri;
+    rel = StringRef{std::begin(uri), q};
     if (q != end) {
-      relq = q + 1;
-      relqlen = end - relq;
+      relq = StringRef{q + 1, std::end(uri)};
     }
   } else {
     if (u.field_set & (1 << UF_SCHEMA)) {
-      http2::copy_url_component(scheme, &u, UF_SCHEMA, uri);
+      http2::copy_url_component(scheme, &u, UF_SCHEMA, uri.c_str());
     }
 
     if (u.field_set & (1 << UF_HOST)) {
-      http2::copy_url_component(authority, &u, UF_HOST, uri);
+      http2::copy_url_component(authority, &u, UF_HOST, uri.c_str());
       if (u.field_set & (1 << UF_PORT)) {
         authority += ':';
         authority += util::utos(u.port);
@@ -1486,22 +1508,18 @@ int construct_push_component(std::string &scheme, std::string &authority,
 
     if (u.field_set & (1 << UF_PATH)) {
       auto &f = u.field_data[UF_PATH];
-      rel = uri + f.off;
-      rellen = f.len;
+      rel = StringRef{uri.c_str() + f.off, f.len};
     } else {
-      rel = "/";
-      rellen = 1;
+      rel = StringRef::from_lit("/");
     }
 
     if (u.field_set & (1 << UF_QUERY)) {
       auto &f = u.field_data[UF_QUERY];
-      relq = uri + f.off;
-      relqlen = f.len;
+      relq = StringRef{uri.c_str() + f.off, f.len};
     }
   }
 
-  path =
-      http2::path_join(base, baselen, nullptr, 0, rel, rellen, relq, relqlen);
+  path = http2::path_join(base, StringRef{}, rel, relq);
 
   return 0;
 }

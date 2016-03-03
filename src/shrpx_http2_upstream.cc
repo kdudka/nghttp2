@@ -1734,14 +1734,12 @@ int Http2Upstream::on_downstream_reset(bool no_retry) {
 
 int Http2Upstream::prepare_push_promise(Downstream *downstream) {
   int rv;
-  const char *base;
-  size_t baselen;
 
   const auto &req = downstream->request();
   const auto &resp = downstream->response();
 
-  rv = http2::get_pure_path_component(&base, &baselen, req.path);
-  if (rv != 0) {
+  auto base = http2::get_pure_path_component(req.path);
+  if (base.empty()) {
     return 0;
   }
 
@@ -1752,14 +1750,11 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
     for (auto &link :
          http2::parse_link_header(kv.value.c_str(), kv.value.size())) {
 
-      auto uri = link.uri.first;
-      auto len = link.uri.second - link.uri.first;
-
       const std::string *scheme_ptr, *authority_ptr;
       std::string scheme, authority, path;
 
       rv = http2::construct_push_component(scheme, authority, path, base,
-                                           baselen, uri, len);
+                                           link.uri);
       if (rv != 0) {
         continue;
       }
@@ -1853,29 +1848,24 @@ bool Http2Upstream::push_enabled() const {
            get_config()->http2_proxy);
 }
 
-int Http2Upstream::initiate_push(Downstream *downstream, const char *uri,
-                                 size_t len) {
+int Http2Upstream::initiate_push(Downstream *downstream, const StringRef &uri) {
   int rv;
 
-  if (len == 0 || !push_enabled() || (downstream->get_stream_id() % 2)) {
+  if (uri.empty() || !push_enabled() || (downstream->get_stream_id() % 2)) {
     return 0;
   }
 
-  const char *base;
-  size_t baselen;
-
   const auto &req = downstream->request();
 
-  rv = http2::get_pure_path_component(&base, &baselen, req.path);
-  if (rv != 0) {
+  auto base = http2::get_pure_path_component(req.path);
+  if (base.empty()) {
     return -1;
   }
 
   const std::string *scheme_ptr, *authority_ptr;
   std::string scheme, authority, path;
 
-  rv = http2::construct_push_component(scheme, authority, path, base, baselen,
-                                       uri, len);
+  rv = http2::construct_push_component(scheme, authority, path, base, uri);
   if (rv != 0) {
     return -1;
   }
