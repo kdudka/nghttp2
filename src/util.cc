@@ -339,7 +339,7 @@ std::string iso8601_date(int64_t ms) {
   return res;
 }
 
-time_t parse_http_date(const std::string &s) {
+time_t parse_http_date(const StringRef &s) {
   tm tm{};
   char *r = strptime(s.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
   if (r == 0) {
@@ -591,13 +591,13 @@ bool fieldeq(const char *uri, const http_parser_url &u,
   return i == len && !t[i];
 }
 
-std::string get_uri_field(const char *uri, const http_parser_url &u,
-                          http_parser_url_fields field) {
-  if (util::has_uri_field(u, field)) {
-    return std::string(uri + u.field_data[field].off, u.field_data[field].len);
-  } else {
-    return "";
+StringRef get_uri_field(const char *uri, const http_parser_url &u,
+                        http_parser_url_fields field) {
+  if (!util::has_uri_field(u, field)) {
+    return StringRef{};
   }
+
+  return StringRef{uri + u.field_data[field].off, u.field_data[field].len};
 }
 
 uint16_t get_default_port(const char *uri, const http_parser_url &u) {
@@ -1054,6 +1054,10 @@ int64_t parse_uint(const char *s) {
 
 int64_t parse_uint(const std::string &s) {
   return parse_uint(reinterpret_cast<const uint8_t *>(s.c_str()), s.size());
+}
+
+int64_t parse_uint(const StringRef &s) {
+  return parse_uint(s.byte(), s.size());
 }
 
 int64_t parse_uint(const uint8_t *s, size_t len) {
