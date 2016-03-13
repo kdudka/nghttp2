@@ -69,8 +69,6 @@ Config *mod_config() { return config; }
 
 void create_config() { config = new Config(); }
 
-std::string EMPTY_STRING;
-
 TicketKeys::~TicketKeys() {
   /* Erase keys from memory */
   for (auto &key : keys) {
@@ -2067,7 +2065,7 @@ int parse_config(const char *opt, const char *optarg,
       return -1;
     }
 
-    AltSvc altsvc;
+    AltSvc altsvc{};
 
     altsvc.protocol_id = std::move(tokens[0]);
 
