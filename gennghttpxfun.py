@@ -127,7 +127,13 @@ OPTIONS = [
     "backend-http2-max-concurrent-streams",
     "backend-connections-per-frontend",
     "backend-tls",
-    "backend-connections-per-host"
+    "backend-connections-per-host",
+    "error-page",
+    "no-kqueue",
+    "frontend-http2-settings-timeout",
+    "backend-http2-settings-timeout",
+    "api-max-request-body",
+    "backend-max-backoff",
 ]
 
 LOGVARS = [
@@ -146,6 +152,8 @@ LOGVARS = [
     "ssl_protocol",
     "ssl_session_id",
     "ssl_session_reused",
+    "backend_host",
+    "backend_port",
 ]
 
 if __name__ == '__main__':

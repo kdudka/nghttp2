@@ -20,13 +20,13 @@ A reverse proxy for HTTP/2, HTTP/1 and SPDY.
 
     
     Set  path  to  server's private  key.   Required  unless
-    :option:`--frontend-no-tls` are given.
+    "no-tls" parameter is used in :option:`--frontend` option.
 
 .. describe:: <CERT>
 
     Set  path  to  server's  certificate.   Required  unless
-    :option:`--frontend-no-tls`  are  given.   To make  OCSP  stapling
-    work, this must be an absolute path.
+    "no-tls"  parameter is  used in  :option:`--frontend` option.   To
+    make OCSP stapling work, this must be an absolute path.
 
 
 OPTIONS
@@ -37,7 +37,8 @@ The options are categorized into several groups.
 Connections
 ~~~~~~~~~~~
 
-.. option:: -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][;proto=<PROTO>]]
+.. option:: -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][[;PARAM]...]
+
 
     Set  backend  host  and   port.   The  multiple  backend
     addresses are  accepted by repeating this  option.  UNIX
@@ -65,8 +66,15 @@ Connections
 
     Patterns with  host take  precedence over  patterns with
     just path.   Then, longer patterns take  precedence over
-    shorter  ones,  breaking  a  tie by  the  order  of  the
-    appearance in the configuration.
+    shorter ones.
+
+    Host  can  include "\*"  in  the  left most  position  to
+    indicate  wildcard match  (only suffix  match is  done).
+    The "*" must match at least one character.  For example,
+    host    pattern    "\*.nghttp2.org"    matches    against
+    "www.nghttp2.org"  and  "git.ngttp2.org", but  does  not
+    match  against  "nghttp2.org".   The exact  hosts  match
+    takes precedence over the wildcard hosts match.
 
     If <PATTERN> is omitted or  empty string, "*/*" is used as
     pattern,  which  matches  all request  paths  (catch-all
@@ -93,14 +101,63 @@ Connections
     The backend addresses sharing same <PATTERN> are grouped
     together forming  load balancing  group.
 
-    Optionally,   backend   application  protocol   can   be
-    specified in <PROTO>.  All that share the same <PATTERN>
-    must  have  the  same  <PROTO> value  if  it  is  given.
-    <PROTO>  should be  one  of the  following list  without
-    quotes: "h2", "http/1.1".  The  default value of <PROTO>
-    is "http/1.1".  Note that  usually "h2" refers to HTTP/2
-    over TLS.  But  in this option, it may  mean HTTP/2 over
-    cleartext TCP unless :option:`--backend-tls` is used.
+    Several parameters <PARAM> are accepted after <PATTERN>.
+    The  parameters are  delimited  by  ";".  The  available
+    parameters       are:      "proto=<PROTO>",       "tls",
+    "sni=<SNI_HOST>",     "fall=<N>",    "rise=<N>",     and
+    "affinity=<METHOD>".  The parameter consists of keyword,
+    and optionally followed by  "=" and value.  For example,
+    the parameter "proto=h2" consists of the keyword "proto"
+    and  value "h2".   The parameter  "tls" consists  of the
+    keyword   "tls"  without   value.   Each   parameter  is
+    described as follows.
+
+    The backend application protocol  can be specified using
+    optional  "proto"   parameter,  and   in  the   form  of
+    "proto=<PROTO>".  <PROTO> should be one of the following
+    list  without  quotes:  "h2", "http/1.1".   The  default
+    value of <PROTO> is  "http/1.1".  Note that usually "h2"
+    refers to HTTP/2  over TLS.  But in this  option, it may
+    mean HTTP/2  over cleartext TCP unless  "tls" keyword is
+    used (see below).
+
+    TLS  can   be  enabled  by  specifying   optional  "tls"
+    parameter.  TLS is not enabled by default.
+
+    With "sni=<SNI_HOST>" parameter, it can override the TLS
+    SNI  field  value  with  given  <SNI_HOST>.   This  will
+    default to the backend <HOST> name
+
+    The  feature  to detect  whether  backend  is online  or
+    offline can be enabled  using optional "fall" and "rise"
+    parameters.   Using  "fall=<N>"  parameter,  if  nghttpx
+    cannot connect  to a  this backend <N>  times in  a row,
+    this  backend  is  assumed  to be  offline,  and  it  is
+    excluded from load balancing.  If <N> is 0, this backend
+    never  be excluded  from load  balancing whatever  times
+    nghttpx cannot connect  to it, and this  is the default.
+    There is  also "rise=<N>" parameter.  After  backend was
+    excluded from load balancing group, nghttpx periodically
+    attempts to make a connection to the failed backend, and
+    if the  connection is made  successfully <N> times  in a
+    row, the backend is assumed to  be online, and it is now
+    eligible  for load  balancing target.   If <N>  is 0,  a
+    backend  is permanently  offline, once  it goes  in that
+    state, and this is the default behaviour.
+
+    The     session     affinity    is     enabled     using
+    "affinity=<METHOD>"  parameter.   If  "ip" is  given  in
+    <METHOD>, client  IP based session affinity  is enabled.
+    If  "none" is  given  in <METHOD>,  session affinity  is
+    disabled, and this is the default.  The session affinity
+    is enabled per  <PATTERN>.  If at least  one backend has
+    "affinity" parameter,  and its  <METHOD> is  not "none",
+    session  affinity is  enabled  for  all backend  servers
+    sharing  the  same  <PATTERN>.   It is  advised  to  set
+    "affinity"  parameter  to   all  backend  explicitly  if
+    session affinity  is desired.  The session  affinity may
+    break if one of the backend gets unreachable, or backend
+    settings are reloaded or replaced by API.
 
     Since ";" and ":" are  used as delimiter, <PATTERN> must
     not  contain these  characters.  Since  ";" has  special
@@ -109,7 +166,7 @@ Connections
 
     Default: ``127.0.0.1,80``
 
-.. option:: -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)
+.. option:: -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)[[;PARAM]...]
 
     Set  frontend  host and  port.   If  <HOST> is  '\*',  it
     assumes  all addresses  including  both  IPv4 and  IPv6.
@@ -117,6 +174,26 @@ Connections
     name  with  "unix:" (e.g.,  unix:/var/run/nghttpx.sock).
     This  option can  be used  multiple times  to listen  to
     multiple addresses.
+
+    This option  can take  0 or  more parameters,  which are
+    described  below.   Note   that  "api"  and  "healthmon"
+    parameters are mutually exclusive.
+
+    Optionally, TLS  can be disabled by  specifying "no-tls"
+    parameter.  TLS is enabled by default.
+
+    To  make this  frontend as  API endpoint,  specify "api"
+    parameter.   This   is  disabled  by  default.    It  is
+    important  to  limit the  access  to  the API  frontend.
+    Otherwise, someone  may change  the backend  server, and
+    break your services,  or expose confidential information
+    to the outside the world.
+
+    To  make  this  frontend  as  health  monitor  endpoint,
+    specify  "healthmon"  parameter.   This is  disabled  by
+    default.  Any  requests which come through  this address
+    are replied with 200 HTTP status, without no body.
+
 
     Default: ``*,3000``
 
@@ -153,10 +230,6 @@ Connections
 .. option:: --accept-proxy-protocol
 
     Accept PROXY protocol version 1 on frontend connection.
-
-.. option:: --backend-tls
-
-    Enable SSL/TLS on backend connections.
 
 
 Performance
@@ -289,6 +362,13 @@ Performance
 
     Default: ``0``
 
+.. option:: --no-kqueue
+
+    Don't use  kqueue.  This  option is only  applicable for
+    the platforms  which have kqueue.  For  other platforms,
+    this option will be simply ignored.
+
+
 Timeout
 ~~~~~~~
 
@@ -351,6 +431,33 @@ Timeout
 
     Default: ``30s``
 
+.. option:: --frontend-http2-setting-timeout=<DURATION>
+
+    Specify  timeout before  SETTINGS ACK  is received  from
+    client.
+
+    Default: ``10s``
+
+.. option:: --backend-http2-settings-timeout=<DURATION>
+
+    Specify  timeout before  SETTINGS ACK  is received  from
+    backend server.
+
+    Default: ``10s``
+
+.. option:: --backend-max-backoff=<DURATION>
+
+    Specify  maximum backoff  interval.  This  is used  when
+    doing health  check against offline backend  (see "fail"
+    parameter  in :option:`--backend`  option).   It is  also used  to
+    limit  the  maximum   interval  to  temporarily  disable
+    backend  when nghttpx  failed to  connect to  it.  These
+    intervals are calculated  using exponential backoff, and
+    consecutive failed attempts increase the interval.  This
+    option caps its maximum value.
+
+    Default: ``2m``
+
 
 SSL/TLS
 ~~~~~~~
@@ -386,11 +493,6 @@ SSL/TLS
     indicated  by  client  using TLS  SNI  extension.   This
     option  can  be  used  multiple  times.   To  make  OCSP
     stapling work, <CERTPATH> must be absolute path.
-
-.. option:: --backend-tls-sni-field=<HOST>
-
-    Explicitly  set the  content of  the TLS  SNI extension.
-    This will default to the backend HOST name.
 
 .. option:: --dh-param-file=<PATH>
 
@@ -467,7 +569,7 @@ SSL/TLS
     ticket  key sharing  between  nghttpx  instances is  not
     required.
 
-.. option:: --tls-ticket-key-memcached=<HOST>,<PORT>
+.. option:: --tls-ticket-key-memcached=<HOST>,<PORT>[;tls]
 
     Specify address  of memcached  server to get  TLS ticket
     keys for  session resumption.   This enables  shared TLS
@@ -478,7 +580,9 @@ SSL/TLS
     replacing current set  of keys.  It is up  to extern TLS
     ticket  key generator  to rotate  keys frequently.   See
     "TLS SESSION  TICKET RESUMPTION" section in  manual page
-    to know the data format in memcached entry.
+    to know the data format in memcached entry.  Optionally,
+    memcached  connection  can  be  encrypted  with  TLS  by
+    specifying "tls" parameter.
 
 .. option:: --tls-ticket-key-memcached-address-family=(auto|IPv4|IPv6)
 
@@ -520,11 +624,6 @@ SSL/TLS
     either   aes-128-cbc   or  aes-256-cbc.    By   default,
     aes-128-cbc is used.
 
-.. option:: --tls-ticket-key-memcached-tls
-
-    Enable  SSL/TLS  on  memcached connections  to  get  TLS
-    ticket keys.
-
 .. option:: --tls-ticket-key-memcached-cert-file=<PATH>
 
     Path to client certificate  for memcached connections to
@@ -552,11 +651,13 @@ SSL/TLS
 
     Disable OCSP stapling.
 
-.. option:: --tls-session-cache-memcached=<HOST>,<PORT>
+.. option:: --tls-session-cache-memcached=<HOST>,<PORT>[;tls]
 
     Specify  address of  memcached server  to store  session
     cache.   This  enables   shared  session  cache  between
-    multiple nghttpx instances.
+    multiple   nghttpx  instances.    Optionally,  memcached
+    connection can be encrypted with TLS by specifying "tls"
+    parameter.
 
 .. option:: --tls-session-cache-memcached-address-family=(auto|IPv4|IPv6)
 
@@ -567,11 +668,6 @@ SSL/TLS
     considered.
 
     Default: ``auto``
-
-.. option:: --tls-session-cache-memcached-tls
-
-    Enable SSL/TLS on memcached connections to store session
-    cache.
 
 .. option:: --tls-session-cache-memcached-cert-file=<PATH>
 
@@ -649,10 +745,6 @@ HTTP/2 and SPDY
 
     Default: ``16``
 
-.. option:: --frontend-no-tls
-
-    Disable SSL/TLS on frontend connections.
-
 .. option:: --backend-http2-window-bits=<N>
 
     Sets  the   initial  window   size  of   HTTP/2  backend
@@ -695,10 +787,11 @@ Mode
 .. describe:: (default mode)
 
     
-    Accept  HTTP/2,  SPDY  and HTTP/1.1  over  SSL/TLS.   If
-    :option:`--frontend-no-tls` is  used, accept HTTP/2  and HTTP/1.1.
-    The  incoming HTTP/1.1  connection  can  be upgraded  to
-    HTTP/2  through  HTTP  Upgrade.
+    Accept HTTP/2, SPDY and HTTP/1.1 over SSL/TLS.  "no-tls"
+    parameter is  used in  :option:`--frontend` option,  accept HTTP/2
+    and HTTP/1.1 over cleartext  TCP.  The incoming HTTP/1.1
+    connection  can  be  upgraded  to  HTTP/2  through  HTTP
+    Upgrade.
 
 .. option:: -s, --http2-proxy
 
@@ -913,6 +1006,25 @@ HTTP
 
     Default: ``500``
 
+.. option:: --error-page=(<CODE>|*)=<PATH>
+
+    Set file path  to custom error page  served when nghttpx
+    originally  generates  HTTP  error status  code  <CODE>.
+    <CODE> must be greater than or equal to 400, and at most
+    599.  If "*"  is used instead of <CODE>,  it matches all
+    HTTP  status  code.  If  error  status  code comes  from
+    backend server, the custom error pages are not used.
+
+
+API
+~~~
+
+.. option:: --api-max-request-body=<SIZE>
+
+    Set the maximum size of request body for API request.
+
+    Default: ``16K``
+
 
 Debug
 ~~~~~
@@ -1051,6 +1163,9 @@ SIGQUIT
   accepting connection.  After all connections are handled, nghttpx
   exits.
 
+SIGHUP
+  Reload configuration file given in :option:`--conf`.
+
 SIGUSR1
   Reopen log files.
 
@@ -1058,7 +1173,11 @@ SIGUSR2
   Fork and execute nghttpx.  It will execute the binary in the same
   path with same command-line arguments and environment variables.
   After new process comes up, sending SIGQUIT to the original process
-  to perform hot swapping.
+  to perform hot swapping.  The difference between SIGUSR2 + SIGQUIT
+  and SIGHUP is that former is usually used to execute new binary, and
+  the master process is newly spawned.  On the other hand, the latter
+  just reloads configuration file, and the same master process
+  continues to exist.
 
 .. note::
 
@@ -1087,7 +1206,7 @@ backend server and extracts URI-reference with parameter
 and pushes those URIs to the frontend client. Here is a sample Link
 header field to initiate server push:
 
-.. code-block:: http
+.. code-block:: text
 
   Link: </fonts/font.woff>; rel=preload
   Link: </css/theme.css>; rel=preload
@@ -1153,8 +1272,8 @@ as a memcached entry key, with expiry time 12 hours.  Session timeout
 is set to 12 hours.
 
 By default, connections to memcached server are not encrypted.  To
-enable encryption, use :option:`--tls-session-cache-memcached-tls`
-option.
+enable encryption, use ``tls`` keyword in
+:option:`--tls-session-cache-memcached` option.
 
 TLS SESSION TICKET RESUMPTION
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1196,8 +1315,8 @@ keys.  The key appeared first is used as encryption key.  All the
 remaining keys are used as decryption only.
 
 By default, connections to memcached server are not encrypted.  To
-enable encryption, use :option:`--tls-ticket-key-memcached-tls`
-option.
+enable encryption, use ``tls`` keyword in
+:option:`--tls-ticket-key-memcached` option.
 
 If :option:`--tls-ticket-key-file` is given, encryption key is read
 from the given file.  In this case, nghttpx does not rotate key
@@ -1267,7 +1386,24 @@ respectively.
 
     .. rb:attr_reader:: remote_addr
 
-        Return IP address of a remote client.
+        Return IP address of a remote client.  If connection is made
+        via UNIX domain socket, this returns the string "localhost".
+
+    .. rb:attr_reader:: server_addr
+
+        Return address of server that accepted the connection.  This
+	is a string which specified in :option:`--frontend` option,
+	excluding port number, and not a resolved IP address.  For
+	UNIX domain socket, this is a path to UNIX domain socket.
+
+    .. rb:attr_reader:: server_port
+
+        Return port number of the server frontend which accepted the
+        connection from client.
+
+    .. rb:attr_reader:: tls_used
+
+        Return true if TLS is used on the connection.
 
 .. rb:class:: Request
 
@@ -1303,7 +1439,13 @@ respectively.
 
         Request path, including query component (i.e., /index.html).
         On assignment, copy of given value is assigned.  The path does
-        not include authority component of URI.
+        not include authority component of URI.  This may include
+        query component.  nghttpx makes certain normalization for
+        path.  It decodes percent-encoding for unreserved characters
+        (see https://tools.ietf.org/html/rfc3986#section-2.3), and
+        resolves ".." and ".".  But it may leave characters which
+        should be percent-encoded as is. So be careful when comparing
+        path against desired string.
 
     .. rb:attr_reader:: headers
 
@@ -1330,7 +1472,7 @@ respectively.
 
         Clear all existing request header fields.
 
-    .. rb:method:: push uri
+    .. rb:method:: push(uri)
 
         Initiate to push resource identified by *uri*.  Only HTTP/2
         protocol supports this feature.  For the other protocols, this
@@ -1440,6 +1582,62 @@ addresses:
     end
 
     App.new
+
+API ENDPOINTS
+-------------
+
+nghttpx exposes API endpoints to manipulate it via HTTP based API.  By
+default, API endpoint is disabled.  To enable it, add a dedicated
+frontend for API using :option:`--frontend` option with "api"
+parameter.  All requests which come from this frontend address, will
+be treated as API request.
+
+The response is normally JSON dictionary, and at least includes the
+following keys:
+
+status
+  The status of the request processing.  The following values are
+  defined:
+
+  Success
+    The request was successful.
+
+  Failure
+    The request was failed.  No change has been made.
+
+code
+  HTTP status code
+
+We wrote "normally", since nghttpx may return ordinal HTML response in
+some cases where the error has occurred before reaching API endpoint
+(e.g., header field is too large).
+
+The following section describes available API endpoints.
+
+PUT /api/v1beta1/backendconfig
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This API replaces the current backend server settings with the
+requested ones.  The request method should be PUT, but POST is also
+acceptable.  The request body must be nghttpx configuration file
+format.  For configuration file format, see `FILES`_ section.  The
+line separator inside the request body must be single LF (0x0A).
+Currently, only :option:`backend <--backend>` option is parsed, the
+others are simply ignored.  The semantics of this API is replace the
+current backend with the backend options in request body.  Describe
+the desired set of backend severs, and nghttpx makes it happen.  If
+there is no :option:`backend <--backend>` option is found in request
+body, the current set of backend is replaced with the :option:`backend
+<--backend>` option's default value, which is ``127.0.0.1,80``.
+
+The replacement is done instantly without breaking existing
+connections or requests.  It also avoids any process creation as is
+the case with hot swapping with signals.
+
+The one limitation is that only numeric IP address is allowd in
+:option:`backend <--backend>` in request body while non numeric
+hostname is allowed in command-line or configuration file is read
+using :option:`--conf`.
 
 SEE ALSO
 --------

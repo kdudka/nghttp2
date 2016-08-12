@@ -143,9 +143,6 @@ namespace {
 void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
                            spdylay_frame *frame, void *user_data) {
   auto upstream = static_cast<SpdyUpstream *>(user_data);
-  auto handler = upstream->get_client_handler();
-
-  handler->signal_reset_upstream_conn_rtimer();
 
   switch (type) {
   case SPDYLAY_SYN_STREAM: {
@@ -272,7 +269,8 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
       req.authority = host->value;
       if (get_config()->http2_proxy) {
         req.path = path->value;
-      } else if (method_token == HTTP_OPTIONS && path->value == "*") {
+      } else if (method_token == HTTP_OPTIONS &&
+                 path->value == StringRef::from_lit("*")) {
         // Server-wide OPTIONS request.  Path is empty.
       } else {
         req.path = http2::rewrite_clean_path(balloc, path->value);
@@ -288,6 +286,7 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
     downstream->set_request_state(Downstream::HEADER_COMPLETE);
 
 #ifdef HAVE_MRUBY
+    auto handler = upstream->get_client_handler();
     auto worker = handler->get_worker();
     auto mruby_ctx = worker->get_mruby_context();
 
@@ -334,9 +333,12 @@ void SpdyUpstream::start_downstream(Downstream *downstream) {
 }
 
 void SpdyUpstream::initiate_downstream(Downstream *downstream) {
-  int rv = downstream->attach_downstream_connection(
-      handler_->get_downstream_connection(downstream));
-  if (rv != 0) {
+  int rv;
+
+  auto dconn = handler_->get_downstream_connection(downstream);
+
+  if (!dconn ||
+      (rv = downstream->attach_downstream_connection(std::move(dconn))) != 0) {
     // If downstream connection fails, issue RST_STREAM.
     rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
     downstream->set_request_state(Downstream::CONNECT_FAIL);
@@ -355,6 +357,15 @@ void SpdyUpstream::initiate_downstream(Downstream *downstream) {
   }
 
   downstream_queue_.mark_active(downstream);
+
+  auto &req = downstream->request();
+  if (!req.http2_expect_body) {
+    if (downstream->end_upload_data() != 0) {
+      if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+        rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+      }
+    }
+  }
 }
 
 namespace {
@@ -374,7 +385,9 @@ void on_data_chunk_recv_callback(spdylay_session *session, uint8_t flags,
   downstream->reset_upstream_rtimer();
 
   if (downstream->push_upload_data_chunk(data, len) != 0) {
-    upstream->rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+    if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+      upstream->rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+    }
 
     upstream->consume(stream_id, len);
 
@@ -425,9 +438,6 @@ void on_data_recv_callback(spdylay_session *session, uint8_t flags,
   auto upstream = static_cast<SpdyUpstream *>(user_data);
   auto downstream = static_cast<Downstream *>(
       spdylay_session_get_stream_user_data(session, stream_id));
-  auto handler = upstream->get_client_handler();
-
-  handler->signal_reset_upstream_conn_rtimer();
 
   if (downstream && (flags & SPDYLAY_DATA_FLAG_FIN)) {
     if (!downstream->validate_request_recv_body_length()) {
@@ -436,7 +446,11 @@ void on_data_recv_callback(spdylay_session *session, uint8_t flags,
     }
 
     downstream->disable_upstream_rtimer();
-    downstream->end_upload_data();
+    if (downstream->end_upload_data() != 0) {
+      if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+        upstream->rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+      }
+    }
     downstream->set_request_state(Downstream::MSG_COMPLETE);
   }
 }
@@ -508,13 +522,22 @@ uint32_t infer_upstream_rst_stream_status_code(uint32_t downstream_error_code) {
 }
 } // namespace
 
+namespace {
+size_t downstream_queue_size(Worker *worker) {
+  auto &downstreamconf = *worker->get_downstream_config();
+
+  if (get_config()->http2_proxy) {
+    return downstreamconf.connections_per_host;
+  }
+
+  return downstreamconf.connections_per_frontend;
+}
+} // namespace
+
 SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
     : wb_(handler->get_worker()->get_mcpool()),
-      downstream_queue_(
-          get_config()->http2_proxy
-              ? get_config()->conn.downstream.connections_per_host
-              : get_config()->conn.downstream.connections_per_frontend,
-          !get_config()->http2_proxy),
+      downstream_queue_(downstream_queue_size(handler->get_worker()),
+                        !get_config()->http2_proxy),
       handler_(handler),
       session_(nullptr) {
   spdylay_session_callbacks callbacks{};
@@ -541,7 +564,13 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
 
   auto &http2conf = get_config()->http2;
 
-  if (version >= SPDYLAY_PROTO_SPDY3) {
+  auto faddr = handler_->get_upstream_addr();
+
+  // We use automatic WINDOW_UPDATE for API endpoints.  Since SPDY is
+  // going to be deprecated in the future, and the default stream
+  // window is large enough for API request body (64KiB), we don't
+  // expand window size depending on the options.
+  if (version >= SPDYLAY_PROTO_SPDY3 && !faddr->alt_mode) {
     int val = 1;
     flow_control_ = true;
     initial_window_size_ = 1 << http2conf.upstream.window_bits;
@@ -554,19 +583,23 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
   }
   // TODO Maybe call from outside?
   std::array<spdylay_settings_entry, 2> entry;
+  size_t num_entry = 1;
   entry[0].settings_id = SPDYLAY_SETTINGS_MAX_CONCURRENT_STREAMS;
   entry[0].value = http2conf.upstream.max_concurrent_streams;
   entry[0].flags = SPDYLAY_ID_FLAG_SETTINGS_NONE;
 
-  entry[1].settings_id = SPDYLAY_SETTINGS_INITIAL_WINDOW_SIZE;
-  entry[1].value = initial_window_size_;
-  entry[1].flags = SPDYLAY_ID_FLAG_SETTINGS_NONE;
+  if (flow_control_) {
+    ++num_entry;
+    entry[1].settings_id = SPDYLAY_SETTINGS_INITIAL_WINDOW_SIZE;
+    entry[1].value = initial_window_size_;
+    entry[1].flags = SPDYLAY_ID_FLAG_SETTINGS_NONE;
+  }
 
   rv = spdylay_submit_settings(session_, SPDYLAY_FLAG_SETTINGS_NONE,
-                               entry.data(), entry.size());
+                               entry.data(), num_entry);
   assert(rv == 0);
 
-  if (version >= SPDYLAY_PROTO_SPDY3_1 &&
+  if (flow_control_ && version >= SPDYLAY_PROTO_SPDY3_1 &&
       http2conf.upstream.connection_window_bits > 16) {
     int32_t delta = (1 << http2conf.upstream.connection_window_bits) -
                     SPDYLAY_INITIAL_WINDOW_SIZE;
@@ -856,8 +889,9 @@ int SpdyUpstream::send_reply(Downstream *downstream, const uint8_t *body,
   }
 
   const auto &resp = downstream->response();
+  auto &balloc = downstream->get_block_allocator();
 
-  auto status_string = http2::get_status_string(resp.http_status);
+  auto status_string = http2::get_status_string(balloc, resp.http_status);
 
   const auto &headers = resp.fs.headers();
 
@@ -921,8 +955,9 @@ int SpdyUpstream::error_reply(Downstream *downstream,
                               unsigned int status_code) {
   int rv;
   auto &resp = downstream->response();
+  auto &balloc = downstream->get_block_allocator();
 
-  auto html = http::create_error_html(status_code);
+  auto html = http::create_error_html(balloc, status_code);
   resp.http_status = status_code;
   auto body = downstream->get_response_buf();
   body->append(html);
@@ -935,8 +970,9 @@ int SpdyUpstream::error_reply(Downstream *downstream,
   auto lgconf = log_config();
   lgconf->update_tstamp(std::chrono::system_clock::now());
 
-  std::string content_length = util::utos(html.size());
-  std::string status_string = http2::get_status_string(status_code);
+  auto content_length = util::make_string_ref_uint(balloc, html.size());
+  auto status_string = http2::get_status_string(balloc, status_code);
+
   const char *nv[] = {":status", status_string.c_str(), ":version", "http/1.1",
                       "content-type", "text/html; charset=UTF-8", "server",
                       get_config()->http.server_name.c_str(), "content-length",
@@ -962,6 +998,8 @@ Downstream *SpdyUpstream::add_pending_downstream(int32_t stream_id) {
 
   downstream_queue_.add_pending(std::move(downstream));
 
+  handler_->stop_read_timer();
+
   return res;
 }
 
@@ -977,6 +1015,10 @@ void SpdyUpstream::remove_downstream(Downstream *downstream) {
 
   if (next_downstream) {
     initiate_downstream(next_downstream);
+  }
+
+  if (downstream_queue_.get_downstreams() == nullptr) {
+    handler_->repeat_read_timer();
   }
 }
 
@@ -995,6 +1037,7 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
   }
 
   const auto &req = downstream->request();
+  auto &balloc = downstream->get_block_allocator();
 
 #ifdef HAVE_MRUBY
   auto worker = handler_->get_worker();
@@ -1030,7 +1073,7 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
 
   size_t hdidx = 0;
   std::string via_value;
-  auto status_string = http2::get_status_string(resp.http_status);
+  auto status_string = http2::get_status_string(balloc, resp.http_status);
   nv[hdidx++] = ":status";
   nv[hdidx++] = status_string.c_str();
   nv[hdidx++] = ":version";
@@ -1187,6 +1230,10 @@ int SpdyUpstream::on_downstream_abort_request(Downstream *downstream,
 int SpdyUpstream::consume(int32_t stream_id, size_t len) {
   int rv;
 
+  if (!get_flow_control()) {
+    return 0;
+  }
+
   rv = spdylay_session_consume(session_, stream_id, len);
 
   if (rv != 0) {
@@ -1224,6 +1271,11 @@ int SpdyUpstream::on_downstream_reset(bool no_retry) {
   for (auto downstream = downstream_queue_.get_downstreams(); downstream;
        downstream = downstream->dlnext) {
     if (downstream->get_dispatch_state() != Downstream::DISPATCH_ACTIVE) {
+      // This is error condition when we failed push_request_headers()
+      // in initiate_downstream().  Otherwise, we have
+      // Downstream::DISPATCH_ACTIVE state, or we did not set
+      // DownstreamConnection.
+      downstream->pop_downstream_connection();
       continue;
     }
 
@@ -1237,6 +1289,8 @@ int SpdyUpstream::on_downstream_reset(bool no_retry) {
 
     downstream->add_retry();
 
+    std::unique_ptr<DownstreamConnection> dconn;
+
     if (no_retry || downstream->no_more_retry()) {
       goto fail;
     }
@@ -1244,8 +1298,17 @@ int SpdyUpstream::on_downstream_reset(bool no_retry) {
     // downstream connection is clean; we can retry with new
     // downstream connection.
 
-    rv = downstream->attach_downstream_connection(
-        handler_->get_downstream_connection(downstream));
+    dconn = handler_->get_downstream_connection(downstream);
+    if (!dconn) {
+      goto fail;
+    }
+
+    rv = downstream->attach_downstream_connection(std::move(dconn));
+    if (rv != 0) {
+      goto fail;
+    }
+
+    rv = downstream->push_request_headers();
     if (rv != 0) {
       goto fail;
     }

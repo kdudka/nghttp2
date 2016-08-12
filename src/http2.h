@@ -94,11 +94,12 @@ using HeaderRefs = std::vector<HeaderRef>;
 
 namespace http2 {
 
-std::string get_status_string(unsigned int status_code);
+// Returns string version of |status code| followed by reason
+// string. (e.g., "404 Not Found").
+StringRef get_status_string(BlockAllocator &balloc, unsigned int status_code);
 
-// Returns string version of |status_code|.  This function can handle
-// only predefined status code.  Otherwise, returns nullptr.
-StringRef stringify_status(unsigned int status_code);
+// Returns string version of |status_code|. (e.g., "404")
+StringRef stringify_status(BlockAllocator &balloc, unsigned int status_code);
 
 void capitalize(DefaultMemchunks *buf, const StringRef &s);
 
@@ -301,7 +302,6 @@ using HeaderIndex = std::array<int16_t, HD_MAXIDX>;
 // Only headers we are interested in are tokenized.  If header name
 // cannot be tokenized, returns -1.
 int lookup_token(const uint8_t *name, size_t namelen);
-int lookup_token(const std::string &name);
 int lookup_token(const StringRef &name);
 
 // Initializes |hdidx|, header index.  The |hdidx| must point to the
@@ -322,11 +322,11 @@ struct LinkHeader {
   StringRef uri;
 };
 
-// Returns next URI-reference in Link header field value |src| of
-// length |len|.  If no URI-reference found after searching all input,
-// returned uri field is empty.  This imply that empty URI-reference
-// is ignored during parsing.
-std::vector<LinkHeader> parse_link_header(const char *src, size_t len);
+// Returns next URI-reference in Link header field value |src|.  If no
+// URI-reference found after searching all input, returned uri field
+// is empty.  This imply that empty URI-reference is ignored during
+// parsing.
+std::vector<LinkHeader> parse_link_header(const StringRef &src);
 
 // Constructs path by combining base path |base_path| with another
 // path |rel_path|.  The base path and another path can have optional
@@ -352,7 +352,6 @@ bool expect_response_body(int status_code);
 // Only methods defined in http-parser/http-parser.h (http_method) are
 // tokenized.  If method name cannot be tokenized, returns -1.
 int lookup_method_token(const uint8_t *name, size_t namelen);
-int lookup_method_token(const std::string &name);
 int lookup_method_token(const StringRef &name);
 
 // Returns string  representation of |method_token|.  This  is wrapper

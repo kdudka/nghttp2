@@ -81,6 +81,7 @@
 #include "shrpx_worker_process.h"
 #include "shrpx_process.h"
 #include "shrpx_signal.h"
+#include "shrpx_connection.h"
 #include "util.h"
 #include "app_helper.h"
 #include "ssl.h"
@@ -94,19 +95,19 @@ namespace shrpx {
 
 // Deprecated: Environment variables to tell new binary the listening
 // socket's file descriptors.  They are not close-on-exec.
-#define ENV_LISTENER4_FD "NGHTTPX_LISTENER4_FD"
-#define ENV_LISTENER6_FD "NGHTTPX_LISTENER6_FD"
+constexpr auto ENV_LISTENER4_FD = StringRef::from_lit("NGHTTPX_LISTENER4_FD");
+constexpr auto ENV_LISTENER6_FD = StringRef::from_lit("NGHTTPX_LISTENER6_FD");
 
 // Deprecated: Environment variable to tell new binary the port number
 // the current binary is listening to.
-#define ENV_PORT "NGHTTPX_PORT"
+constexpr auto ENV_PORT = StringRef::from_lit("NGHTTPX_PORT");
 
 // Deprecated: Environment variable to tell new binary the listening
 // socket's file descriptor if frontend listens UNIX domain socket.
-#define ENV_UNIX_FD "NGHTTP2_UNIX_FD"
+constexpr auto ENV_UNIX_FD = StringRef::from_lit("NGHTTP2_UNIX_FD");
 // Deprecated: Environment variable to tell new binary the UNIX domain
 // socket path.
-#define ENV_UNIX_PATH "NGHTTP2_UNIX_PATH"
+constexpr auto ENV_UNIX_PATH = StringRef::from_lit("NGHTTP2_UNIX_PATH");
 
 // Prefix of environment variables to tell new binary the listening
 // socket's file descriptor.  They are not close-on-exec.  For TCP
@@ -114,7 +115,7 @@ namespace shrpx {
 // <FD> is file descriptor.  For UNIX domain socket, the value must be
 // comma separated 3 parameters: unix,<FD>,<PATH>.  <FD> is file
 // descriptor.  <PATH> is a path to UNIX domain socket.
-constexpr char ENV_ACCEPT_PREFIX[] = "NGHTTPX_ACCEPT_";
+constexpr auto ENV_ACCEPT_PREFIX = StringRef::from_lit("NGHTTPX_ACCEPT_");
 
 #ifndef _KERNEL_FASTOPEN
 #define _KERNEL_FASTOPEN
@@ -129,65 +130,160 @@ constexpr char ENV_ACCEPT_PREFIX[] = "NGHTTPX_ACCEPT_";
 #endif
 #endif
 
-struct SignalServer {
-  SignalServer() : ipc_fd{{-1, -1}}, worker_process_pid(-1) {}
-  ~SignalServer() {
-    if (ipc_fd[0] != -1) {
-      close(ipc_fd[0]);
-    }
-    if (ipc_fd[1] != -1) {
-      shutdown(ipc_fd[1], SHUT_WR);
-      close(ipc_fd[1]);
-    }
-  }
-
-  std::array<int, 2> ipc_fd;
-  pid_t worker_process_pid;
+// This configuration is fixed at the first startup of the main
+// process, and does not change after subsequent reloadings.
+struct StartupConfig {
+  // This contains all options given in command-line.
+  std::vector<std::pair<StringRef, StringRef>> cmdcfgs;
+  // The current working directory where this process started.
+  char *cwd;
+  // The pointer to original argv (not sure why we have this?)
+  char **original_argv;
+  // The pointer to argv, this is a deep copy of original argv.
+  char **argv;
+  // The number of elements in argv.
+  int argc;
 };
 
 namespace {
-int resolve_hostname(Address *addr, const char *hostname, uint16_t port,
-                     int family) {
-  int rv;
+StartupConfig suconfig;
+} // namespace
 
-  auto service = util::utos(port);
+struct InheritedAddr {
+  // IP address if TCP socket.  Otherwise, UNIX domain socket path.
+  ImmutableString host;
+  uint16_t port;
+  // true if UNIX domain socket path
+  bool host_unix;
+  int fd;
+  bool used;
+};
 
-  addrinfo hints{};
-  hints.ai_family = family;
-  hints.ai_socktype = SOCK_STREAM;
-#ifdef AI_ADDRCONFIG
-  hints.ai_flags |= AI_ADDRCONFIG;
-#endif // AI_ADDRCONFIG
-  addrinfo *res;
+namespace {
+std::random_device rd;
+} // namespace
 
-  rv = getaddrinfo(hostname, service.c_str(), &hints, &res);
-  if (rv != 0) {
-    LOG(FATAL) << "Unable to resolve address for " << hostname << ": "
-               << gai_strerror(rv);
+namespace {
+void signal_cb(struct ev_loop *loop, ev_signal *w, int revents);
+} // namespace
+
+namespace {
+void worker_process_child_cb(struct ev_loop *loop, ev_child *w, int revents);
+} // namespace
+
+struct WorkerProcess {
+  WorkerProcess(struct ev_loop *loop, pid_t worker_pid, int ipc_fd)
+      : loop(loop), worker_pid(worker_pid), ipc_fd(ipc_fd) {
+    ev_signal_init(&reopen_log_signalev, signal_cb, REOPEN_LOG_SIGNAL);
+    reopen_log_signalev.data = this;
+    ev_signal_start(loop, &reopen_log_signalev);
+
+    ev_signal_init(&exec_binary_signalev, signal_cb, EXEC_BINARY_SIGNAL);
+    exec_binary_signalev.data = this;
+    ev_signal_start(loop, &exec_binary_signalev);
+
+    ev_signal_init(&graceful_shutdown_signalev, signal_cb,
+                   GRACEFUL_SHUTDOWN_SIGNAL);
+    graceful_shutdown_signalev.data = this;
+    ev_signal_start(loop, &graceful_shutdown_signalev);
+
+    ev_signal_init(&reload_signalev, signal_cb, RELOAD_SIGNAL);
+    reload_signalev.data = this;
+    ev_signal_start(loop, &reload_signalev);
+
+    ev_child_init(&worker_process_childev, worker_process_child_cb, worker_pid,
+                  0);
+    worker_process_childev.data = this;
+    ev_child_start(loop, &worker_process_childev);
+  }
+
+  ~WorkerProcess() {
+    shutdown_signal_watchers();
+
+    ev_child_stop(loop, &worker_process_childev);
+
+    if (ipc_fd != -1) {
+      shutdown(ipc_fd, SHUT_WR);
+      close(ipc_fd);
+    }
+  }
+
+  void shutdown_signal_watchers() {
+    ev_signal_stop(loop, &reopen_log_signalev);
+    ev_signal_stop(loop, &exec_binary_signalev);
+    ev_signal_stop(loop, &graceful_shutdown_signalev);
+    ev_signal_stop(loop, &reload_signalev);
+  }
+
+  ev_signal reopen_log_signalev;
+  ev_signal exec_binary_signalev;
+  ev_signal graceful_shutdown_signalev;
+  ev_signal reload_signalev;
+  ev_child worker_process_childev;
+  struct ev_loop *loop;
+  pid_t worker_pid;
+  int ipc_fd;
+};
+
+namespace {
+void reload_config(WorkerProcess *wp);
+} // namespace
+
+namespace {
+std::deque<std::unique_ptr<WorkerProcess>> worker_processes;
+} // namespace
+
+namespace {
+void worker_process_add(std::unique_ptr<WorkerProcess> wp) {
+  worker_processes.push_back(std::move(wp));
+}
+} // namespace
+
+namespace {
+void worker_process_remove(const WorkerProcess *wp) {
+  for (auto it = std::begin(worker_processes); it != std::end(worker_processes);
+       ++it) {
+    auto &s = *it;
+
+    if (s.get() != wp) {
+      continue;
+    }
+
+    worker_processes.erase(it);
+    break;
+  }
+}
+} // namespace
+
+namespace {
+void worker_process_remove_all() {
+  std::deque<std::unique_ptr<WorkerProcess>>().swap(worker_processes);
+}
+} // namespace
+
+namespace {
+// Send signal |signum| to all worker processes, and clears
+// worker_processes.
+void worker_process_kill(int signum) {
+  for (auto &s : worker_processes) {
+    if (s->worker_pid == -1) {
+      continue;
+    }
+    kill(s->worker_pid, signum);
+  }
+  worker_process_remove_all();
+}
+} // namespace
+
+namespace {
+// Returns the last PID of worker process.  Returns -1 if there is no
+// worker process at the moment.
+int worker_process_last_pid() {
+  if (worker_processes.empty()) {
     return -1;
   }
 
-  auto res_d = defer(freeaddrinfo, res);
-
-  char host[NI_MAXHOST];
-  rv = getnameinfo(res->ai_addr, res->ai_addrlen, host, sizeof(host), nullptr,
-                   0, NI_NUMERICHOST);
-  if (rv != 0) {
-    LOG(FATAL) << "Address resolution for " << hostname
-               << " failed: " << gai_strerror(rv);
-
-    return -1;
-  }
-
-  if (LOG_ENABLED(INFO)) {
-    LOG(INFO) << "Address resolution for " << hostname
-              << " succeeded: " << host;
-  }
-
-  memcpy(&addr->su, res->ai_addr, res->ai_addrlen);
-  addr->len = res->ai_addrlen;
-
-  return 0;
+  return worker_processes.back()->worker_pid;
 }
 } // namespace
 
@@ -198,27 +294,70 @@ int chown_to_running_user(const char *path) {
 } // namespace
 
 namespace {
-void save_pid() {
-  std::ofstream out(get_config()->pid_file.c_str(), std::ios::binary);
-  out << get_config()->pid << "\n";
-  out.close();
-  if (!out) {
-    LOG(ERROR) << "Could not save PID to file " << get_config()->pid_file;
-    exit(EXIT_FAILURE);
+int save_pid() {
+  constexpr auto SUFFIX = StringRef::from_lit(".XXXXXX");
+  auto &pid_file = get_config()->pid_file;
+
+  auto len = get_config()->pid_file.size() + SUFFIX.size();
+  auto buf = make_unique<char[]>(len + 1);
+  auto p = buf.get();
+
+  p = std::copy(std::begin(pid_file), std::end(pid_file), p);
+  p = std::copy(std::begin(SUFFIX), std::end(SUFFIX), p);
+  *p = '\0';
+
+  auto temp_path = buf.get();
+
+  auto fd = mkstemp(temp_path);
+  if (fd == -1) {
+    auto error = errno;
+    LOG(ERROR) << "Could not save PID to file " << pid_file << ": "
+               << strerror(error);
+    return -1;
+  }
+
+  auto content = util::utos(get_config()->pid) + '\n';
+
+  if (write(fd, content.c_str(), content.size()) == -1) {
+    auto error = errno;
+    LOG(ERROR) << "Could not save PID to file " << pid_file << ": "
+               << strerror(error);
+    return -1;
+  }
+
+  if (fsync(fd) == -1) {
+    auto error = errno;
+    LOG(ERROR) << "Could not save PID to file " << pid_file << ": "
+               << strerror(error);
+    return -1;
+  }
+
+  close(fd);
+
+  if (rename(temp_path, pid_file.c_str()) == -1) {
+    auto error = errno;
+    LOG(ERROR) << "Could not save PID to file " << pid_file << ": "
+               << strerror(error);
+
+    unlink(temp_path);
+
+    return -1;
   }
 
   if (get_config()->uid != 0) {
-    if (chown_to_running_user(get_config()->pid_file.c_str()) == -1) {
+    if (chown_to_running_user(pid_file.c_str()) == -1) {
       auto error = errno;
-      LOG(WARN) << "Changing owner of pid file " << get_config()->pid_file
+      LOG(WARN) << "Changing owner of pid file " << pid_file
                 << " failed: " << strerror(error);
     }
   }
+
+  return 0;
 }
 } // namespace
 
 namespace {
-void exec_binary(SignalServer *ssv) {
+void exec_binary() {
   int rv;
   sigset_t oldset;
 
@@ -257,12 +396,6 @@ void exec_binary(SignalServer *ssv) {
   shrpx_signal_unset_master_proc_ign_handler();
 
   rv = shrpx_signal_unblock_all();
-
-  if (setsid() == -1) {
-    auto error = errno;
-    LOG(ERROR) << "setsid() failed: " << strerror(error);
-  }
-
   if (rv != 0) {
     auto error = errno;
     LOG(ERROR) << "Unblocking all signals failed: " << strerror(error);
@@ -270,21 +403,21 @@ void exec_binary(SignalServer *ssv) {
     _Exit(EXIT_FAILURE);
   }
 
-  auto exec_path = util::get_exec_path(get_config()->argc, get_config()->argv,
-                                       get_config()->cwd);
+  auto exec_path =
+      util::get_exec_path(suconfig.argc, suconfig.argv, suconfig.cwd);
 
   if (!exec_path) {
     LOG(ERROR) << "Could not resolve the executable path";
     _Exit(EXIT_FAILURE);
   }
 
-  auto argv = make_unique<char *[]>(get_config()->argc + 1);
+  auto argv = make_unique<char *[]>(suconfig.argc + 1);
 
   argv[0] = exec_path;
-  for (int i = 1; i < get_config()->argc; ++i) {
-    argv[i] = get_config()->argv[i];
+  for (int i = 1; i < suconfig.argc; ++i) {
+    argv[i] = suconfig.argv[i];
   }
-  argv[get_config()->argc] = nullptr;
+  argv[suconfig.argc] = nullptr;
 
   size_t envlen = 0;
   for (char **p = environ; *p; ++p, ++envlen)
@@ -298,7 +431,7 @@ void exec_binary(SignalServer *ssv) {
   std::vector<ImmutableString> fd_envs;
   for (size_t i = 0; i < listenerconf.addrs.size(); ++i) {
     auto &addr = listenerconf.addrs[i];
-    std::string s = ENV_ACCEPT_PREFIX;
+    auto s = ENV_ACCEPT_PREFIX.str();
     s += util::utos(i + 1);
     s += '=';
     if (addr.host_unix) {
@@ -316,12 +449,13 @@ void exec_binary(SignalServer *ssv) {
   }
 
   for (size_t i = 0; i < envlen; ++i) {
-    if (util::starts_with(environ[i], ENV_ACCEPT_PREFIX) ||
-        util::starts_with(environ[i], ENV_LISTENER4_FD) ||
-        util::starts_with(environ[i], ENV_LISTENER6_FD) ||
-        util::starts_with(environ[i], ENV_PORT) ||
-        util::starts_with(environ[i], ENV_UNIX_FD) ||
-        util::starts_with(environ[i], ENV_UNIX_PATH)) {
+    auto env = StringRef{environ[i]};
+    if (util::starts_with(env, ENV_ACCEPT_PREFIX) ||
+        util::starts_with(env, ENV_LISTENER4_FD) ||
+        util::starts_with(env, ENV_LISTENER6_FD) ||
+        util::starts_with(env, ENV_PORT) ||
+        util::starts_with(env, ENV_UNIX_FD) ||
+        util::starts_with(env, ENV_UNIX_PATH)) {
       continue;
     }
 
@@ -353,10 +487,9 @@ void exec_binary(SignalServer *ssv) {
 } // namespace
 
 namespace {
-void ipc_send(SignalServer *ssv, uint8_t ipc_event) {
+void ipc_send(WorkerProcess *wp, uint8_t ipc_event) {
   ssize_t nwrite;
-  while ((nwrite = write(ssv->ipc_fd[1], &ipc_event, 1)) == -1 &&
-         errno == EINTR)
+  while ((nwrite = write(wp->ipc_fd, &ipc_event, 1)) == -1 && errno == EINTR)
     ;
 
   if (nwrite < 0) {
@@ -374,35 +507,38 @@ void ipc_send(SignalServer *ssv, uint8_t ipc_event) {
 } // namespace
 
 namespace {
-void reopen_log(SignalServer *ssv) {
+void reopen_log(WorkerProcess *wp) {
   LOG(NOTICE) << "Reopening log files: master process";
 
   (void)reopen_log_files();
   redirect_stderr_to_errorlog();
-  ipc_send(ssv, SHRPX_IPC_REOPEN_LOG);
+  ipc_send(wp, SHRPX_IPC_REOPEN_LOG);
 }
 } // namespace
 
 namespace {
 void signal_cb(struct ev_loop *loop, ev_signal *w, int revents) {
-  auto ssv = static_cast<SignalServer *>(w->data);
-  if (ssv->worker_process_pid == -1) {
+  auto wp = static_cast<WorkerProcess *>(w->data);
+  if (wp->worker_pid == -1) {
     ev_break(loop);
     return;
   }
 
   switch (w->signum) {
   case REOPEN_LOG_SIGNAL:
-    reopen_log(ssv);
+    reopen_log(wp);
     return;
   case EXEC_BINARY_SIGNAL:
-    exec_binary(ssv);
+    exec_binary();
     return;
   case GRACEFUL_SHUTDOWN_SIGNAL:
-    ipc_send(ssv, SHRPX_IPC_GRACEFUL_SHUTDOWN);
+    ipc_send(wp, SHRPX_IPC_GRACEFUL_SHUTDOWN);
+    return;
+  case RELOAD_SIGNAL:
+    reload_config(wp);
     return;
   default:
-    kill(ssv->worker_process_pid, w->signum);
+    worker_process_kill(w->signum);
     ev_break(loop);
     return;
   }
@@ -411,23 +547,19 @@ void signal_cb(struct ev_loop *loop, ev_signal *w, int revents) {
 
 namespace {
 void worker_process_child_cb(struct ev_loop *loop, ev_child *w, int revents) {
+  auto wp = static_cast<WorkerProcess *>(w->data);
+
   log_chld(w->rpid, w->rstatus, "Worker process");
 
-  ev_child_stop(loop, w);
+  auto pid = wp->worker_pid;
 
-  ev_break(loop);
+  worker_process_remove(wp);
+
+  if (worker_process_last_pid() == pid) {
+    ev_break(loop);
+  }
 }
 } // namespace
-
-struct InheritedAddr {
-  // IP address if TCP socket.  Otherwise, UNIX domain socket path.
-  ImmutableString host;
-  uint16_t port;
-  // true if UNIX domain socket path
-  bool host_unix;
-  int fd;
-  bool used;
-};
 
 namespace {
 int create_unix_domain_server_socket(UpstreamAddr &faddr,
@@ -438,7 +570,8 @@ int create_unix_domain_server_socket(UpstreamAddr &faddr,
       });
 
   if (found != std::end(iaddrs)) {
-    LOG(NOTICE) << "Listening on UNIX domain socket " << faddr.host;
+    LOG(NOTICE) << "Listening on UNIX domain socket " << faddr.host
+                << (faddr.tls ? ", tls" : "");
     (*found).used = true;
     faddr.fd = (*found).fd;
     faddr.hostport = "localhost";
@@ -502,7 +635,8 @@ int create_unix_domain_server_socket(UpstreamAddr &faddr,
     return -1;
   }
 
-  LOG(NOTICE) << "Listening on UNIX domain socket " << faddr.host;
+  LOG(NOTICE) << "Listening on UNIX domain socket " << faddr.host
+              << (faddr.tls ? ", tls" : "");
 
   faddr.fd = fd;
   faddr.hostport = "localhost";
@@ -528,7 +662,8 @@ int create_tcp_server_socket(UpstreamAddr &faddr,
   hints.ai_flags |= AI_ADDRCONFIG;
 #endif // AI_ADDRCONFIG
 
-  auto node = faddr.host == "*" ? nullptr : faddr.host.c_str();
+  auto node =
+      faddr.host == StringRef::from_lit("*") ? nullptr : faddr.host.c_str();
 
   addrinfo *res, *rp;
   rv = getaddrinfo(node, service.c_str(), &hints, &res);
@@ -658,29 +793,92 @@ int create_tcp_server_socket(UpstreamAddr &faddr,
   faddr.fd = fd;
   faddr.hostport = util::make_http_hostport(StringRef{host.data()}, faddr.port);
 
-  LOG(NOTICE) << "Listening on " << faddr.hostport;
+  LOG(NOTICE) << "Listening on " << faddr.hostport
+              << (faddr.tls ? ", tls" : "");
 
   return 0;
 }
 } // namespace
 
 namespace {
-int create_acceptor_socket() {
+// Returns array of InheritedAddr constructed from |config|.  This
+// function is intended to be used when reloading configuration, and
+// |config| is usually a current configuration.
+std::vector<InheritedAddr>
+get_inherited_addr_from_config(const Config *config) {
   int rv;
 
-  auto &listenerconf = mod_config()->conn.listener;
+  auto &listenerconf = config->conn.listener;
 
+  std::vector<InheritedAddr> iaddrs(listenerconf.addrs.size());
+
+  size_t idx = 0;
+  for (auto &addr : listenerconf.addrs) {
+    auto &iaddr = iaddrs[idx++];
+
+    if (addr.host_unix) {
+      iaddr.host = addr.host;
+      iaddr.host_unix = true;
+      iaddr.fd = addr.fd;
+
+      continue;
+    }
+
+    iaddr.port = addr.port;
+    iaddr.fd = addr.fd;
+
+    // We have to getsockname/getnameinfo for fd, since we may have
+    // '*' appear in addr.host, which makes comparison against "real"
+    // address fail.
+
+    sockaddr_union su;
+    socklen_t salen = sizeof(su);
+
+    // We already added entry to iaddrs.  Even if we got errors, we
+    // don't remove it.  This is required because we have to close the
+    // socket if it is not reused.  The empty host name usually does
+    // not match anything.
+
+    if (getsockname(addr.fd, &su.sa, &salen) != 0) {
+      auto error = errno;
+      LOG(WARN) << "getsockname() syscall failed (fd=" << addr.fd
+                << "): " << strerror(error);
+      continue;
+    }
+
+    std::array<char, NI_MAXHOST> host;
+    rv = getnameinfo(&su.sa, salen, host.data(), host.size(), nullptr, 0,
+                     NI_NUMERICHOST);
+    if (rv != 0) {
+      LOG(WARN) << "getnameinfo() failed (fd=" << addr.fd
+                << "): " << gai_strerror(rv);
+      continue;
+    }
+
+    iaddr.host = host.data();
+  }
+
+  return iaddrs;
+}
+} // namespace
+
+namespace {
+// Returns array of InheritedAddr constructed from environment
+// variables.  This function handles the old environment variable
+// names used in 1.7.0 or earlier.
+std::vector<InheritedAddr> get_inherited_addr_from_env() {
+  int rv;
   std::vector<InheritedAddr> iaddrs;
 
   {
     // Upgrade from 1.7.0 or earlier
-    auto portenv = getenv(ENV_PORT);
+    auto portenv = getenv(ENV_PORT.c_str());
     if (portenv) {
       size_t i = 1;
       for (auto env_name : {ENV_LISTENER4_FD, ENV_LISTENER6_FD}) {
-        auto fdenv = getenv(env_name);
+        auto fdenv = getenv(env_name.c_str());
         if (fdenv) {
-          std::string name = ENV_ACCEPT_PREFIX;
+          auto name = ENV_ACCEPT_PREFIX.str();
           name += util::utos(i);
           std::string value = "tcp,";
           value += fdenv;
@@ -689,10 +887,10 @@ int create_acceptor_socket() {
         }
       }
     } else {
-      auto pathenv = getenv(ENV_UNIX_PATH);
-      auto fdenv = getenv(ENV_UNIX_FD);
+      auto pathenv = getenv(ENV_UNIX_PATH.c_str());
+      auto fdenv = getenv(ENV_UNIX_FD.c_str());
       if (pathenv && fdenv) {
-        std::string name = ENV_ACCEPT_PREFIX;
+        auto name = ENV_ACCEPT_PREFIX.str();
         name += '1';
         std::string value = "unix,";
         value += fdenv;
@@ -704,7 +902,7 @@ int create_acceptor_socket() {
   }
 
   for (size_t i = 1;; ++i) {
-    std::string name = ENV_ACCEPT_PREFIX;
+    auto name = ENV_ACCEPT_PREFIX.str();
     name += util::utos(i);
     auto env = getenv(name.c_str());
     if (!env) {
@@ -723,7 +921,7 @@ int create_acceptor_socket() {
     auto type = StringRef(env, end_type);
     auto value = end_type + 1;
 
-    if (type == "unix") {
+    if (type == StringRef::from_lit("unix")) {
       auto endfd = strchr(value, ',');
       if (!endfd) {
         continue;
@@ -755,7 +953,7 @@ int create_acceptor_socket() {
       iaddrs.push_back(std::move(addr));
     }
 
-    if (type == "tcp") {
+    if (type == StringRef::from_lit("tcp")) {
       auto fd = util::parse_uint(value);
       if (fd == -1) {
         LOG(WARN) << "Could not parse file descriptor from " << value;
@@ -811,13 +1009,34 @@ int create_acceptor_socket() {
     }
   }
 
+  return iaddrs;
+}
+} // namespace
+
+namespace {
+// Closes all sockets which are not reused.
+void close_unused_inherited_addr(const std::vector<InheritedAddr> &iaddrs) {
+  for (auto &ia : iaddrs) {
+    if (ia.used) {
+      continue;
+    }
+
+    close(ia.fd);
+  }
+}
+} // namespace
+
+namespace {
+int create_acceptor_socket(Config *config, std::vector<InheritedAddr> &iaddrs) {
+  auto &listenerconf = config->conn.listener;
+
   for (auto &addr : listenerconf.addrs) {
     if (addr.host_unix) {
       if (create_unix_domain_server_socket(addr, iaddrs) != 0) {
         return -1;
       }
 
-      if (get_config()->uid != 0) {
+      if (config->uid != 0) {
         // fd is not associated to inode, so we cannot use fchown(2)
         // here.  https://lkml.org/lkml/2004/11/1/84
         if (chown_to_running_user(addr.host.c_str()) == -1) {
@@ -832,14 +1051,6 @@ int create_acceptor_socket() {
     if (create_tcp_server_socket(addr, iaddrs) != 0) {
       return -1;
     }
-  }
-
-  for (auto &ia : iaddrs) {
-    if (ia.used) {
-      continue;
-    }
-
-    close(ia.fd);
   }
 
   return 0;
@@ -857,14 +1068,56 @@ int call_daemon() {
 } // namespace
 
 namespace {
-pid_t fork_worker_process(SignalServer *ssv) {
+// Opens IPC socket used to communicate with worker proess.  The
+// communication is unidirectional; that is main process sends
+// messages to the worker process.  On success, ipc_fd[0] is for
+// reading, and ipc_fd[1] for writing, just like pipe(2).
+int create_ipc_socket(std::array<int, 2> &ipc_fd) {
+  int rv;
+
+  rv = pipe(ipc_fd.data());
+  if (rv == -1) {
+    auto error = errno;
+    LOG(WARN) << "Failed to create pipe to communicate worker process: "
+              << strerror(error);
+    return -1;
+  }
+
+  for (int i = 0; i < 2; ++i) {
+    auto fd = ipc_fd[i];
+    util::make_socket_nonblocking(fd);
+    util::make_socket_closeonexec(fd);
+  }
+
+  return 0;
+}
+} // namespace
+
+namespace {
+// Creates worker process, and returns PID of worker process.  On
+// success, file descriptor for IPC (send only) is assigned to
+// |main_ipc_fd|.  In child process, we will close file descriptors
+// which are inherited from previous configuration/process, but not
+// used in the current configuration.
+pid_t fork_worker_process(int &main_ipc_fd,
+                          const std::vector<InheritedAddr> &iaddrs) {
   int rv;
   sigset_t oldset;
+
+  std::array<int, 2> ipc_fd;
+
+  rv = create_ipc_socket(ipc_fd);
+  if (rv != 0) {
+    return -1;
+  }
 
   rv = shrpx_signal_block_all(&oldset);
   if (rv != 0) {
     auto error = errno;
     LOG(ERROR) << "Blocking all signals failed: " << strerror(error);
+
+    close(ipc_fd[0]);
+    close(ipc_fd[1]);
 
     return -1;
   }
@@ -873,6 +1126,12 @@ pid_t fork_worker_process(SignalServer *ssv) {
 
   if (pid == 0) {
     ev_loop_fork(EV_DEFAULT);
+
+    // Remove all WorkerProcesses to stop any registered watcher on
+    // default loop.
+    worker_process_remove_all();
+
+    close_unused_inherited_addr(iaddrs);
 
     shrpx_signal_set_worker_proc_ign_handler();
 
@@ -884,8 +1143,8 @@ pid_t fork_worker_process(SignalServer *ssv) {
       _Exit(EXIT_FAILURE);
     }
 
-    close(ssv->ipc_fd[1]);
-    WorkerProcessConfig wpconf{ssv->ipc_fd[0]};
+    close(ipc_fd[1]);
+    WorkerProcessConfig wpconf{ipc_fd[0]};
     rv = worker_process_event_loop(&wpconf);
     if (rv != 0) {
       LOG(FATAL) << "Worker process returned error";
@@ -914,10 +1173,15 @@ pid_t fork_worker_process(SignalServer *ssv) {
   }
 
   if (pid == -1) {
+    close(ipc_fd[0]);
+    close(ipc_fd[1]);
+
     return -1;
   }
 
-  close(ssv->ipc_fd[0]);
+  close(ipc_fd[0]);
+
+  main_ipc_fd = ipc_fd[1];
 
   LOG(NOTICE) << "Worker process [" << pid << "] spawned";
 
@@ -927,8 +1191,6 @@ pid_t fork_worker_process(SignalServer *ssv) {
 
 namespace {
 int event_loop() {
-  int rv;
-
   shrpx_signal_set_master_proc_ign_handler();
 
   if (get_config()->daemon) {
@@ -946,55 +1208,33 @@ int event_loop() {
     redirect_stderr_to_errorlog();
   }
 
-  if (!get_config()->pid_file.empty()) {
-    save_pid();
-  }
+  auto iaddrs = get_inherited_addr_from_env();
 
-  SignalServer ssv;
-
-  rv = pipe(ssv.ipc_fd.data());
-  if (rv == -1) {
-    auto error = errno;
-    LOG(WARN) << "Failed to create pipe to communicate worker process: "
-              << strerror(error);
+  if (create_acceptor_socket(mod_config(), iaddrs) != 0) {
     return -1;
   }
 
-  for (int i = 0; i < 2; ++i) {
-    auto fd = ssv.ipc_fd[i];
-    util::make_socket_nonblocking(fd);
-    util::make_socket_closeonexec(fd);
-  }
+  close_unused_inherited_addr(iaddrs);
 
-  if (create_acceptor_socket() != 0) {
-    return -1;
-  }
+  auto loop = ev_default_loop(get_config()->ev_loop_flags);
 
-  auto loop = EV_DEFAULT;
+  int ipc_fd;
 
-  auto pid = fork_worker_process(&ssv);
+  auto pid = fork_worker_process(ipc_fd, {});
 
   if (pid == -1) {
     return -1;
   }
 
-  ssv.worker_process_pid = pid;
+  worker_process_add(make_unique<WorkerProcess>(loop, pid, ipc_fd));
 
-  constexpr auto signals = std::array<int, 3>{
-      {REOPEN_LOG_SIGNAL, EXEC_BINARY_SIGNAL, GRACEFUL_SHUTDOWN_SIGNAL}};
-  auto sigevs = std::array<ev_signal, signals.size()>();
-
-  for (size_t i = 0; i < signals.size(); ++i) {
-    auto sigev = &sigevs[i];
-    ev_signal_init(sigev, signal_cb, signals[i]);
-    sigev->data = &ssv;
-    ev_signal_start(loop, sigev);
+  // Write PID file when we are ready to accept connection from peer.
+  // This makes easier to write restart script for nghttpx.  Because
+  // when we know that PID file is recreated, it means we can send
+  // QUIT signal to the old process to make it shutdown gracefully.
+  if (!get_config()->pid_file.empty()) {
+    save_pid();
   }
-
-  ev_child worker_process_childev;
-  ev_child_init(&worker_process_childev, worker_process_child_cb, pid, 0);
-  worker_process_childev.data = nullptr;
-  ev_child_start(loop, &worker_process_childev);
 
   ev_run(loop, 0);
 
@@ -1012,38 +1252,37 @@ bool conf_exists(const char *path) {
 } // namespace
 
 namespace {
-constexpr char DEFAULT_NPN_LIST[] = "h2,h2-16,h2-14,"
+constexpr auto DEFAULT_NPN_LIST = StringRef::from_lit("h2,h2-16,h2-14,"
 #ifdef HAVE_SPDYLAY
-                                    "spdy/3.1,"
+                                                      "spdy/3.1,"
 #endif // HAVE_SPDYLAY
-                                    "http/1.1";
+                                                      "http/1.1");
 } // namespace
 
 namespace {
-constexpr char DEFAULT_TLS_PROTO_LIST[] = "TLSv1.2,TLSv1.1";
+constexpr auto DEFAULT_TLS_PROTO_LIST = StringRef::from_lit("TLSv1.2,TLSv1.1");
 } // namespace
 
 namespace {
-constexpr char DEFAULT_ACCESSLOG_FORMAT[] =
+constexpr auto DEFAULT_ACCESSLOG_FORMAT = StringRef::from_lit(
     R"($remote_addr - - [$time_local] )"
     R"("$request" $status $body_bytes_sent )"
-    R"("$http_referer" "$http_user_agent")";
+    R"("$http_referer" "$http_user_agent")");
 } // namespace
 
 namespace {
-constexpr char DEFAULT_DOWNSTREAM_HOST[] = "127.0.0.1";
-int16_t DEFAULT_DOWNSTREAM_PORT = 80;
-} // namespace;
+void fill_default_config(Config *config) {
+  *config = {};
 
-namespace {
-void fill_default_config() {
-  *mod_config() = {};
+  config->num_worker = 1;
+  config->conf_path = "/etc/nghttpx/nghttpx.conf";
+  config->pid = getpid();
 
-  mod_config()->num_worker = 1;
-  mod_config()->conf_path = "/etc/nghttpx/nghttpx.conf";
-  mod_config()->pid = getpid();
+  if (ev_supported_backends() & ~ev_recommended_backends() & EVBACKEND_KQUEUE) {
+    config->ev_loop_flags = ev_recommended_backends() | EVBACKEND_KQUEUE;
+  }
 
-  auto &tlsconf = mod_config()->tls;
+  auto &tlsconf = config->tls;
   {
     auto &ticketconf = tlsconf.ticket;
     {
@@ -1078,7 +1317,7 @@ void fill_default_config() {
 
   tlsconf.session_timeout = std::chrono::hours(12);
 
-  auto &httpconf = mod_config()->http;
+  auto &httpconf = config->http;
   httpconf.server_name =
       StringRef::from_lit("nghttpx nghttp2/" NGHTTP2_VERSION);
   httpconf.no_host_rewrite = true;
@@ -1087,9 +1326,15 @@ void fill_default_config() {
   httpconf.response_header_field_buffer = 64_k;
   httpconf.max_response_header_fields = 500;
 
-  auto &http2conf = mod_config()->http2;
+  auto &http2conf = config->http2;
   {
     auto &upstreamconf = http2conf.upstream;
+
+    {
+      auto &timeoutconf = upstreamconf.timeout;
+      timeoutconf.settings = 10_s;
+    }
+
     // window bits for HTTP/2 and SPDY upstream connection per
     // stream. 2**16-1 = 64KiB-1, which is HTTP/2 default. Please note
     // that SPDY/3 default is 64KiB.
@@ -1102,10 +1347,21 @@ void fill_default_config() {
     nghttp2_option_new(&upstreamconf.option);
     nghttp2_option_set_no_auto_window_update(upstreamconf.option, 1);
     nghttp2_option_set_no_recv_client_magic(upstreamconf.option, 1);
+
+    // For API endpoint, we enable automatic window update.  This is
+    // because we are a sink.
+    nghttp2_option_new(&upstreamconf.alt_mode_option);
+    nghttp2_option_set_no_recv_client_magic(upstreamconf.alt_mode_option, 1);
   }
 
   {
     auto &downstreamconf = http2conf.downstream;
+
+    {
+      auto &timeoutconf = downstreamconf.timeout;
+      timeoutconf.settings = 10_s;
+    }
+
     downstreamconf.window_bits = 16;
     downstreamconf.connection_window_bits = 30;
     downstreamconf.max_concurrent_streams = 100;
@@ -1115,7 +1371,7 @@ void fill_default_config() {
     nghttp2_option_set_peer_max_concurrent_streams(downstreamconf.option, 100);
   }
 
-  auto &loggingconf = mod_config()->logging;
+  auto &loggingconf = config->logging;
   {
     auto &accessconf = loggingconf.access;
     accessconf.format = parse_log_format(DEFAULT_ACCESSLOG_FORMAT);
@@ -1126,7 +1382,7 @@ void fill_default_config() {
 
   loggingconf.syslog_facility = LOG_DAEMON;
 
-  auto &connconf = mod_config()->conn;
+  auto &connconf = config->conn;
   {
     auto &listenerconf = connconf.listener;
     {
@@ -1152,7 +1408,8 @@ void fill_default_config() {
   }
 
   {
-    auto &downstreamconf = connconf.downstream;
+    connconf.downstream = std::make_shared<DownstreamConfig>();
+    auto &downstreamconf = *connconf.downstream;
     {
       auto &timeoutconf = downstreamconf.timeout;
       // Read/Write timeouts for downstream connection
@@ -1160,14 +1417,17 @@ void fill_default_config() {
       timeoutconf.write = 30_s;
       // Timeout for pooled (idle) connections
       timeoutconf.idle_read = 2_s;
+      timeoutconf.max_backoff = 120_s;
     }
 
     downstreamconf.connections_per_host = 8;
     downstreamconf.request_buffer_size = 16_k;
     downstreamconf.response_buffer_size = 128_k;
     downstreamconf.family = AF_UNSPEC;
-    downstreamconf.no_tls = true;
   }
+
+  auto &apiconf = config->api;
+  apiconf.max_request_body = 16_k;
 }
 
 } // namespace
@@ -1191,16 +1451,17 @@ void print_help(std::ostream &out) {
   out << R"(
   <PRIVATE_KEY>
               Set  path  to  server's private  key.   Required  unless
-              --frontend-no-tls are given.
+              "no-tls" parameter is used in --frontend option.
   <CERT>      Set  path  to  server's  certificate.   Required  unless
-              --frontend-no-tls  are  given.   To make  OCSP  stapling
-              work, this must be an absolute path.
+              "no-tls"  parameter is  used in  --frontend option.   To
+              make OCSP stapling work, this must be an absolute path.
 
 Options:
   The options are categorized into several groups.
 
 Connections:
-  -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][;proto=<PROTO>]]
+  -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][[;PARAM]...]
+
               Set  backend  host  and   port.   The  multiple  backend
               addresses are  accepted by repeating this  option.  UNIX
               domain socket  can be  specified by prefixing  path name
@@ -1231,10 +1492,11 @@ Connections:
 
               Host  can  include "*"  in  the  left most  position  to
               indicate  wildcard match  (only suffix  match is  done).
-              For  example,  host pattern  "*www.nghttp2.org"  matches
-              against  "www.nghttp2.org"  and  "1www.ngttp2.org",  but
-              does not  match against "nghttp2.org".  The  exact hosts
-              match takes precedence over the wildcard hosts match.
+              The "*" must match at least one character.  For example,
+              host    pattern    "*.nghttp2.org"    matches    against
+              "www.nghttp2.org"  and  "git.ngttp2.org", but  does  not
+              match  against  "nghttp2.org".   The exact  hosts  match
+              takes precedence over the wildcard hosts match.
 
               If <PATTERN> is omitted or  empty string, "/" is used as
               pattern,  which  matches  all request  paths  (catch-all
@@ -1261,14 +1523,63 @@ Connections:
               The backend addresses sharing same <PATTERN> are grouped
               together forming  load balancing  group.
 
-              Optionally,   backend   application  protocol   can   be
-              specified in <PROTO>.  All that share the same <PATTERN>
-              must  have  the  same  <PROTO> value  if  it  is  given.
-              <PROTO>  should be  one  of the  following list  without
-              quotes: "h2", "http/1.1".  The  default value of <PROTO>
-              is "http/1.1".  Note that  usually "h2" refers to HTTP/2
-              over TLS.  But  in this option, it may  mean HTTP/2 over
-              cleartext TCP unless --backend-tls is used.
+              Several parameters <PARAM> are accepted after <PATTERN>.
+              The  parameters are  delimited  by  ";".  The  available
+              parameters       are:      "proto=<PROTO>",       "tls",
+              "sni=<SNI_HOST>",     "fall=<N>",    "rise=<N>",     and
+              "affinity=<METHOD>".  The parameter consists of keyword,
+              and optionally followed by  "=" and value.  For example,
+              the parameter "proto=h2" consists of the keyword "proto"
+              and  value "h2".   The parameter  "tls" consists  of the
+              keyword   "tls"  without   value.   Each   parameter  is
+              described as follows.
+
+              The backend application protocol  can be specified using
+              optional  "proto"   parameter,  and   in  the   form  of
+              "proto=<PROTO>".  <PROTO> should be one of the following
+              list  without  quotes:  "h2", "http/1.1".   The  default
+              value of <PROTO> is  "http/1.1".  Note that usually "h2"
+              refers to HTTP/2  over TLS.  But in this  option, it may
+              mean HTTP/2  over cleartext TCP unless  "tls" keyword is
+              used (see below).
+
+              TLS  can   be  enabled  by  specifying   optional  "tls"
+              parameter.  TLS is not enabled by default.
+
+              With "sni=<SNI_HOST>" parameter, it can override the TLS
+              SNI  field  value  with  given  <SNI_HOST>.   This  will
+              default to the backend <HOST> name
+
+              The  feature  to detect  whether  backend  is online  or
+              offline can be enabled  using optional "fall" and "rise"
+              parameters.   Using  "fall=<N>"  parameter,  if  nghttpx
+              cannot connect  to a  this backend <N>  times in  a row,
+              this  backend  is  assumed  to be  offline,  and  it  is
+              excluded from load balancing.  If <N> is 0, this backend
+              never  be excluded  from load  balancing whatever  times
+              nghttpx cannot connect  to it, and this  is the default.
+              There is  also "rise=<N>" parameter.  After  backend was
+              excluded from load balancing group, nghttpx periodically
+              attempts to make a connection to the failed backend, and
+              if the  connection is made  successfully <N> times  in a
+              row, the backend is assumed to  be online, and it is now
+              eligible  for load  balancing target.   If <N>  is 0,  a
+              backend  is permanently  offline, once  it goes  in that
+              state, and this is the default behaviour.
+
+              The     session     affinity    is     enabled     using
+              "affinity=<METHOD>"  parameter.   If  "ip" is  given  in
+              <METHOD>, client  IP based session affinity  is enabled.
+              If  "none" is  given  in <METHOD>,  session affinity  is
+              disabled, and this is the default.  The session affinity
+              is enabled per  <PATTERN>.  If at least  one backend has
+              "affinity" parameter,  and its  <METHOD> is  not "none",
+              session  affinity is  enabled  for  all backend  servers
+              sharing  the  same  <PATTERN>.   It is  advised  to  set
+              "affinity"  parameter  to   all  backend  explicitly  if
+              session affinity  is desired.  The session  affinity may
+              break if one of the backend gets unreachable, or backend
+              settings are reloaded or replaced by API.
 
               Since ";" and ":" are  used as delimiter, <PATTERN> must
               not  contain these  characters.  Since  ";" has  special
@@ -1276,13 +1587,33 @@ Connections:
 
               Default: )" << DEFAULT_DOWNSTREAM_HOST << ","
       << DEFAULT_DOWNSTREAM_PORT << R"(
-  -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)
+  -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)[[;PARAM]...]
               Set  frontend  host and  port.   If  <HOST> is  '*',  it
               assumes  all addresses  including  both  IPv4 and  IPv6.
               UNIX domain  socket can  be specified by  prefixing path
               name  with  "unix:" (e.g.,  unix:/var/run/nghttpx.sock).
               This  option can  be used  multiple times  to listen  to
               multiple addresses.
+
+              This option  can take  0 or  more parameters,  which are
+              described  below.   Note   that  "api"  and  "healthmon"
+              parameters are mutually exclusive.
+
+              Optionally, TLS  can be disabled by  specifying "no-tls"
+              parameter.  TLS is enabled by default.
+
+              To  make this  frontend as  API endpoint,  specify "api"
+              parameter.   This   is  disabled  by  default.    It  is
+              important  to  limit the  access  to  the API  frontend.
+              Otherwise, someone  may change  the backend  server, and
+              break your services,  or expose confidential information
+              to the outside the world.
+
+              To  make  this  frontend  as  health  monitor  endpoint,
+              specify  "healthmon"  parameter.   This is  disabled  by
+              default.  Any  requests which come through  this address
+              are replied with 200 HTTP status, without no body.
+
               Default: *,3000
   --backlog=<N>
               Set listen backlog size.
@@ -1308,8 +1639,6 @@ Connections:
               --backend-write-timeout options.
   --accept-proxy-protocol
               Accept PROXY protocol version 1 on frontend connection.
-  --backend-tls
-              Enable SSL/TLS on backend connections.
 
 Performance:
   -n, --workers=<N>
@@ -1371,7 +1700,7 @@ Performance:
               HTTP/2).   To  limit  the   number  of  connections  per
               frontend        for       default        mode,       use
               --backend-connections-per-frontend.
-              Default: )" << get_config()->conn.downstream.connections_per_host
+              Default: )" << get_config()->conn.downstream->connections_per_host
       << R"(
   --backend-connections-per-frontend=<N>
               Set  maximum number  of  backend concurrent  connections
@@ -1381,7 +1710,7 @@ Performance:
               with          --http2-proxy         option,          use
               --backend-connections-per-host.
               Default: )"
-      << get_config()->conn.downstream.connections_per_frontend << R"(
+      << get_config()->conn.downstream->connections_per_frontend << R"(
   --rlimit-nofile=<N>
               Set maximum number of open files (RLIMIT_NOFILE) to <N>.
               If 0 is given, nghttpx does not set the limit.
@@ -1389,12 +1718,12 @@ Performance:
   --backend-request-buffer=<SIZE>
               Set buffer size used to store backend request.
               Default: )"
-      << util::utos_unit(get_config()->conn.downstream.request_buffer_size)
+      << util::utos_unit(get_config()->conn.downstream->request_buffer_size)
       << R"(
   --backend-response-buffer=<SIZE>
               Set buffer size used to store backend response.
               Default: )"
-      << util::utos_unit(get_config()->conn.downstream.response_buffer_size)
+      << util::utos_unit(get_config()->conn.downstream->response_buffer_size)
       << R"(
   --fastopen=<N>
               Enables  "TCP Fast  Open" for  the listening  socket and
@@ -1402,6 +1731,10 @@ Performance:
               that have not yet completed the three-way handshake.  If
               value is 0 then fast open is disabled.
               Default: )" << get_config()->conn.listener.fastopen << R"(
+  --no-kqueue Don't use  kqueue.  This  option is only  applicable for
+              the platforms  which have kqueue.  For  other platforms,
+              this option will be simply ignored.
+
 Timeout:
   --frontend-http2-read-timeout=<DURATION>
               Specify  read  timeout  for  HTTP/2  and  SPDY  frontend
@@ -1430,15 +1763,15 @@ Timeout:
   --backend-read-timeout=<DURATION>
               Specify read timeout for backend connection.
               Default: )"
-      << util::duration_str(get_config()->conn.downstream.timeout.read) << R"(
+      << util::duration_str(get_config()->conn.downstream->timeout.read) << R"(
   --backend-write-timeout=<DURATION>
               Specify write timeout for backend connection.
               Default: )"
-      << util::duration_str(get_config()->conn.downstream.timeout.write) << R"(
+      << util::duration_str(get_config()->conn.downstream->timeout.write) << R"(
   --backend-keep-alive-timeout=<DURATION>
               Specify keep-alive timeout for backend connection.
               Default: )"
-      << util::duration_str(get_config()->conn.downstream.timeout.idle_read)
+      << util::duration_str(get_config()->conn.downstream->timeout.idle_read)
       << R"(
   --listener-disable-timeout=<DURATION>
               After accepting  connection failed,  connection listener
@@ -1446,6 +1779,30 @@ Timeout:
               disables this feature.
               Default: )"
       << util::duration_str(get_config()->conn.listener.timeout.sleep) << R"(
+  --frontend-http2-setting-timeout=<DURATION>
+              Specify  timeout before  SETTINGS ACK  is received  from
+              client.
+              Default: )"
+      << util::duration_str(get_config()->http2.upstream.timeout.settings)
+      << R"(
+  --backend-http2-settings-timeout=<DURATION>
+              Specify  timeout before  SETTINGS ACK  is received  from
+              backend server.
+              Default: )"
+      << util::duration_str(get_config()->http2.downstream.timeout.settings)
+      << R"(
+  --backend-max-backoff=<DURATION>
+              Specify  maximum backoff  interval.  This  is used  when
+              doing health  check against offline backend  (see "fail"
+              parameter  in --backend  option).   It is  also used  to
+              limit  the  maximum   interval  to  temporarily  disable
+              backend  when nghttpx  failed to  connect to  it.  These
+              intervals are calculated  using exponential backoff, and
+              consecutive failed attempts increase the interval.  This
+              option caps its maximum value.
+              Default: )"
+      << util::duration_str(get_config()->conn.downstream->timeout.max_backoff)
+      << R"(
 
 SSL/TLS:
   --ciphers=<SUITE>
@@ -1470,9 +1827,6 @@ SSL/TLS:
               indicated  by  client  using TLS  SNI  extension.   This
               option  can  be  used  multiple  times.   To  make  OCSP
               stapling work, <CERTPATH> must be absolute path.
-  --backend-tls-sni-field=<HOST>
-              Explicitly  set the  content of  the TLS  SNI extension.
-              This will default to the backend HOST name.
   --dh-param-file=<PATH>
               Path to file that contains  DH parameters in PEM format.
               Without  this   option,  DHE   cipher  suites   are  not
@@ -1530,7 +1884,7 @@ SSL/TLS:
               they are  valid for  12 hours.   This is  recommended if
               ticket  key sharing  between  nghttpx  instances is  not
               required.
-  --tls-ticket-key-memcached=<HOST>,<PORT>
+  --tls-ticket-key-memcached=<HOST>,<PORT>[;tls]
               Specify address  of memcached  server to get  TLS ticket
               keys for  session resumption.   This enables  shared TLS
               ticket key between  multiple nghttpx instances.  nghttpx
@@ -1540,7 +1894,9 @@ SSL/TLS:
               replacing current set  of keys.  It is up  to extern TLS
               ticket  key generator  to rotate  keys frequently.   See
               "TLS SESSION  TICKET RESUMPTION" section in  manual page
-              to know the data format in memcached entry.
+              to know the data format in memcached entry.  Optionally,
+              memcached  connection  can  be  encrypted  with  TLS  by
+              specifying "tls" parameter.
   --tls-ticket-key-memcached-address-family=(auto|IPv4|IPv6)
               Specify address  family of memcached connections  to get
               TLS ticket keys.  If "auto" is given, both IPv4 and IPv6
@@ -1568,9 +1924,6 @@ SSL/TLS:
               Specify cipher  to encrypt TLS session  ticket.  Specify
               either   aes-128-cbc   or  aes-256-cbc.    By   default,
               aes-128-cbc is used.
-  --tls-ticket-key-memcached-tls
-              Enable  SSL/TLS  on  memcached connections  to  get  TLS
-              ticket keys.
   --tls-ticket-key-memcached-cert-file=<PATH>
               Path to client certificate  for memcached connections to
               get TLS ticket keys.
@@ -1587,10 +1940,12 @@ SSL/TLS:
               Default: )"
       << util::duration_str(get_config()->tls.ocsp.update_interval) << R"(
   --no-ocsp   Disable OCSP stapling.
-  --tls-session-cache-memcached=<HOST>,<PORT>
+  --tls-session-cache-memcached=<HOST>,<PORT>[;tls]
               Specify  address of  memcached server  to store  session
               cache.   This  enables   shared  session  cache  between
-              multiple nghttpx instances.
+              multiple   nghttpx  instances.    Optionally,  memcached
+              connection can be encrypted with TLS by specifying "tls"
+              parameter.
   --tls-session-cache-memcached-address-family=(auto|IPv4|IPv6)
               Specify address family of memcached connections to store
               session cache.  If  "auto" is given, both  IPv4 and IPv6
@@ -1598,9 +1953,6 @@ SSL/TLS:
               is considered.  If "IPv6" is given, only IPv6 address is
               considered.
               Default: auto
-  --tls-session-cache-memcached-tls
-              Enable SSL/TLS on memcached connections to store session
-              cache.
   --tls-session-cache-memcached-cert-file=<PATH>
               Path to client certificate  for memcached connections to
               store session cache.
@@ -1656,8 +2008,6 @@ HTTP/2 and SPDY:
               2**<N>-1. For SPDY, the size is 2**<N>.
               Default: )" << get_config()->http2.upstream.connection_window_bits
       << R"(
-  --frontend-no-tls
-              Disable SSL/TLS on frontend connections.
   --backend-http2-window-bits=<N>
               Sets  the   initial  window   size  of   HTTP/2  backend
               connection to 2**<N>-1.
@@ -1685,10 +2035,11 @@ HTTP/2 and SPDY:
 
 Mode:
   (default mode)
-              Accept  HTTP/2,  SPDY  and HTTP/1.1  over  SSL/TLS.   If
-              --frontend-no-tls is  used, accept HTTP/2  and HTTP/1.1.
-              The  incoming HTTP/1.1  connection  can  be upgraded  to
-              HTTP/2  through  HTTP  Upgrade.
+              Accept HTTP/2, SPDY and HTTP/1.1 over SSL/TLS.  "no-tls"
+              parameter is  used in  --frontend option,  accept HTTP/2
+              and HTTP/1.1 over cleartext  TCP.  The incoming HTTP/1.1
+              connection  can  be  upgraded  to  HTTP/2  through  HTTP
+              Upgrade.
   -s, --http2-proxy
               Like default mode, but enable forward proxy.  This is so
               called HTTP/2 proxy mode.
@@ -1731,6 +2082,10 @@ Logging:
               * $ssl_session_id: session ID for SSL/TLS connection.
               * $ssl_session_reused:  "r"   if  SSL/TLS   session  was
                 reused.  Otherwise, "."
+              * $backend_host:  backend  host   used  to  fulfill  the
+                request.  "-" if backend host is not available.
+              * $backend_port:  backend  port   used  to  fulfill  the
+                request.  "-" if backend host is not available.
 
               The  variable  can  be  enclosed  by  "{"  and  "}"  for
               disambiguation (e.g., ${remote_addr}).
@@ -1843,6 +2198,19 @@ HTTP:
               towards this number.
               Default: )" << get_config()->http.max_response_header_fields
       << R"(
+  --error-page=(<CODE>|*)=<PATH>
+              Set file path  to custom error page  served when nghttpx
+              originally  generates  HTTP  error status  code  <CODE>.
+              <CODE> must be greater than or equal to 400, and at most
+              599.  If "*"  is used instead of <CODE>,  it matches all
+              HTTP  status  code.  If  error  status  code comes  from
+              backend server, the custom error pages are not used.
+
+API:
+  --api-max-request-body=<SIZE>
+              Set the maximum size of request body for API request.
+              Default: )" << util::utos_unit(get_config()->api.max_request_body)
+      << R"(
 
 Debug:
   --frontend-http2-dump-request-header=<PATH>
@@ -1902,42 +2270,34 @@ Misc:
 } // namespace
 
 namespace {
-void process_options(
-    int argc, char **argv,
-    std::vector<std::pair<const char *, const char *>> &cmdcfgs) {
-  if (conf_exists(get_config()->conf_path.c_str())) {
-    std::set<std::string> include_set;
-    if (load_config(get_config()->conf_path.c_str(), include_set) == -1) {
-      LOG(FATAL) << "Failed to load configuration from "
-                 << get_config()->conf_path;
-      exit(EXIT_FAILURE);
+int process_options(Config *config,
+                    std::vector<std::pair<StringRef, StringRef>> &cmdcfgs) {
+  if (conf_exists(config->conf_path.c_str())) {
+    std::set<StringRef> include_set;
+    if (load_config(config, config->conf_path.c_str(), include_set) == -1) {
+      LOG(FATAL) << "Failed to load configuration from " << config->conf_path;
+      return -1;
     }
     assert(include_set.empty());
-  }
-
-  if (argc - optind >= 2) {
-    cmdcfgs.emplace_back(SHRPX_OPT_PRIVATE_KEY_FILE, argv[optind++]);
-    cmdcfgs.emplace_back(SHRPX_OPT_CERTIFICATE_FILE, argv[optind++]);
   }
 
   // Reopen log files using configurations in file
   reopen_log_files();
 
   {
-    std::set<std::string> include_set;
+    std::set<StringRef> include_set;
 
-    for (size_t i = 0, len = cmdcfgs.size(); i < len; ++i) {
-      if (parse_config(cmdcfgs[i].first, cmdcfgs[i].second, include_set) ==
-          -1) {
+    for (auto &p : cmdcfgs) {
+      if (parse_config(config, p.first, p.second, include_set) == -1) {
         LOG(FATAL) << "Failed to parse command-line argument.";
-        exit(EXIT_FAILURE);
+        return -1;
       }
     }
 
     assert(include_set.empty());
   }
 
-  auto &loggingconf = get_config()->logging;
+  auto &loggingconf = config->logging;
 
   if (loggingconf.access.syslog || loggingconf.error.syslog) {
     openlog("nghttpx", LOG_NDELAY | LOG_NOWAIT | LOG_PID,
@@ -1946,29 +2306,27 @@ void process_options(
 
   if (reopen_log_files() != 0) {
     LOG(FATAL) << "Failed to open log file";
-    exit(EXIT_FAILURE);
+    return -1;
   }
 
   redirect_stderr_to_errorlog();
 
-  if (get_config()->uid != 0) {
+  if (config->uid != 0) {
     if (log_config()->accesslog_fd != -1 &&
-        fchown(log_config()->accesslog_fd, get_config()->uid,
-               get_config()->gid) == -1) {
+        fchown(log_config()->accesslog_fd, config->uid, config->gid) == -1) {
       auto error = errno;
       LOG(WARN) << "Changing owner of access log file failed: "
                 << strerror(error);
     }
     if (log_config()->errorlog_fd != -1 &&
-        fchown(log_config()->errorlog_fd, get_config()->uid,
-               get_config()->gid) == -1) {
+        fchown(log_config()->errorlog_fd, config->uid, config->gid) == -1) {
       auto error = errno;
       LOG(WARN) << "Changing owner of error log file failed: "
                 << strerror(error);
     }
   }
 
-  auto &http2conf = mod_config()->http2;
+  auto &http2conf = config->http2;
   {
     auto &dumpconf = http2conf.upstream.debug.dump;
 
@@ -1979,12 +2337,12 @@ void process_options(
       if (f == nullptr) {
         LOG(FATAL) << "Failed to open http2 upstream request header file: "
                    << path;
-        exit(EXIT_FAILURE);
+        return -1;
       }
 
       dumpconf.request_header = f;
 
-      if (get_config()->uid != 0) {
+      if (config->uid != 0) {
         if (chown_to_running_user(path) == -1) {
           auto error = errno;
           LOG(WARN) << "Changing owner of http2 upstream request header file "
@@ -2000,12 +2358,12 @@ void process_options(
       if (f == nullptr) {
         LOG(FATAL) << "Failed to open http2 upstream response header file: "
                    << path;
-        exit(EXIT_FAILURE);
+        return -1;
       }
 
       dumpconf.response_header = f;
 
-      if (get_config()->uid != 0) {
+      if (config->uid != 0) {
         if (chown_to_running_user(path) == -1) {
           auto error = errno;
           LOG(WARN) << "Changing owner of http2 upstream response header file"
@@ -2015,7 +2373,7 @@ void process_options(
     }
   }
 
-  auto &tlsconf = mod_config()->tls;
+  auto &tlsconf = config->tls;
 
   if (tlsconf.npn_list.empty()) {
     tlsconf.npn_list = util::parse_config_str_list(DEFAULT_NPN_LIST);
@@ -2027,16 +2385,20 @@ void process_options(
 
   tlsconf.tls_proto_mask = ssl::create_tls_proto_mask(tlsconf.tls_proto_list);
 
-  tlsconf.alpn_prefs = ssl::set_alpn_prefs(tlsconf.npn_list);
+  if (ssl::set_alpn_prefs(tlsconf.alpn_prefs, tlsconf.npn_list) != 0) {
+    return -1;
+  }
 
-  auto &listenerconf = mod_config()->conn.listener;
-  auto &upstreamconf = mod_config()->conn.upstream;
-  auto &downstreamconf = mod_config()->conn.downstream;
+  tlsconf.bio_method = create_bio_method();
+
+  auto &listenerconf = config->conn.listener;
+  auto &upstreamconf = config->conn.upstream;
 
   if (listenerconf.addrs.empty()) {
     UpstreamAddr addr{};
     addr.host = "*";
     addr.port = 3000;
+    addr.tls = true;
     addr.family = AF_INET;
     listenerconf.addrs.push_back(addr);
     addr.family = AF_INET6;
@@ -2047,14 +2409,14 @@ void process_options(
     upstreamconf.worker_connections = std::numeric_limits<size_t>::max();
   }
 
-  if (!upstreamconf.no_tls &&
+  if (ssl::upstream_tls_enabled() &&
       (tlsconf.private_key_file.empty() || tlsconf.cert_file.empty())) {
     print_usage(std::cerr);
     LOG(FATAL) << "Too few arguments";
-    exit(EXIT_FAILURE);
+    return -1;
   }
 
-  if (!upstreamconf.no_tls && !tlsconf.ocsp.disabled) {
+  if (ssl::upstream_tls_enabled() && !tlsconf.ocsp.disabled) {
     struct stat buf;
     if (stat(tlsconf.ocsp.fetch_ocsp_response_file.c_str(), &buf) != 0) {
       tlsconf.ocsp.disabled = true;
@@ -2064,144 +2426,18 @@ void process_options(
     }
   }
 
-  auto &addr_groups = downstreamconf.addr_groups;
-
-  if (addr_groups.empty()) {
-    DownstreamAddrConfig addr{};
-    addr.host = ImmutableString::from_lit(DEFAULT_DOWNSTREAM_HOST);
-    addr.port = DEFAULT_DOWNSTREAM_PORT;
-
-    DownstreamAddrGroupConfig g(StringRef::from_lit("/"));
-    g.proto = PROTO_HTTP1;
-    g.addrs.push_back(std::move(addr));
-    mod_config()->router.add_route(StringRef{g.pattern}, addr_groups.size());
-    addr_groups.push_back(std::move(g));
-  } else if (get_config()->http2_proxy) {
-    // We don't support host mapping in these cases.  Move all
-    // non-catch-all patterns to catch-all pattern.
-    DownstreamAddrGroupConfig catch_all(StringRef::from_lit("/"));
-    auto proto = PROTO_NONE;
-    for (auto &g : addr_groups) {
-      if (proto == PROTO_NONE) {
-        proto = g.proto;
-      } else if (proto != g.proto) {
-        LOG(ERROR) << SHRPX_OPT_BACKEND << ": <PATTERN> was ignored with "
-                                           "--http2-proxy, and protocol must "
-                                           "be the same for all backends.";
-        exit(EXIT_FAILURE);
-      }
-      std::move(std::begin(g.addrs), std::end(g.addrs),
-                std::back_inserter(catch_all.addrs));
-    }
-    catch_all.proto = proto;
-    std::vector<DownstreamAddrGroupConfig>().swap(addr_groups);
-    std::vector<WildcardPattern>().swap(mod_config()->wildcard_patterns);
-    // maybe not necessary?
-    mod_config()->router = Router();
-    mod_config()->router.add_route(StringRef{catch_all.pattern},
-                                   addr_groups.size());
-    addr_groups.push_back(std::move(catch_all));
-  } else {
-    auto &wildcard_patterns = mod_config()->wildcard_patterns;
-    std::sort(std::begin(wildcard_patterns), std::end(wildcard_patterns),
-              [](const WildcardPattern &lhs, const WildcardPattern &rhs) {
-                return std::lexicographical_compare(
-                    rhs.host.rbegin(), rhs.host.rend(), lhs.host.rbegin(),
-                    lhs.host.rend());
-              });
-    if (LOG_ENABLED(INFO)) {
-      LOG(INFO) << "Reverse sorted wildcard hosts (compared from tail to head, "
-                   "and sorted in reverse order):";
-      for (auto &wp : mod_config()->wildcard_patterns) {
-        LOG(INFO) << wp.host;
-      }
-    }
+  if (configure_downstream_group(config, config->http2_proxy, false, tlsconf) !=
+      0) {
+    return -1;
   }
 
-  if (LOG_ENABLED(INFO)) {
-    LOG(INFO) << "Resolving backend address";
-  }
-
-  ssize_t catch_all_group = -1;
-  for (size_t i = 0; i < addr_groups.size(); ++i) {
-    auto &g = addr_groups[i];
-    if (g.pattern == "/") {
-      catch_all_group = i;
-    }
-    if (LOG_ENABLED(INFO)) {
-      LOG(INFO) << "Host-path pattern: group " << i << ": '" << g.pattern
-                << "', proto=" << strproto(g.proto);
-      for (auto &addr : g.addrs) {
-        LOG(INFO) << "group " << i << " -> " << addr.host.c_str()
-                  << (addr.host_unix ? "" : ":" + util::utos(addr.port));
-      }
-    }
-  }
-
-  if (catch_all_group == -1) {
-    LOG(FATAL) << "backend: No catch-all backend address is configured";
-    exit(EXIT_FAILURE);
-  }
-
-  downstreamconf.addr_group_catch_all = catch_all_group;
-
-  if (LOG_ENABLED(INFO)) {
-    LOG(INFO) << "Catch-all pattern is group " << catch_all_group;
-  }
-
-  for (auto &g : addr_groups) {
-    for (auto &addr : g.addrs) {
-
-      if (addr.host_unix) {
-        // for AF_UNIX socket, we use "localhost" as host for backend
-        // hostport.  This is used as Host header field to backend and
-        // not going to be passed to any syscalls.
-        addr.hostport = "localhost";
-
-        auto path = addr.host.c_str();
-        auto pathlen = addr.host.size();
-
-        if (pathlen + 1 > sizeof(addr.addr.su.un.sun_path)) {
-          LOG(FATAL) << "UNIX domain socket path " << path << " is too long > "
-                     << sizeof(addr.addr.su.un.sun_path);
-          exit(EXIT_FAILURE);
-        }
-
-        if (LOG_ENABLED(INFO)) {
-          LOG(INFO) << "Use UNIX domain socket path " << path
-                    << " for backend connection";
-        }
-
-        addr.addr.su.un.sun_family = AF_UNIX;
-        // copy path including terminal NULL
-        std::copy_n(path, pathlen + 1, addr.addr.su.un.sun_path);
-        addr.addr.len = sizeof(addr.addr.su.un);
-
-        continue;
-      }
-
-      addr.hostport = ImmutableString(
-          util::make_http_hostport(StringRef(addr.host), addr.port));
-
-      auto hostport = util::make_hostport(StringRef{addr.host}, addr.port);
-
-      if (resolve_hostname(&addr.addr, addr.host.c_str(), addr.port,
-                           downstreamconf.family) == -1) {
-        LOG(FATAL) << "Resolving backend address failed: " << hostport;
-        exit(EXIT_FAILURE);
-      }
-      LOG(NOTICE) << "Resolved backend address: " << hostport << " -> "
-                  << util::to_numeric_addr(&addr.addr);
-    }
-  }
-
-  auto &proxy = mod_config()->downstream_http_proxy;
+  auto &proxy = config->downstream_http_proxy;
   if (!proxy.host.empty()) {
     auto hostport = util::make_hostport(StringRef{proxy.host}, proxy.port);
     if (resolve_hostname(&proxy.addr, proxy.host.c_str(), proxy.port,
                          AF_UNSPEC) == -1) {
       LOG(FATAL) << "Resolving backend HTTP proxy address failed: " << hostport;
-      exit(EXIT_FAILURE);
+      return -1;
     }
     LOG(NOTICE) << "Backend HTTP proxy address: " << hostport << " -> "
                 << util::to_numeric_addr(&proxy.addr);
@@ -2217,10 +2453,14 @@ void process_options(
         LOG(FATAL)
             << "Resolving memcached address for TLS session cache failed: "
             << hostport;
-        exit(EXIT_FAILURE);
+        return -1;
       }
       LOG(NOTICE) << "Memcached address for TLS session cache: " << hostport
                   << " -> " << util::to_numeric_addr(&memcachedconf.addr);
+      if (memcachedconf.tls) {
+        LOG(NOTICE) << "Connection to memcached for TLS session cache will be "
+                       "encrypted by TLS";
+      }
     }
   }
 
@@ -2233,34 +2473,37 @@ void process_options(
                            memcachedconf.port, memcachedconf.family) == -1) {
         LOG(FATAL) << "Resolving memcached address for TLS ticket key failed: "
                    << hostport;
-        exit(EXIT_FAILURE);
+        return -1;
       }
       LOG(NOTICE) << "Memcached address for TLS ticket key: " << hostport
                   << " -> " << util::to_numeric_addr(&memcachedconf.addr);
+      if (memcachedconf.tls) {
+        LOG(NOTICE) << "Connection to memcached for TLS ticket key will be "
+                       "encrypted by TLS";
+      }
     }
   }
 
-  if (get_config()->rlimit_nofile) {
-    struct rlimit lim = {static_cast<rlim_t>(get_config()->rlimit_nofile),
-                         static_cast<rlim_t>(get_config()->rlimit_nofile)};
+  if (config->rlimit_nofile) {
+    struct rlimit lim = {static_cast<rlim_t>(config->rlimit_nofile),
+                         static_cast<rlim_t>(config->rlimit_nofile)};
     if (setrlimit(RLIMIT_NOFILE, &lim) != 0) {
       auto error = errno;
       LOG(WARN) << "Setting rlimit-nofile failed: " << strerror(error);
     }
   }
 
-  auto &fwdconf = mod_config()->http.forwarded;
+  auto &fwdconf = config->http.forwarded;
 
   if (fwdconf.by_node_type == FORWARDED_NODE_OBFUSCATED &&
       fwdconf.by_obfuscated.empty()) {
-    std::random_device rd;
     std::mt19937 gen(rd());
     auto &dst = fwdconf.by_obfuscated;
     dst = "_";
     dst += util::random_alpha_digit(gen, SHRPX_OBFUSCATED_NODE_LENGTH);
   }
 
-  if (get_config()->http2.upstream.debug.frame_debug) {
+  if (config->http2.upstream.debug.frame_debug) {
     // To make it sync to logging
     set_output(stderr);
     if (isatty(fileno(stdout))) {
@@ -2269,13 +2512,105 @@ void process_options(
     reset_timer();
   }
 
-  mod_config()->http2.upstream.callbacks = create_http2_upstream_callbacks();
-  mod_config()->http2.downstream.callbacks =
-      create_http2_downstream_callbacks();
+  config->http2.upstream.callbacks = create_http2_upstream_callbacks();
+  config->http2.downstream.callbacks = create_http2_downstream_callbacks();
+
+  return 0;
+}
+} // namespace
+
+namespace {
+// Closes file descriptor which are opened for listeners in config,
+// and are not inherited from |iaddrs|.
+void close_not_inherited_fd(Config *config,
+                            const std::vector<InheritedAddr> &iaddrs) {
+  auto &listenerconf = config->conn.listener;
+
+  for (auto &addr : listenerconf.addrs) {
+    auto inherited = std::find_if(
+        std::begin(iaddrs), std::end(iaddrs),
+        [&addr](const InheritedAddr &iaddr) { return addr.fd == iaddr.fd; });
+
+    if (inherited != std::end(iaddrs)) {
+      continue;
+    }
+
+    close(addr.fd);
+  }
+}
+} // namespace
+
+namespace {
+void reload_config(WorkerProcess *wp) {
+  int rv;
+
+  LOG(NOTICE) << "Reloading configuration";
+
+  auto cur_config = get_config();
+  auto new_config = make_unique<Config>();
+
+  fill_default_config(new_config.get());
+
+  new_config->conf_path = cur_config->conf_path;
+  // daemon option is ignored here.
+  new_config->daemon = cur_config->daemon;
+  // loop is reused, and ev_loop_flags gets ignored
+  new_config->ev_loop_flags = cur_config->ev_loop_flags;
+
+  rv = process_options(new_config.get(), suconfig.cmdcfgs);
+  if (rv != 0) {
+    LOG(ERROR) << "Failed to process new configuration";
+    return;
+  }
+
+  auto iaddrs = get_inherited_addr_from_config(cur_config);
+
+  if (create_acceptor_socket(new_config.get(), iaddrs) != 0) {
+    close_not_inherited_fd(new_config.get(), iaddrs);
+    return;
+  }
+
+  // According to libev documentation, flags are ignored since we have
+  // already created first default loop.
+  auto loop = ev_default_loop(new_config->ev_loop_flags);
+
+  int ipc_fd;
+
+  // fork_worker_process and forked child process assumes new
+  // configuration can be obtained from get_config().
+
+  auto old_config = replace_config(std::move(new_config));
+
+  auto pid = fork_worker_process(ipc_fd, iaddrs);
+
+  if (pid == -1) {
+    LOG(ERROR) << "Failed to process new configuration";
+
+    new_config = replace_config(std::move(old_config));
+    close_not_inherited_fd(new_config.get(), iaddrs);
+
+    return;
+  }
+
+  close_unused_inherited_addr(iaddrs);
+
+  // Send last worker process a graceful shutdown notice
+  auto &last_wp = worker_processes.back();
+  ipc_send(last_wp.get(), SHRPX_IPC_GRACEFUL_SHUTDOWN);
+  // We no longer use signals for this worker.
+  last_wp->shutdown_signal_watchers();
+
+  worker_process_add(make_unique<WorkerProcess>(loop, pid, ipc_fd));
+
+  if (!get_config()->pid_file.empty()) {
+    save_pid();
+  }
 }
 } // namespace
 
 int main(int argc, char **argv) {
+  int rv;
+
   nghttp2::ssl::libssl_init();
 
 #ifndef NOTHREADS
@@ -2284,7 +2619,7 @@ int main(int argc, char **argv) {
 
   Log::set_severity_level(NOTICE);
   create_config();
-  fill_default_config();
+  fill_default_config(mod_config());
 
   // make copy of stderr
   util::store_original_fds();
@@ -2293,177 +2628,211 @@ int main(int argc, char **argv) {
   // log errors/warnings while reading configuration files.
   reopen_log_files();
 
-  mod_config()->original_argv = argv;
+  suconfig.original_argv = argv;
 
   // We have to copy argv, since getopt_long may change its content.
-  mod_config()->argc = argc;
-  mod_config()->argv = new char *[argc];
+  suconfig.argc = argc;
+  suconfig.argv = new char *[argc];
 
   for (int i = 0; i < argc; ++i) {
-    mod_config()->argv[i] = strdup(argv[i]);
-    if (mod_config()->argv[i] == nullptr) {
+    suconfig.argv[i] = strdup(argv[i]);
+    if (suconfig.argv[i] == nullptr) {
       auto error = errno;
       LOG(FATAL) << "failed to copy argv: " << strerror(error);
       exit(EXIT_FAILURE);
     }
   }
 
-  mod_config()->cwd = getcwd(nullptr, 0);
-  if (mod_config()->cwd == nullptr) {
+  suconfig.cwd = getcwd(nullptr, 0);
+  if (suconfig.cwd == nullptr) {
     auto error = errno;
     LOG(FATAL) << "failed to get current working directory: errno=" << error;
     exit(EXIT_FAILURE);
   }
 
-  std::vector<std::pair<const char *, const char *>> cmdcfgs;
+  auto &cmdcfgs = suconfig.cmdcfgs;
+
   while (1) {
     static int flag = 0;
     static option long_options[] = {
-        {SHRPX_OPT_DAEMON, no_argument, nullptr, 'D'},
-        {SHRPX_OPT_LOG_LEVEL, required_argument, nullptr, 'L'},
-        {SHRPX_OPT_BACKEND, required_argument, nullptr, 'b'},
-        {SHRPX_OPT_HTTP2_MAX_CONCURRENT_STREAMS, required_argument, nullptr,
-         'c'},
-        {SHRPX_OPT_FRONTEND, required_argument, nullptr, 'f'},
+        {SHRPX_OPT_DAEMON.c_str(), no_argument, nullptr, 'D'},
+        {SHRPX_OPT_LOG_LEVEL.c_str(), required_argument, nullptr, 'L'},
+        {SHRPX_OPT_BACKEND.c_str(), required_argument, nullptr, 'b'},
+        {SHRPX_OPT_HTTP2_MAX_CONCURRENT_STREAMS.c_str(), required_argument,
+         nullptr, 'c'},
+        {SHRPX_OPT_FRONTEND.c_str(), required_argument, nullptr, 'f'},
         {"help", no_argument, nullptr, 'h'},
-        {SHRPX_OPT_INSECURE, no_argument, nullptr, 'k'},
-        {SHRPX_OPT_WORKERS, required_argument, nullptr, 'n'},
-        {SHRPX_OPT_CLIENT_PROXY, no_argument, nullptr, 'p'},
-        {SHRPX_OPT_HTTP2_PROXY, no_argument, nullptr, 's'},
+        {SHRPX_OPT_INSECURE.c_str(), no_argument, nullptr, 'k'},
+        {SHRPX_OPT_WORKERS.c_str(), required_argument, nullptr, 'n'},
+        {SHRPX_OPT_CLIENT_PROXY.c_str(), no_argument, nullptr, 'p'},
+        {SHRPX_OPT_HTTP2_PROXY.c_str(), no_argument, nullptr, 's'},
         {"version", no_argument, nullptr, 'v'},
-        {SHRPX_OPT_FRONTEND_FRAME_DEBUG, no_argument, nullptr, 'o'},
-        {SHRPX_OPT_ADD_X_FORWARDED_FOR, no_argument, &flag, 1},
-        {SHRPX_OPT_FRONTEND_HTTP2_READ_TIMEOUT, required_argument, &flag, 2},
-        {SHRPX_OPT_FRONTEND_READ_TIMEOUT, required_argument, &flag, 3},
-        {SHRPX_OPT_FRONTEND_WRITE_TIMEOUT, required_argument, &flag, 4},
-        {SHRPX_OPT_BACKEND_READ_TIMEOUT, required_argument, &flag, 5},
-        {SHRPX_OPT_BACKEND_WRITE_TIMEOUT, required_argument, &flag, 6},
-        {SHRPX_OPT_ACCESSLOG_FILE, required_argument, &flag, 7},
-        {SHRPX_OPT_BACKEND_KEEP_ALIVE_TIMEOUT, required_argument, &flag, 8},
-        {SHRPX_OPT_FRONTEND_HTTP2_WINDOW_BITS, required_argument, &flag, 9},
-        {SHRPX_OPT_PID_FILE, required_argument, &flag, 10},
-        {SHRPX_OPT_USER, required_argument, &flag, 11},
+        {SHRPX_OPT_FRONTEND_FRAME_DEBUG.c_str(), no_argument, nullptr, 'o'},
+        {SHRPX_OPT_ADD_X_FORWARDED_FOR.c_str(), no_argument, &flag, 1},
+        {SHRPX_OPT_FRONTEND_HTTP2_READ_TIMEOUT.c_str(), required_argument,
+         &flag, 2},
+        {SHRPX_OPT_FRONTEND_READ_TIMEOUT.c_str(), required_argument, &flag, 3},
+        {SHRPX_OPT_FRONTEND_WRITE_TIMEOUT.c_str(), required_argument, &flag, 4},
+        {SHRPX_OPT_BACKEND_READ_TIMEOUT.c_str(), required_argument, &flag, 5},
+        {SHRPX_OPT_BACKEND_WRITE_TIMEOUT.c_str(), required_argument, &flag, 6},
+        {SHRPX_OPT_ACCESSLOG_FILE.c_str(), required_argument, &flag, 7},
+        {SHRPX_OPT_BACKEND_KEEP_ALIVE_TIMEOUT.c_str(), required_argument, &flag,
+         8},
+        {SHRPX_OPT_FRONTEND_HTTP2_WINDOW_BITS.c_str(), required_argument, &flag,
+         9},
+        {SHRPX_OPT_PID_FILE.c_str(), required_argument, &flag, 10},
+        {SHRPX_OPT_USER.c_str(), required_argument, &flag, 11},
         {"conf", required_argument, &flag, 12},
-        {SHRPX_OPT_SYSLOG_FACILITY, required_argument, &flag, 14},
-        {SHRPX_OPT_BACKLOG, required_argument, &flag, 15},
-        {SHRPX_OPT_CIPHERS, required_argument, &flag, 16},
-        {SHRPX_OPT_CLIENT, no_argument, &flag, 17},
-        {SHRPX_OPT_BACKEND_HTTP2_WINDOW_BITS, required_argument, &flag, 18},
-        {SHRPX_OPT_CACERT, required_argument, &flag, 19},
-        {SHRPX_OPT_BACKEND_IPV4, no_argument, &flag, 20},
-        {SHRPX_OPT_BACKEND_IPV6, no_argument, &flag, 21},
-        {SHRPX_OPT_PRIVATE_KEY_PASSWD_FILE, required_argument, &flag, 22},
-        {SHRPX_OPT_NO_VIA, no_argument, &flag, 23},
-        {SHRPX_OPT_SUBCERT, required_argument, &flag, 24},
-        {SHRPX_OPT_HTTP2_BRIDGE, no_argument, &flag, 25},
-        {SHRPX_OPT_BACKEND_HTTP_PROXY_URI, required_argument, &flag, 26},
-        {SHRPX_OPT_BACKEND_NO_TLS, no_argument, &flag, 27},
-        {SHRPX_OPT_FRONTEND_NO_TLS, no_argument, &flag, 29},
-        {SHRPX_OPT_BACKEND_TLS_SNI_FIELD, required_argument, &flag, 31},
-        {SHRPX_OPT_DH_PARAM_FILE, required_argument, &flag, 33},
-        {SHRPX_OPT_READ_RATE, required_argument, &flag, 34},
-        {SHRPX_OPT_READ_BURST, required_argument, &flag, 35},
-        {SHRPX_OPT_WRITE_RATE, required_argument, &flag, 36},
-        {SHRPX_OPT_WRITE_BURST, required_argument, &flag, 37},
-        {SHRPX_OPT_NPN_LIST, required_argument, &flag, 38},
-        {SHRPX_OPT_VERIFY_CLIENT, no_argument, &flag, 39},
-        {SHRPX_OPT_VERIFY_CLIENT_CACERT, required_argument, &flag, 40},
-        {SHRPX_OPT_CLIENT_PRIVATE_KEY_FILE, required_argument, &flag, 41},
-        {SHRPX_OPT_CLIENT_CERT_FILE, required_argument, &flag, 42},
-        {SHRPX_OPT_FRONTEND_HTTP2_DUMP_REQUEST_HEADER, required_argument, &flag,
-         43},
-        {SHRPX_OPT_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER, required_argument,
-         &flag, 44},
-        {SHRPX_OPT_HTTP2_NO_COOKIE_CRUMBLING, no_argument, &flag, 45},
-        {SHRPX_OPT_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS, required_argument,
-         &flag, 46},
-        {SHRPX_OPT_BACKEND_HTTP2_CONNECTION_WINDOW_BITS, required_argument,
-         &flag, 47},
-        {SHRPX_OPT_TLS_PROTO_LIST, required_argument, &flag, 48},
-        {SHRPX_OPT_PADDING, required_argument, &flag, 49},
-        {SHRPX_OPT_WORKER_READ_RATE, required_argument, &flag, 50},
-        {SHRPX_OPT_WORKER_READ_BURST, required_argument, &flag, 51},
-        {SHRPX_OPT_WORKER_WRITE_RATE, required_argument, &flag, 52},
-        {SHRPX_OPT_WORKER_WRITE_BURST, required_argument, &flag, 53},
-        {SHRPX_OPT_ALTSVC, required_argument, &flag, 54},
-        {SHRPX_OPT_ADD_RESPONSE_HEADER, required_argument, &flag, 55},
-        {SHRPX_OPT_WORKER_FRONTEND_CONNECTIONS, required_argument, &flag, 56},
-        {SHRPX_OPT_ACCESSLOG_SYSLOG, no_argument, &flag, 57},
-        {SHRPX_OPT_ERRORLOG_FILE, required_argument, &flag, 58},
-        {SHRPX_OPT_ERRORLOG_SYSLOG, no_argument, &flag, 59},
-        {SHRPX_OPT_STREAM_READ_TIMEOUT, required_argument, &flag, 60},
-        {SHRPX_OPT_STREAM_WRITE_TIMEOUT, required_argument, &flag, 61},
-        {SHRPX_OPT_NO_LOCATION_REWRITE, no_argument, &flag, 62},
-        {SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_HOST, required_argument, &flag,
-         63},
-        {SHRPX_OPT_LISTENER_DISABLE_TIMEOUT, required_argument, &flag, 64},
-        {SHRPX_OPT_STRIP_INCOMING_X_FORWARDED_FOR, no_argument, &flag, 65},
-        {SHRPX_OPT_ACCESSLOG_FORMAT, required_argument, &flag, 66},
-        {SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND, required_argument,
-         &flag, 67},
-        {SHRPX_OPT_TLS_TICKET_KEY_FILE, required_argument, &flag, 68},
-        {SHRPX_OPT_RLIMIT_NOFILE, required_argument, &flag, 69},
-        {SHRPX_OPT_BACKEND_RESPONSE_BUFFER, required_argument, &flag, 71},
-        {SHRPX_OPT_BACKEND_REQUEST_BUFFER, required_argument, &flag, 72},
-        {SHRPX_OPT_NO_HOST_REWRITE, no_argument, &flag, 73},
-        {SHRPX_OPT_NO_SERVER_PUSH, no_argument, &flag, 74},
-        {SHRPX_OPT_BACKEND_HTTP2_CONNECTIONS_PER_WORKER, required_argument,
-         &flag, 76},
-        {SHRPX_OPT_FETCH_OCSP_RESPONSE_FILE, required_argument, &flag, 77},
-        {SHRPX_OPT_OCSP_UPDATE_INTERVAL, required_argument, &flag, 78},
-        {SHRPX_OPT_NO_OCSP, no_argument, &flag, 79},
-        {SHRPX_OPT_HEADER_FIELD_BUFFER, required_argument, &flag, 80},
-        {SHRPX_OPT_MAX_HEADER_FIELDS, required_argument, &flag, 81},
-        {SHRPX_OPT_ADD_REQUEST_HEADER, required_argument, &flag, 82},
-        {SHRPX_OPT_INCLUDE, required_argument, &flag, 83},
-        {SHRPX_OPT_TLS_TICKET_KEY_CIPHER, required_argument, &flag, 84},
-        {SHRPX_OPT_HOST_REWRITE, no_argument, &flag, 85},
-        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED, required_argument, &flag, 86},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED, required_argument, &flag, 87},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_INTERVAL, required_argument, &flag,
-         88},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY, required_argument, &flag,
-         89},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL, required_argument, &flag,
-         90},
-        {SHRPX_OPT_MRUBY_FILE, required_argument, &flag, 91},
-        {SHRPX_OPT_ACCEPT_PROXY_PROTOCOL, no_argument, &flag, 93},
-        {SHRPX_OPT_FASTOPEN, required_argument, &flag, 94},
-        {SHRPX_OPT_TLS_DYN_REC_WARMUP_THRESHOLD, required_argument, &flag, 95},
-        {SHRPX_OPT_TLS_DYN_REC_IDLE_TIMEOUT, required_argument, &flag, 96},
-        {SHRPX_OPT_ADD_FORWARDED, required_argument, &flag, 97},
-        {SHRPX_OPT_STRIP_INCOMING_FORWARDED, no_argument, &flag, 98},
-        {SHRPX_OPT_FORWARDED_BY, required_argument, &flag, 99},
-        {SHRPX_OPT_FORWARDED_FOR, required_argument, &flag, 100},
-        {SHRPX_OPT_RESPONSE_HEADER_FIELD_BUFFER, required_argument, &flag, 101},
-        {SHRPX_OPT_MAX_RESPONSE_HEADER_FIELDS, required_argument, &flag, 102},
-        {SHRPX_OPT_NO_HTTP2_CIPHER_BLACK_LIST, no_argument, &flag, 103},
-        {SHRPX_OPT_REQUEST_HEADER_FIELD_BUFFER, required_argument, &flag, 104},
-        {SHRPX_OPT_MAX_REQUEST_HEADER_FIELDS, required_argument, &flag, 105},
-        {SHRPX_OPT_BACKEND_HTTP1_TLS, no_argument, &flag, 106},
-        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_TLS, no_argument, &flag, 108},
-        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE, required_argument,
-         &flag, 109},
-        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE,
+        {SHRPX_OPT_SYSLOG_FACILITY.c_str(), required_argument, &flag, 14},
+        {SHRPX_OPT_BACKLOG.c_str(), required_argument, &flag, 15},
+        {SHRPX_OPT_CIPHERS.c_str(), required_argument, &flag, 16},
+        {SHRPX_OPT_CLIENT.c_str(), no_argument, &flag, 17},
+        {SHRPX_OPT_BACKEND_HTTP2_WINDOW_BITS.c_str(), required_argument, &flag,
+         18},
+        {SHRPX_OPT_CACERT.c_str(), required_argument, &flag, 19},
+        {SHRPX_OPT_BACKEND_IPV4.c_str(), no_argument, &flag, 20},
+        {SHRPX_OPT_BACKEND_IPV6.c_str(), no_argument, &flag, 21},
+        {SHRPX_OPT_PRIVATE_KEY_PASSWD_FILE.c_str(), required_argument, &flag,
+         22},
+        {SHRPX_OPT_NO_VIA.c_str(), no_argument, &flag, 23},
+        {SHRPX_OPT_SUBCERT.c_str(), required_argument, &flag, 24},
+        {SHRPX_OPT_HTTP2_BRIDGE.c_str(), no_argument, &flag, 25},
+        {SHRPX_OPT_BACKEND_HTTP_PROXY_URI.c_str(), required_argument, &flag,
+         26},
+        {SHRPX_OPT_BACKEND_NO_TLS.c_str(), no_argument, &flag, 27},
+        {SHRPX_OPT_FRONTEND_NO_TLS.c_str(), no_argument, &flag, 29},
+        {SHRPX_OPT_BACKEND_TLS_SNI_FIELD.c_str(), required_argument, &flag, 31},
+        {SHRPX_OPT_DH_PARAM_FILE.c_str(), required_argument, &flag, 33},
+        {SHRPX_OPT_READ_RATE.c_str(), required_argument, &flag, 34},
+        {SHRPX_OPT_READ_BURST.c_str(), required_argument, &flag, 35},
+        {SHRPX_OPT_WRITE_RATE.c_str(), required_argument, &flag, 36},
+        {SHRPX_OPT_WRITE_BURST.c_str(), required_argument, &flag, 37},
+        {SHRPX_OPT_NPN_LIST.c_str(), required_argument, &flag, 38},
+        {SHRPX_OPT_VERIFY_CLIENT.c_str(), no_argument, &flag, 39},
+        {SHRPX_OPT_VERIFY_CLIENT_CACERT.c_str(), required_argument, &flag, 40},
+        {SHRPX_OPT_CLIENT_PRIVATE_KEY_FILE.c_str(), required_argument, &flag,
+         41},
+        {SHRPX_OPT_CLIENT_CERT_FILE.c_str(), required_argument, &flag, 42},
+        {SHRPX_OPT_FRONTEND_HTTP2_DUMP_REQUEST_HEADER.c_str(),
+         required_argument, &flag, 43},
+        {SHRPX_OPT_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER.c_str(),
+         required_argument, &flag, 44},
+        {SHRPX_OPT_HTTP2_NO_COOKIE_CRUMBLING.c_str(), no_argument, &flag, 45},
+        {SHRPX_OPT_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS.c_str(),
+         required_argument, &flag, 46},
+        {SHRPX_OPT_BACKEND_HTTP2_CONNECTION_WINDOW_BITS.c_str(),
+         required_argument, &flag, 47},
+        {SHRPX_OPT_TLS_PROTO_LIST.c_str(), required_argument, &flag, 48},
+        {SHRPX_OPT_PADDING.c_str(), required_argument, &flag, 49},
+        {SHRPX_OPT_WORKER_READ_RATE.c_str(), required_argument, &flag, 50},
+        {SHRPX_OPT_WORKER_READ_BURST.c_str(), required_argument, &flag, 51},
+        {SHRPX_OPT_WORKER_WRITE_RATE.c_str(), required_argument, &flag, 52},
+        {SHRPX_OPT_WORKER_WRITE_BURST.c_str(), required_argument, &flag, 53},
+        {SHRPX_OPT_ALTSVC.c_str(), required_argument, &flag, 54},
+        {SHRPX_OPT_ADD_RESPONSE_HEADER.c_str(), required_argument, &flag, 55},
+        {SHRPX_OPT_WORKER_FRONTEND_CONNECTIONS.c_str(), required_argument,
+         &flag, 56},
+        {SHRPX_OPT_ACCESSLOG_SYSLOG.c_str(), no_argument, &flag, 57},
+        {SHRPX_OPT_ERRORLOG_FILE.c_str(), required_argument, &flag, 58},
+        {SHRPX_OPT_ERRORLOG_SYSLOG.c_str(), no_argument, &flag, 59},
+        {SHRPX_OPT_STREAM_READ_TIMEOUT.c_str(), required_argument, &flag, 60},
+        {SHRPX_OPT_STREAM_WRITE_TIMEOUT.c_str(), required_argument, &flag, 61},
+        {SHRPX_OPT_NO_LOCATION_REWRITE.c_str(), no_argument, &flag, 62},
+        {SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_HOST.c_str(),
+         required_argument, &flag, 63},
+        {SHRPX_OPT_LISTENER_DISABLE_TIMEOUT.c_str(), required_argument, &flag,
+         64},
+        {SHRPX_OPT_STRIP_INCOMING_X_FORWARDED_FOR.c_str(), no_argument, &flag,
+         65},
+        {SHRPX_OPT_ACCESSLOG_FORMAT.c_str(), required_argument, &flag, 66},
+        {SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND.c_str(),
+         required_argument, &flag, 67},
+        {SHRPX_OPT_TLS_TICKET_KEY_FILE.c_str(), required_argument, &flag, 68},
+        {SHRPX_OPT_RLIMIT_NOFILE.c_str(), required_argument, &flag, 69},
+        {SHRPX_OPT_BACKEND_RESPONSE_BUFFER.c_str(), required_argument, &flag,
+         71},
+        {SHRPX_OPT_BACKEND_REQUEST_BUFFER.c_str(), required_argument, &flag,
+         72},
+        {SHRPX_OPT_NO_HOST_REWRITE.c_str(), no_argument, &flag, 73},
+        {SHRPX_OPT_NO_SERVER_PUSH.c_str(), no_argument, &flag, 74},
+        {SHRPX_OPT_BACKEND_HTTP2_CONNECTIONS_PER_WORKER.c_str(),
+         required_argument, &flag, 76},
+        {SHRPX_OPT_FETCH_OCSP_RESPONSE_FILE.c_str(), required_argument, &flag,
+         77},
+        {SHRPX_OPT_OCSP_UPDATE_INTERVAL.c_str(), required_argument, &flag, 78},
+        {SHRPX_OPT_NO_OCSP.c_str(), no_argument, &flag, 79},
+        {SHRPX_OPT_HEADER_FIELD_BUFFER.c_str(), required_argument, &flag, 80},
+        {SHRPX_OPT_MAX_HEADER_FIELDS.c_str(), required_argument, &flag, 81},
+        {SHRPX_OPT_ADD_REQUEST_HEADER.c_str(), required_argument, &flag, 82},
+        {SHRPX_OPT_INCLUDE.c_str(), required_argument, &flag, 83},
+        {SHRPX_OPT_TLS_TICKET_KEY_CIPHER.c_str(), required_argument, &flag, 84},
+        {SHRPX_OPT_HOST_REWRITE.c_str(), no_argument, &flag, 85},
+        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED.c_str(), required_argument,
+         &flag, 86},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED.c_str(), required_argument, &flag,
+         87},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_INTERVAL.c_str(), required_argument,
+         &flag, 88},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY.c_str(),
+         required_argument, &flag, 89},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL.c_str(), required_argument,
+         &flag, 90},
+        {SHRPX_OPT_MRUBY_FILE.c_str(), required_argument, &flag, 91},
+        {SHRPX_OPT_ACCEPT_PROXY_PROTOCOL.c_str(), no_argument, &flag, 93},
+        {SHRPX_OPT_FASTOPEN.c_str(), required_argument, &flag, 94},
+        {SHRPX_OPT_TLS_DYN_REC_WARMUP_THRESHOLD.c_str(), required_argument,
+         &flag, 95},
+        {SHRPX_OPT_TLS_DYN_REC_IDLE_TIMEOUT.c_str(), required_argument, &flag,
+         96},
+        {SHRPX_OPT_ADD_FORWARDED.c_str(), required_argument, &flag, 97},
+        {SHRPX_OPT_STRIP_INCOMING_FORWARDED.c_str(), no_argument, &flag, 98},
+        {SHRPX_OPT_FORWARDED_BY.c_str(), required_argument, &flag, 99},
+        {SHRPX_OPT_FORWARDED_FOR.c_str(), required_argument, &flag, 100},
+        {SHRPX_OPT_RESPONSE_HEADER_FIELD_BUFFER.c_str(), required_argument,
+         &flag, 101},
+        {SHRPX_OPT_MAX_RESPONSE_HEADER_FIELDS.c_str(), required_argument, &flag,
+         102},
+        {SHRPX_OPT_NO_HTTP2_CIPHER_BLACK_LIST.c_str(), no_argument, &flag, 103},
+        {SHRPX_OPT_REQUEST_HEADER_FIELD_BUFFER.c_str(), required_argument,
+         &flag, 104},
+        {SHRPX_OPT_MAX_REQUEST_HEADER_FIELDS.c_str(), required_argument, &flag,
+         105},
+        {SHRPX_OPT_BACKEND_HTTP1_TLS.c_str(), no_argument, &flag, 106},
+        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_TLS.c_str(), no_argument, &flag,
+         108},
+        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE.c_str(),
+         required_argument, &flag, 109},
+        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE.c_str(),
          required_argument, &flag, 110},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_TLS, no_argument, &flag, 111},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_CERT_FILE, required_argument, &flag,
-         112},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE, required_argument,
-         &flag, 113},
-        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY, required_argument,
-         &flag, 114},
-        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY,
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_TLS.c_str(), no_argument, &flag,
+         111},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_CERT_FILE.c_str(),
+         required_argument, &flag, 112},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE.c_str(),
+         required_argument, &flag, 113},
+        {SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY.c_str(),
+         required_argument, &flag, 114},
+        {SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY.c_str(),
          required_argument, &flag, 115},
-        {SHRPX_OPT_BACKEND_ADDRESS_FAMILY, required_argument, &flag, 116},
-        {SHRPX_OPT_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS, required_argument,
-         &flag, 117},
-        {SHRPX_OPT_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS, required_argument,
-         &flag, 118},
-        {SHRPX_OPT_BACKEND_CONNECTIONS_PER_FRONTEND, required_argument, &flag,
-         119},
-        {SHRPX_OPT_BACKEND_TLS, no_argument, &flag, 120},
-        {SHRPX_OPT_BACKEND_CONNECTIONS_PER_HOST, required_argument, &flag, 121},
+        {SHRPX_OPT_BACKEND_ADDRESS_FAMILY.c_str(), required_argument, &flag,
+         116},
+        {SHRPX_OPT_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS.c_str(),
+         required_argument, &flag, 117},
+        {SHRPX_OPT_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS.c_str(),
+         required_argument, &flag, 118},
+        {SHRPX_OPT_BACKEND_CONNECTIONS_PER_FRONTEND.c_str(), required_argument,
+         &flag, 119},
+        {SHRPX_OPT_BACKEND_TLS.c_str(), no_argument, &flag, 120},
+        {SHRPX_OPT_BACKEND_CONNECTIONS_PER_HOST.c_str(), required_argument,
+         &flag, 121},
+        {SHRPX_OPT_ERROR_PAGE.c_str(), required_argument, &flag, 122},
+        {SHRPX_OPT_NO_KQUEUE.c_str(), no_argument, &flag, 123},
+        {SHRPX_OPT_FRONTEND_HTTP2_SETTINGS_TIMEOUT.c_str(), required_argument,
+         &flag, 124},
+        {SHRPX_OPT_BACKEND_HTTP2_SETTINGS_TIMEOUT.c_str(), required_argument,
+         &flag, 125},
+        {SHRPX_OPT_API_MAX_REQUEST_BODY.c_str(), required_argument, &flag, 126},
+        {SHRPX_OPT_BACKEND_MAX_BACKOFF.c_str(), required_argument, &flag, 127},
         {nullptr, 0, nullptr, 0}};
 
     int option_index = 0;
@@ -2474,37 +2843,39 @@ int main(int argc, char **argv) {
     }
     switch (c) {
     case 'D':
-      cmdcfgs.emplace_back(SHRPX_OPT_DAEMON, "yes");
+      cmdcfgs.emplace_back(SHRPX_OPT_DAEMON, StringRef::from_lit("yes"));
       break;
     case 'L':
-      cmdcfgs.emplace_back(SHRPX_OPT_LOG_LEVEL, optarg);
+      cmdcfgs.emplace_back(SHRPX_OPT_LOG_LEVEL, StringRef{optarg});
       break;
     case 'b':
-      cmdcfgs.emplace_back(SHRPX_OPT_BACKEND, optarg);
+      cmdcfgs.emplace_back(SHRPX_OPT_BACKEND, StringRef{optarg});
       break;
     case 'c':
-      cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_MAX_CONCURRENT_STREAMS, optarg);
+      cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_MAX_CONCURRENT_STREAMS,
+                           StringRef{optarg});
       break;
     case 'f':
-      cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND, optarg);
+      cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND, StringRef{optarg});
       break;
     case 'h':
       print_help(std::cout);
       exit(EXIT_SUCCESS);
     case 'k':
-      cmdcfgs.emplace_back(SHRPX_OPT_INSECURE, "yes");
+      cmdcfgs.emplace_back(SHRPX_OPT_INSECURE, StringRef::from_lit("yes"));
       break;
     case 'n':
-      cmdcfgs.emplace_back(SHRPX_OPT_WORKERS, optarg);
+      cmdcfgs.emplace_back(SHRPX_OPT_WORKERS, StringRef{optarg});
       break;
     case 'o':
-      cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_FRAME_DEBUG, "yes");
+      cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_FRAME_DEBUG,
+                           StringRef::from_lit("yes"));
       break;
     case 'p':
-      cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_PROXY, "yes");
+      cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_PROXY, StringRef::from_lit("yes"));
       break;
     case 's':
-      cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_PROXY, "yes");
+      cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_PROXY, StringRef::from_lit("yes"));
       break;
     case 'v':
       print_version(std::cout);
@@ -2516,44 +2887,51 @@ int main(int argc, char **argv) {
       switch (flag) {
       case 1:
         // --add-x-forwarded-for
-        cmdcfgs.emplace_back(SHRPX_OPT_ADD_X_FORWARDED_FOR, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_ADD_X_FORWARDED_FOR,
+                             StringRef::from_lit("yes"));
         break;
       case 2:
         // --frontend-http2-read-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_READ_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_READ_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 3:
         // --frontend-read-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_READ_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_READ_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 4:
         // --frontend-write-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_WRITE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_WRITE_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 5:
         // --backend-read-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_READ_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_READ_TIMEOUT, StringRef{optarg});
         break;
       case 6:
         // --backend-write-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_WRITE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_WRITE_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 7:
-        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_FILE, StringRef{optarg});
         break;
       case 8:
         // --backend-keep-alive-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_KEEP_ALIVE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_KEEP_ALIVE_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 9:
         // --frontend-http2-window-bits
-        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_WINDOW_BITS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_WINDOW_BITS,
+                             StringRef{optarg});
         break;
       case 10:
-        cmdcfgs.emplace_back(SHRPX_OPT_PID_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_PID_FILE, StringRef{optarg});
         break;
       case 11:
-        cmdcfgs.emplace_back(SHRPX_OPT_USER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_USER, StringRef{optarg});
         break;
       case 12:
         // --conf
@@ -2561,426 +2939,496 @@ int main(int argc, char **argv) {
         break;
       case 14:
         // --syslog-facility
-        cmdcfgs.emplace_back(SHRPX_OPT_SYSLOG_FACILITY, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_SYSLOG_FACILITY, StringRef{optarg});
         break;
       case 15:
         // --backlog
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKLOG, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKLOG, StringRef{optarg});
         break;
       case 16:
         // --ciphers
-        cmdcfgs.emplace_back(SHRPX_OPT_CIPHERS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_CIPHERS, StringRef{optarg});
         break;
       case 17:
         // --client
-        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT, StringRef::from_lit("yes"));
         break;
       case 18:
         // --backend-http2-window-bits
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_WINDOW_BITS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_WINDOW_BITS,
+                             StringRef{optarg});
         break;
       case 19:
         // --cacert
-        cmdcfgs.emplace_back(SHRPX_OPT_CACERT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_CACERT, StringRef{optarg});
         break;
       case 20:
         // --backend-ipv4
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_IPV4, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_IPV4,
+                             StringRef::from_lit("yes"));
         break;
       case 21:
         // --backend-ipv6
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_IPV6, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_IPV6,
+                             StringRef::from_lit("yes"));
         break;
       case 22:
         // --private-key-passwd-file
-        cmdcfgs.emplace_back(SHRPX_OPT_PRIVATE_KEY_PASSWD_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_PRIVATE_KEY_PASSWD_FILE,
+                             StringRef{optarg});
         break;
       case 23:
         // --no-via
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_VIA, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_VIA, StringRef::from_lit("yes"));
         break;
       case 24:
         // --subcert
-        cmdcfgs.emplace_back(SHRPX_OPT_SUBCERT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_SUBCERT, StringRef{optarg});
         break;
       case 25:
         // --http2-bridge
-        cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_BRIDGE, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_BRIDGE,
+                             StringRef::from_lit("yes"));
         break;
       case 26:
         // --backend-http-proxy-uri
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP_PROXY_URI, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP_PROXY_URI,
+                             StringRef{optarg});
         break;
       case 27:
         // --backend-no-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_NO_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_NO_TLS,
+                             StringRef::from_lit("yes"));
         break;
       case 29:
         // --frontend-no-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_NO_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_NO_TLS,
+                             StringRef::from_lit("yes"));
         break;
       case 31:
         // --backend-tls-sni-field
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_TLS_SNI_FIELD, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_TLS_SNI_FIELD,
+                             StringRef{optarg});
         break;
       case 33:
         // --dh-param-file
-        cmdcfgs.emplace_back(SHRPX_OPT_DH_PARAM_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_DH_PARAM_FILE, StringRef{optarg});
         break;
       case 34:
         // --read-rate
-        cmdcfgs.emplace_back(SHRPX_OPT_READ_RATE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_READ_RATE, StringRef{optarg});
         break;
       case 35:
         // --read-burst
-        cmdcfgs.emplace_back(SHRPX_OPT_READ_BURST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_READ_BURST, StringRef{optarg});
         break;
       case 36:
         // --write-rate
-        cmdcfgs.emplace_back(SHRPX_OPT_WRITE_RATE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WRITE_RATE, StringRef{optarg});
         break;
       case 37:
         // --write-burst
-        cmdcfgs.emplace_back(SHRPX_OPT_WRITE_BURST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WRITE_BURST, StringRef{optarg});
         break;
       case 38:
         // --npn-list
-        cmdcfgs.emplace_back(SHRPX_OPT_NPN_LIST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_NPN_LIST, StringRef{optarg});
         break;
       case 39:
         // --verify-client
-        cmdcfgs.emplace_back(SHRPX_OPT_VERIFY_CLIENT, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_VERIFY_CLIENT,
+                             StringRef::from_lit("yes"));
         break;
       case 40:
         // --verify-client-cacert
-        cmdcfgs.emplace_back(SHRPX_OPT_VERIFY_CLIENT_CACERT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_VERIFY_CLIENT_CACERT, StringRef{optarg});
         break;
       case 41:
         // --client-private-key-file
-        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_PRIVATE_KEY_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_PRIVATE_KEY_FILE,
+                             StringRef{optarg});
         break;
       case 42:
         // --client-cert-file
-        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_CERT_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_CLIENT_CERT_FILE, StringRef{optarg});
         break;
       case 43:
         // --frontend-http2-dump-request-header
         cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_DUMP_REQUEST_HEADER,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 44:
         // --frontend-http2-dump-response-header
         cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_DUMP_RESPONSE_HEADER,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 45:
         // --http2-no-cookie-crumbling
-        cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_NO_COOKIE_CRUMBLING, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_HTTP2_NO_COOKIE_CRUMBLING,
+                             StringRef::from_lit("yes"));
         break;
       case 46:
         // --frontend-http2-connection-window-bits
         cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_CONNECTION_WINDOW_BITS,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 47:
         // --backend-http2-connection-window-bits
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_CONNECTION_WINDOW_BITS,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 48:
         // --tls-proto-list
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_PROTO_LIST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_PROTO_LIST, StringRef{optarg});
         break;
       case 49:
         // --padding
-        cmdcfgs.emplace_back(SHRPX_OPT_PADDING, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_PADDING, StringRef{optarg});
         break;
       case 50:
         // --worker-read-rate
-        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_READ_RATE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_READ_RATE, StringRef{optarg});
         break;
       case 51:
         // --worker-read-burst
-        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_READ_BURST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_READ_BURST, StringRef{optarg});
         break;
       case 52:
         // --worker-write-rate
-        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_WRITE_RATE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_WRITE_RATE, StringRef{optarg});
         break;
       case 53:
         // --worker-write-burst
-        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_WRITE_BURST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_WRITE_BURST, StringRef{optarg});
         break;
       case 54:
         // --altsvc
-        cmdcfgs.emplace_back(SHRPX_OPT_ALTSVC, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ALTSVC, StringRef{optarg});
         break;
       case 55:
         // --add-response-header
-        cmdcfgs.emplace_back(SHRPX_OPT_ADD_RESPONSE_HEADER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ADD_RESPONSE_HEADER, StringRef{optarg});
         break;
       case 56:
         // --worker-frontend-connections
-        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_FRONTEND_CONNECTIONS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_WORKER_FRONTEND_CONNECTIONS,
+                             StringRef{optarg});
         break;
       case 57:
         // --accesslog-syslog
-        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_SYSLOG, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_SYSLOG,
+                             StringRef::from_lit("yes"));
         break;
       case 58:
         // --errorlog-file
-        cmdcfgs.emplace_back(SHRPX_OPT_ERRORLOG_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ERRORLOG_FILE, StringRef{optarg});
         break;
       case 59:
         // --errorlog-syslog
-        cmdcfgs.emplace_back(SHRPX_OPT_ERRORLOG_SYSLOG, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_ERRORLOG_SYSLOG,
+                             StringRef::from_lit("yes"));
         break;
       case 60:
         // --stream-read-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_STREAM_READ_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_STREAM_READ_TIMEOUT, StringRef{optarg});
         break;
       case 61:
         // --stream-write-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_STREAM_WRITE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_STREAM_WRITE_TIMEOUT, StringRef{optarg});
         break;
       case 62:
         // --no-location-rewrite
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_LOCATION_REWRITE, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_LOCATION_REWRITE,
+                             StringRef::from_lit("yes"));
         break;
       case 63:
         // --backend-http1-connections-per-host
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_HOST,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 64:
         // --listener-disable-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_LISTENER_DISABLE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_LISTENER_DISABLE_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 65:
         // --strip-incoming-x-forwarded-for
-        cmdcfgs.emplace_back(SHRPX_OPT_STRIP_INCOMING_X_FORWARDED_FOR, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_STRIP_INCOMING_X_FORWARDED_FOR,
+                             StringRef::from_lit("yes"));
         break;
       case 66:
         // --accesslog-format
-        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_FORMAT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ACCESSLOG_FORMAT, StringRef{optarg});
         break;
       case 67:
         // --backend-http1-connections-per-frontend
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP1_CONNECTIONS_PER_FRONTEND,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 68:
         // --tls-ticket-key-file
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_FILE, StringRef{optarg});
         break;
       case 69:
         // --rlimit-nofile
-        cmdcfgs.emplace_back(SHRPX_OPT_RLIMIT_NOFILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_RLIMIT_NOFILE, StringRef{optarg});
         break;
       case 71:
         // --backend-response-buffer
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_RESPONSE_BUFFER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_RESPONSE_BUFFER,
+                             StringRef{optarg});
         break;
       case 72:
         // --backend-request-buffer
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_REQUEST_BUFFER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_REQUEST_BUFFER,
+                             StringRef{optarg});
         break;
       case 73:
         // --no-host-rewrite
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_HOST_REWRITE, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_HOST_REWRITE,
+                             StringRef::from_lit("yes"));
         break;
       case 74:
         // --no-server-push
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_SERVER_PUSH, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_SERVER_PUSH,
+                             StringRef::from_lit("yes"));
         break;
       case 76:
         // --backend-http2-connections-per-worker
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_CONNECTIONS_PER_WORKER,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 77:
         // --fetch-ocsp-response-file
-        cmdcfgs.emplace_back(SHRPX_OPT_FETCH_OCSP_RESPONSE_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FETCH_OCSP_RESPONSE_FILE,
+                             StringRef{optarg});
         break;
       case 78:
         // --ocsp-update-interval
-        cmdcfgs.emplace_back(SHRPX_OPT_OCSP_UPDATE_INTERVAL, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_OCSP_UPDATE_INTERVAL, StringRef{optarg});
         break;
       case 79:
         // --no-ocsp
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_OCSP, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_OCSP, StringRef::from_lit("yes"));
         break;
       case 80:
         // --header-field-buffer
-        cmdcfgs.emplace_back(SHRPX_OPT_HEADER_FIELD_BUFFER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_HEADER_FIELD_BUFFER, StringRef{optarg});
         break;
       case 81:
         // --max-header-fields
-        cmdcfgs.emplace_back(SHRPX_OPT_MAX_HEADER_FIELDS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_MAX_HEADER_FIELDS, StringRef{optarg});
         break;
       case 82:
         // --add-request-header
-        cmdcfgs.emplace_back(SHRPX_OPT_ADD_REQUEST_HEADER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ADD_REQUEST_HEADER, StringRef{optarg});
         break;
       case 83:
         // --include
-        cmdcfgs.emplace_back(SHRPX_OPT_INCLUDE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_INCLUDE, StringRef{optarg});
         break;
       case 84:
         // --tls-ticket-key-cipher
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_CIPHER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_CIPHER,
+                             StringRef{optarg});
         break;
       case 85:
         // --host-rewrite
-        cmdcfgs.emplace_back(SHRPX_OPT_HOST_REWRITE, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_HOST_REWRITE,
+                             StringRef::from_lit("yes"));
         break;
       case 86:
         // --tls-session-cache-memcached
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED,
+                             StringRef{optarg});
         break;
       case 87:
         // --tls-ticket-key-memcached
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED,
+                             StringRef{optarg});
         break;
       case 88:
         // --tls-ticket-key-memcached-interval
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_INTERVAL,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 89:
         // --tls-ticket-key-memcached-max-retry
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 90:
         // --tls-ticket-key-memcached-max-fail
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 91:
         // --mruby-file
-        cmdcfgs.emplace_back(SHRPX_OPT_MRUBY_FILE, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_MRUBY_FILE, StringRef{optarg});
         break;
       case 93:
         // --accept-proxy-protocol
-        cmdcfgs.emplace_back(SHRPX_OPT_ACCEPT_PROXY_PROTOCOL, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_ACCEPT_PROXY_PROTOCOL,
+                             StringRef::from_lit("yes"));
         break;
       case 94:
         // --fastopen
-        cmdcfgs.emplace_back(SHRPX_OPT_FASTOPEN, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FASTOPEN, StringRef{optarg});
         break;
       case 95:
         // --tls-dyn-rec-warmup-threshold
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_DYN_REC_WARMUP_THRESHOLD, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_DYN_REC_WARMUP_THRESHOLD,
+                             StringRef{optarg});
         break;
       case 96:
         // --tls-dyn-rec-idle-timeout
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_DYN_REC_IDLE_TIMEOUT, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_DYN_REC_IDLE_TIMEOUT,
+                             StringRef{optarg});
         break;
       case 97:
         // --add-forwarded
-        cmdcfgs.emplace_back(SHRPX_OPT_ADD_FORWARDED, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_ADD_FORWARDED, StringRef{optarg});
         break;
       case 98:
         // --strip-incoming-forwarded
-        cmdcfgs.emplace_back(SHRPX_OPT_STRIP_INCOMING_FORWARDED, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_STRIP_INCOMING_FORWARDED,
+                             StringRef::from_lit("yes"));
         break;
       case 99:
         // --forwarded-by
-        cmdcfgs.emplace_back(SHRPX_OPT_FORWARDED_BY, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FORWARDED_BY, StringRef{optarg});
         break;
       case 100:
         // --forwarded-for
-        cmdcfgs.emplace_back(SHRPX_OPT_FORWARDED_FOR, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_FORWARDED_FOR, StringRef{optarg});
         break;
       case 101:
         // --response-header-field-buffer
-        cmdcfgs.emplace_back(SHRPX_OPT_RESPONSE_HEADER_FIELD_BUFFER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_RESPONSE_HEADER_FIELD_BUFFER,
+                             StringRef{optarg});
         break;
       case 102:
         // --max-response-header-fields
-        cmdcfgs.emplace_back(SHRPX_OPT_MAX_RESPONSE_HEADER_FIELDS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_MAX_RESPONSE_HEADER_FIELDS,
+                             StringRef{optarg});
         break;
       case 103:
         // --no-http2-cipher-black-list
-        cmdcfgs.emplace_back(SHRPX_OPT_NO_HTTP2_CIPHER_BLACK_LIST, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_HTTP2_CIPHER_BLACK_LIST,
+                             StringRef::from_lit("yes"));
         break;
       case 104:
         // --request-header-field-buffer
-        cmdcfgs.emplace_back(SHRPX_OPT_REQUEST_HEADER_FIELD_BUFFER, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_REQUEST_HEADER_FIELD_BUFFER,
+                             StringRef{optarg});
         break;
       case 105:
         // --max-request-header-fields
-        cmdcfgs.emplace_back(SHRPX_OPT_MAX_REQUEST_HEADER_FIELDS, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_MAX_REQUEST_HEADER_FIELDS,
+                             StringRef{optarg});
         break;
       case 106:
         // --backend-http1-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP1_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP1_TLS,
+                             StringRef::from_lit("yes"));
         break;
       case 108:
         // --tls-session-cache-memcached-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_TLS,
+                             StringRef::from_lit("yes"));
         break;
       case 109:
         // --tls-session-cache-memcached-cert-file
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_CERT_FILE,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 110:
         // --tls-session-cache-memcached-private-key-file
         cmdcfgs.emplace_back(
-            SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE, optarg);
+            SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_PRIVATE_KEY_FILE,
+            StringRef{optarg});
         break;
       case 111:
         // --tls-ticket-key-memcached-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_TLS,
+                             StringRef::from_lit("yes"));
         break;
       case 112:
         // --tls-ticket-key-memcached-cert-file
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_CERT_FILE,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 113:
         // --tls-ticket-key-memcached-private-key-file
         cmdcfgs.emplace_back(
-            SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE, optarg);
+            SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE,
+            StringRef{optarg});
         break;
       case 114:
         // --tls-ticket-key-memcached-address-family
         cmdcfgs.emplace_back(SHRPX_OPT_TLS_TICKET_KEY_MEMCACHED_ADDRESS_FAMILY,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 115:
         // --tls-session-cache-memcached-address-family
         cmdcfgs.emplace_back(
-            SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY, optarg);
+            SHRPX_OPT_TLS_SESSION_CACHE_MEMCACHED_ADDRESS_FAMILY,
+            StringRef{optarg});
         break;
       case 116:
         // --backend-address-family
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_ADDRESS_FAMILY, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_ADDRESS_FAMILY,
+                             StringRef{optarg});
         break;
       case 117:
         // --frontend-http2-max-concurrent-streams
         cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_MAX_CONCURRENT_STREAMS,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 118:
         // --backend-http2-max-concurrent-streams
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_MAX_CONCURRENT_STREAMS,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 119:
         // --backend-connections-per-frontend
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_CONNECTIONS_PER_FRONTEND,
-                             optarg);
+                             StringRef{optarg});
         break;
       case 120:
         // --backend-tls
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_TLS, "yes");
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_TLS, StringRef::from_lit("yes"));
         break;
       case 121:
         // --backend-connections-per-host
-        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_CONNECTIONS_PER_HOST, optarg);
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_CONNECTIONS_PER_HOST,
+                             StringRef{optarg});
+        break;
+      case 122:
+        // --error-page
+        cmdcfgs.emplace_back(SHRPX_OPT_ERROR_PAGE, StringRef{optarg});
+        break;
+      case 123:
+        // --no-kqueue
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_KQUEUE, StringRef::from_lit("yes"));
+        break;
+      case 124:
+        // --frontend-http2-settings-timeout
+        cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_HTTP2_SETTINGS_TIMEOUT,
+                             StringRef{optarg});
+        break;
+      case 125:
+        // --backend-http2-settings-timeout
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_HTTP2_SETTINGS_TIMEOUT,
+                             StringRef{optarg});
+        break;
+      case 126:
+        // --api-max-request-body
+        cmdcfgs.emplace_back(SHRPX_OPT_API_MAX_REQUEST_BODY, StringRef{optarg});
+        break;
+      case 127:
+        // --backend-max-backoff
+        cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_MAX_BACKOFF, StringRef{optarg});
         break;
       default:
         break;
@@ -2991,7 +3439,15 @@ int main(int argc, char **argv) {
     }
   }
 
-  process_options(argc, argv, cmdcfgs);
+  if (argc - optind >= 2) {
+    cmdcfgs.emplace_back(SHRPX_OPT_PRIVATE_KEY_FILE, StringRef{argv[optind++]});
+    cmdcfgs.emplace_back(SHRPX_OPT_CERTIFICATE_FILE, StringRef{argv[optind++]});
+  }
+
+  rv = process_options(mod_config(), cmdcfgs);
+  if (rv != 0) {
+    return -1;
+  }
 
   if (event_loop() != 0) {
     return -1;

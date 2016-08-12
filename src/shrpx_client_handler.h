@@ -49,6 +49,8 @@ class ConnectBlocker;
 class DownstreamConnectionPool;
 class Worker;
 struct WorkerStat;
+struct DownstreamAddrGroup;
+struct DownstreamAddr;
 
 class ClientHandler {
 public:
@@ -86,7 +88,7 @@ public:
   struct ev_loop *get_loop() const;
   void reset_upstream_read_timeout(ev_tstamp t);
   void reset_upstream_write_timeout(ev_tstamp t);
-  void signal_reset_upstream_conn_rtimer();
+
   int validate_next_proto();
   const std::string &get_ipaddr() const;
   const std::string &get_port() const;
@@ -122,7 +124,7 @@ public:
                        int64_t body_bytes_sent);
   Worker *get_worker() const;
 
-  using ReadBuf = Buffer<8_k>;
+  using ReadBuf = Buffer<16_k>;
 
   ReadBuf *get_rb();
 
@@ -140,6 +142,17 @@ public:
   // Returns string suitable for use in "for" parameter of Forwarded
   // header field.
   StringRef get_forwarded_for() const;
+
+  Http2Session *
+  select_http2_session(const std::shared_ptr<DownstreamAddrGroup> &group);
+
+  Http2Session *select_http2_session_with_affinity(
+      const std::shared_ptr<DownstreamAddrGroup> &group, DownstreamAddr *addr);
+
+  const UpstreamAddr *get_upstream_addr() const;
+
+  void repeat_read_timer();
+  void stop_read_timer();
 
 private:
   Connection conn_;
@@ -161,8 +174,11 @@ private:
   Worker *worker_;
   // The number of bytes of HTTP/2 client connection header to read
   size_t left_connhd_len_;
+  // hash for session affinity using client IP
+  uint32_t affinity_hash_;
   bool should_close_after_write_;
-  bool reset_conn_rtimer_required_;
+  // true if affinity_hash_ is computed
+  bool affinity_hash_computed_;
   ReadBuf rb_;
 };
 

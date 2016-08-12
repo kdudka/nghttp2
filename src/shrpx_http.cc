@@ -35,19 +35,24 @@ namespace shrpx {
 
 namespace http {
 
-std::string create_error_html(unsigned int status_code) {
-  std::string res;
-  res.reserve(512);
-  auto status = http2::get_status_string(status_code);
-  res += R"(<!DOCTYPE html><html lang="en"><title>)";
-  res += status;
-  res += "</title><body><h1>";
-  res += status;
-  res += "</h1><footer>";
-  const auto &server_name = get_config()->http.server_name;
-  res.append(server_name.c_str(), server_name.size());
-  res += "</footer></body></html>";
-  return res;
+StringRef create_error_html(BlockAllocator &balloc, unsigned int http_status) {
+  auto &httpconf = get_config()->http;
+
+  const auto &error_pages = httpconf.error_pages;
+  for (const auto &page : error_pages) {
+    if (page.http_status == 0 || page.http_status == http_status) {
+      return StringRef{std::begin(page.content), std::end(page.content)};
+    }
+  }
+
+  auto status_string = http2::get_status_string(balloc, http_status);
+  const auto &server_name = httpconf.server_name;
+
+  return concat_string_ref(
+      balloc, StringRef::from_lit(R"(<!DOCTYPE html><html lang="en"><title>)"),
+      status_string, StringRef::from_lit("</title><body><h1>"), status_string,
+      StringRef::from_lit("</h1><footer>"), server_name,
+      StringRef::from_lit("</footer></body></html>"));
 }
 
 StringRef create_forwarded(BlockAllocator &balloc, int params,

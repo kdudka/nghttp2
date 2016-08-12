@@ -138,6 +138,9 @@ int Http2Upstream::upgrade_upstream(HttpsUpstream *http) {
   downstream_queue_.add_pending(std::move(downstream));
   downstream_queue_.mark_active(ptr);
 
+  // TODO This might not be necessary
+  handler_->stop_read_timer();
+
   if (LOG_ENABLED(INFO)) {
     ULOG(INFO, this) << "Connection upgraded to HTTP/2";
   }
@@ -325,7 +328,8 @@ int Http2Upstream::on_request_headers(Downstream *downstream,
   }
 
   if (path) {
-    if (method_token == HTTP_OPTIONS && path->value == "*") {
+    if (method_token == HTTP_OPTIONS &&
+        path->value == StringRef::from_lit("*")) {
       // Server-wide OPTIONS request.  Path is empty.
     } else if (get_config()->http2_proxy) {
       req.path = path->value;
@@ -384,9 +388,9 @@ void Http2Upstream::start_downstream(Downstream *downstream) {
 void Http2Upstream::initiate_downstream(Downstream *downstream) {
   int rv;
 
-  rv = downstream->attach_downstream_connection(
-      handler_->get_downstream_connection(downstream));
-  if (rv != 0) {
+  auto dconn = handler_->get_downstream_connection(downstream);
+  if (!dconn ||
+      (rv = downstream->attach_downstream_connection(std::move(dconn))) != 0) {
     // downstream connection fails, send error page
     if (error_reply(downstream, 503) != 0) {
       rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
@@ -412,6 +416,14 @@ void Http2Upstream::initiate_downstream(Downstream *downstream) {
 
   downstream_queue_.mark_active(downstream);
 
+  auto &req = downstream->request();
+  if (!req.http2_expect_body) {
+    rv = downstream->end_upload_data();
+    if (rv != 0) {
+      rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+    }
+  }
+
   return;
 }
 
@@ -422,9 +434,6 @@ int on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame,
     verbose_on_frame_recv_callback(session, frame, user_data);
   }
   auto upstream = static_cast<Http2Upstream *>(user_data);
-  auto handler = upstream->get_client_handler();
-
-  handler->signal_reset_upstream_conn_rtimer();
 
   switch (frame->hd.type) {
   case NGHTTP2_DATA: {
@@ -437,7 +446,12 @@ int on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame,
     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
       downstream->disable_upstream_rtimer();
 
-      downstream->end_upload_data();
+      if (downstream->end_upload_data() != 0) {
+        if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+          upstream->rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+        }
+      }
+
       downstream->set_request_state(Downstream::MSG_COMPLETE);
     }
 
@@ -459,7 +473,12 @@ int on_frame_recv_callback(nghttp2_session *session, const nghttp2_frame *frame,
     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
       downstream->disable_upstream_rtimer();
 
-      downstream->end_upload_data();
+      if (downstream->end_upload_data() != 0) {
+        if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+          upstream->rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+        }
+      }
+
       downstream->set_request_state(Downstream::MSG_COMPLETE);
     }
 
@@ -507,7 +526,9 @@ int on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
   downstream->reset_upstream_rtimer();
 
   if (downstream->push_upload_data_chunk(data, len) != 0) {
-    upstream->rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+    if (downstream->get_response_state() != Downstream::MSG_COMPLETE) {
+      upstream->rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+    }
 
     if (upstream->consume(stream_id, len) != 0) {
       return NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -779,23 +800,25 @@ void Http2Upstream::submit_goaway() {
 
 void Http2Upstream::check_shutdown() {
   int rv;
-  if (shutdown_handled_) {
-    return;
-  }
 
   auto worker = handler_->get_worker();
 
-  if (worker->get_graceful_shutdown()) {
-    shutdown_handled_ = true;
-    rv = nghttp2_submit_shutdown_notice(session_);
-    if (rv != 0) {
-      ULOG(FATAL, this) << "nghttp2_submit_shutdown_notice() failed: "
-                        << nghttp2_strerror(rv);
-      return;
-    }
-    handler_->signal_write();
-    ev_timer_start(handler_->get_loop(), &shutdown_timer_);
+  if (!worker->get_graceful_shutdown()) {
+    return;
   }
+
+  ev_prepare_stop(handler_->get_loop(), &prep_);
+
+  rv = nghttp2_submit_shutdown_notice(session_);
+  if (rv != 0) {
+    ULOG(FATAL, this) << "nghttp2_submit_shutdown_notice() failed: "
+                      << nghttp2_strerror(rv);
+    return;
+  }
+
+  handler_->signal_write();
+
+  ev_timer_start(handler_->get_loop(), &shutdown_timer_);
 }
 
 nghttp2_session_callbacks *create_http2_upstream_callbacks() {
@@ -845,23 +868,34 @@ nghttp2_session_callbacks *create_http2_upstream_callbacks() {
   return callbacks;
 }
 
+namespace {
+size_t downstream_queue_size(Worker *worker) {
+  auto &downstreamconf = *worker->get_downstream_config();
+
+  if (get_config()->http2_proxy) {
+    return downstreamconf.connections_per_host;
+  }
+
+  return downstreamconf.connections_per_frontend;
+}
+} // namespace
+
 Http2Upstream::Http2Upstream(ClientHandler *handler)
     : wb_(handler->get_worker()->get_mcpool()),
-      downstream_queue_(
-          get_config()->http2_proxy
-              ? get_config()->conn.downstream.connections_per_host
-              : get_config()->conn.downstream.connections_per_frontend,
-          !get_config()->http2_proxy),
+      downstream_queue_(downstream_queue_size(handler->get_worker()),
+                        !get_config()->http2_proxy),
       handler_(handler),
-      session_(nullptr),
-      shutdown_handled_(false) {
-
+      session_(nullptr) {
   int rv;
 
   auto &http2conf = get_config()->http2;
 
-  rv = nghttp2_session_server_new2(&session_, http2conf.upstream.callbacks,
-                                   this, http2conf.upstream.option);
+  auto faddr = handler_->get_upstream_addr();
+
+  rv = nghttp2_session_server_new2(
+      &session_, http2conf.upstream.callbacks, this,
+      faddr->alt_mode ? http2conf.upstream.alt_mode_option
+                      : http2conf.upstream.option);
 
   assert(rv == 0);
 
@@ -873,7 +907,11 @@ Http2Upstream::Http2Upstream(ClientHandler *handler)
   entry[0].value = http2conf.upstream.max_concurrent_streams;
 
   entry[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
-  entry[1].value = (1 << http2conf.upstream.window_bits) - 1;
+  if (faddr->alt_mode) {
+    entry[1].value = (1u << 31) - 1;
+  } else {
+    entry[1].value = (1 << http2conf.upstream.window_bits) - 1;
+  }
 
   rv = nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, entry.data(),
                                entry.size());
@@ -882,10 +920,13 @@ Http2Upstream::Http2Upstream(ClientHandler *handler)
                       << nghttp2_strerror(rv);
   }
 
-  if (http2conf.upstream.connection_window_bits > 16) {
-    int32_t delta = (1 << http2conf.upstream.connection_window_bits) - 1 -
-                    NGHTTP2_INITIAL_CONNECTION_WINDOW_SIZE;
-    rv = nghttp2_submit_window_update(session_, NGHTTP2_FLAG_NONE, 0, delta);
+  int32_t window_bits =
+      faddr->alt_mode ? 31 : http2conf.upstream.connection_window_bits;
+
+  if (window_bits != 16) {
+    int32_t window_size = (1u << window_bits) - 1;
+    rv = nghttp2_session_set_local_window_size(session_, NGHTTP2_FLAG_NONE, 0,
+                                               window_size);
 
     if (rv != 0) {
       ULOG(ERROR, this) << "nghttp2_submit_window_update() returned error: "
@@ -894,7 +935,8 @@ Http2Upstream::Http2Upstream(ClientHandler *handler)
   }
 
   // We wait for SETTINGS ACK at least 10 seconds.
-  ev_timer_init(&settings_timer_, settings_timeout_cb, 10., 0.);
+  ev_timer_init(&settings_timer_, settings_timeout_cb,
+                http2conf.upstream.timeout.settings, 0.);
 
   settings_timer_.data = this;
 
@@ -929,7 +971,7 @@ int Http2Upstream::on_read() {
     rv = nghttp2_session_mem_recv(session_, rb->pos, rb->rleft());
     if (rv < 0) {
       if (rv != NGHTTP2_ERR_BAD_CLIENT_MAGIC) {
-        ULOG(ERROR, this) << "nghttp2_session_recv() returned error: "
+        ULOG(ERROR, this) << "nghttp2_session_mem_recv() returned error: "
                           << nghttp2_strerror(rv);
       }
       return -1;
@@ -1241,10 +1283,7 @@ int Http2Upstream::send_reply(Downstream *downstream, const uint8_t *body,
   // 2 for :status and server
   nva.reserve(2 + headers.size() + httpconf.add_response_headers.size());
 
-  auto response_status = http2::stringify_status(resp.http_status);
-  if (response_status.empty()) {
-    response_status = util::make_string_ref_uint(balloc, resp.http_status);
-  }
+  auto response_status = http2::stringify_status(balloc, resp.http_status);
 
   nva.push_back(http2::make_nv_ls_nocopy(":status", response_status));
 
@@ -1297,7 +1336,7 @@ int Http2Upstream::error_reply(Downstream *downstream,
 
   auto &balloc = downstream->get_block_allocator();
 
-  auto html = http::create_error_html(status_code);
+  auto html = http::create_error_html(balloc, status_code);
   resp.http_status = status_code;
   auto body = downstream->get_response_buf();
   body->append(html);
@@ -1310,11 +1349,7 @@ int Http2Upstream::error_reply(Downstream *downstream,
   auto lgconf = log_config();
   lgconf->update_tstamp(std::chrono::system_clock::now());
 
-  auto response_status = http2::stringify_status(status_code);
-  if (response_status.empty()) {
-    response_status = util::make_string_ref_uint(balloc, status_code);
-  }
-
+  auto response_status = http2::stringify_status(balloc, status_code);
   auto content_length = util::make_string_ref_uint(balloc, html.size());
   auto date = make_string_ref(balloc, StringRef{lgconf->time_http_str});
 
@@ -1339,6 +1374,8 @@ int Http2Upstream::error_reply(Downstream *downstream,
 void Http2Upstream::add_pending_downstream(
     std::unique_ptr<Downstream> downstream) {
   downstream_queue_.add_pending(std::move(downstream));
+
+  handler_->stop_read_timer();
 }
 
 void Http2Upstream::remove_downstream(Downstream *downstream) {
@@ -1353,6 +1390,11 @@ void Http2Upstream::remove_downstream(Downstream *downstream) {
 
   if (next_downstream) {
     initiate_downstream(next_downstream);
+  }
+
+  if (downstream_queue_.get_downstreams() == nullptr) {
+    // There is no downstream at the moment.  Start idle timer now.
+    handler_->repeat_read_timer();
   }
 }
 
@@ -1399,16 +1441,41 @@ int Http2Upstream::on_downstream_header_complete(Downstream *downstream) {
   }
 #endif // HAVE_MRUBY
 
+  auto &http2conf = get_config()->http2;
+
+  // We need some conditions that must be fulfilled to initiate server
+  // push.
+  //
+  // * Server push is disabled for http2 proxy or client proxy, since
+  //   incoming headers are mixed origins.  We don't know how to
+  //   reliably determine the authority yet.
+  //
+  // * We need non-final response or 200 response code for associated
+  //   resource.  This is too restrictive, we will review this later.
+  //
+  // * We requires GET or POST for associated resource.  Probably we
+  //   don't want to push for HEAD request.  Not sure other methods
+  //   are also eligible for push.
+  if (!http2conf.no_server_push &&
+      nghttp2_session_get_remote_settings(session_,
+                                          NGHTTP2_SETTINGS_ENABLE_PUSH) == 1 &&
+      !get_config()->http2_proxy && (downstream->get_stream_id() % 2) &&
+      resp.fs.header(http2::HD_LINK) &&
+      (downstream->get_non_final_response() || resp.http_status == 200) &&
+      (req.method == HTTP_GET || req.method == HTTP_POST)) {
+
+    if (prepare_push_promise(downstream) != 0) {
+      // Continue to send response even if push was failed.
+    }
+  }
+
   auto nva = std::vector<nghttp2_nv>();
   // 4 means :status and possible server, via and x-http2-push header
   // field.
   nva.reserve(resp.fs.headers().size() + 4 +
               httpconf.add_response_headers.size());
 
-  auto response_status = http2::stringify_status(resp.http_status);
-  if (response_status.empty()) {
-    response_status = util::make_string_ref_uint(balloc, resp.http_status);
-  }
+  auto response_status = http2::stringify_status(balloc, resp.http_status);
 
   nva.push_back(http2::make_nv_ls_nocopy(":status", response_status));
 
@@ -1490,8 +1557,6 @@ int Http2Upstream::on_downstream_header_complete(Downstream *downstream) {
     log_response_headers(downstream, nva);
   }
 
-  auto &http2conf = get_config()->http2;
-
   if (http2conf.upstream.debug.dump.response_header) {
     http2::dump_nv(http2conf.upstream.debug.dump.response_header, nva.data(),
                    nva.size());
@@ -1503,35 +1568,11 @@ int Http2Upstream::on_downstream_header_complete(Downstream *downstream) {
 
   nghttp2_data_provider *data_prdptr;
 
-  if (downstream->expect_response_body()) {
+  if (downstream->expect_response_body() ||
+      downstream->expect_response_trailer()) {
     data_prdptr = &data_prd;
   } else {
     data_prdptr = nullptr;
-  }
-
-  // We need some conditions that must be fulfilled to initiate server
-  // push.
-  //
-  // * Server push is disabled for http2 proxy or client proxy, since
-  //   incoming headers are mixed origins.  We don't know how to
-  //   reliably determine the authority yet.
-  //
-  // * We need 200 response code for associated resource.  This is too
-  //   restrictive, we will review this later.
-  //
-  // * We requires GET or POST for associated resource.  Probably we
-  //   don't want to push for HEAD request.  Not sure other methods
-  //   are also eligible for push.
-  if (!http2conf.no_server_push &&
-      nghttp2_session_get_remote_settings(session_,
-                                          NGHTTP2_SETTINGS_ENABLE_PUSH) == 1 &&
-      !get_config()->http2_proxy && (downstream->get_stream_id() % 2) &&
-      resp.fs.header(http2::HD_LINK) && resp.http_status == 200 &&
-      (req.method == HTTP_GET || req.method == HTTP_POST)) {
-
-    if (prepare_push_promise(downstream) != 0) {
-      // Continue to send response even if push was failed.
-    }
   }
 
   rv = nghttp2_submit_response(session_, downstream->get_stream_id(),
@@ -1681,6 +1722,12 @@ int Http2Upstream::on_downstream_abort_request(Downstream *downstream,
 int Http2Upstream::consume(int32_t stream_id, size_t len) {
   int rv;
 
+  auto faddr = handler_->get_upstream_addr();
+
+  if (faddr->alt_mode) {
+    return 0;
+  }
+
   rv = nghttp2_session_consume(session_, stream_id, len);
 
   if (rv != 0) {
@@ -1696,7 +1743,8 @@ void Http2Upstream::log_response_headers(
     Downstream *downstream, const std::vector<nghttp2_nv> &nva) const {
   std::stringstream ss;
   for (auto &nv : nva) {
-    ss << TTY_HTTP_HD << nv.name << TTY_RST << ": " << nv.value << "\n";
+    ss << TTY_HTTP_HD << StringRef{nv.name, nv.namelen} << TTY_RST << ": "
+       << StringRef{nv.value, nv.valuelen} << "\n";
   }
   ULOG(INFO, this) << "HTTP response headers. stream_id="
                    << downstream->get_stream_id() << "\n" << ss.str();
@@ -1728,6 +1776,11 @@ int Http2Upstream::on_downstream_reset(bool no_retry) {
   for (auto downstream = downstream_queue_.get_downstreams(); downstream;
        downstream = downstream->dlnext) {
     if (downstream->get_dispatch_state() != Downstream::DISPATCH_ACTIVE) {
+      // This is error condition when we failed push_request_headers()
+      // in initiate_downstream().  Otherwise, we have
+      // Downstream::DISPATCH_ACTIVE state, or we did not set
+      // DownstreamConnection.
+      downstream->pop_downstream_connection();
       continue;
     }
 
@@ -1742,6 +1795,8 @@ int Http2Upstream::on_downstream_reset(bool no_retry) {
 
     downstream->add_retry();
 
+    std::unique_ptr<DownstreamConnection> dconn;
+
     if (no_retry || downstream->no_more_retry()) {
       goto fail;
     }
@@ -1749,8 +1804,17 @@ int Http2Upstream::on_downstream_reset(bool no_retry) {
     // downstream connection is clean; we can retry with new
     // downstream connection.
 
-    rv = downstream->attach_downstream_connection(
-        handler_->get_downstream_connection(downstream));
+    dconn = handler_->get_downstream_connection(downstream);
+    if (!dconn) {
+      goto fail;
+    }
+
+    rv = downstream->attach_downstream_connection(std::move(dconn));
+    if (rv != 0) {
+      goto fail;
+    }
+
+    rv = downstream->push_request_headers();
     if (rv != 0) {
       goto fail;
     }
@@ -1786,9 +1850,7 @@ int Http2Upstream::prepare_push_promise(Downstream *downstream) {
     if (kv.token != http2::HD_LINK) {
       continue;
     }
-    for (auto &link :
-         http2::parse_link_header(kv.value.c_str(), kv.value.size())) {
-
+    for (auto &link : http2::parse_link_header(kv.value)) {
       StringRef scheme, authority, path;
 
       rv = http2::construct_push_component(balloc, scheme, authority, path,
@@ -1866,7 +1928,8 @@ int Http2Upstream::submit_push_promise(const StringRef &scheme,
   if (LOG_ENABLED(INFO)) {
     std::stringstream ss;
     for (auto &nv : nva) {
-      ss << TTY_HTTP_HD << nv.name << TTY_RST << ": " << nv.value << "\n";
+      ss << TTY_HTTP_HD << StringRef{nv.name, nv.namelen} << TTY_RST << ": "
+         << StringRef{nv.value, nv.valuelen} << "\n";
     }
     ULOG(INFO, this) << "HTTP push request headers. promised_stream_id="
                      << promised_stream_id << "\n" << ss.str();
@@ -1885,7 +1948,8 @@ bool Http2Upstream::push_enabled() const {
 int Http2Upstream::initiate_push(Downstream *downstream, const StringRef &uri) {
   int rv;
 
-  if (uri.empty() || !push_enabled() || (downstream->get_stream_id() % 2)) {
+  if (uri.empty() || !push_enabled() ||
+      (downstream->get_stream_id() % 2) == 0) {
     return 0;
   }
 

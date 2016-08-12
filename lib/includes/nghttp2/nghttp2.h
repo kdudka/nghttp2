@@ -81,7 +81,7 @@ extern "C" {
 /**
  * @macro
  *
- * The seriazlied form of ALPN protocol identifier this library
+ * The serialized form of ALPN protocol identifier this library
  * supports.  Notice that first byte is the length of following
  * protocol identifier.  This is the same wire format of `TLS ALPN
  * extension <https://tools.ietf.org/html/rfc7301>`_.  This is useful
@@ -422,7 +422,7 @@ typedef enum {
 /**
  * @struct
  *
- * The object representing single contagious buffer.
+ * The object representing single contiguous buffer.
  */
 typedef struct {
   /**
@@ -591,7 +591,12 @@ typedef enum {
    * callbacks because the library processes this frame type and its
    * preceding HEADERS/PUSH_PROMISE as a single frame.
    */
-  NGHTTP2_CONTINUATION = 0x09
+  NGHTTP2_CONTINUATION = 0x09,
+  /**
+   * The ALTSVC frame, which is defined in `RFC 7383
+   * <https://tools.ietf.org/html/rfc7838#section-4>`_.
+   */
+  NGHTTP2_ALTSVC = 0x0a
 } nghttp2_frame_type;
 
 /**
@@ -662,6 +667,10 @@ typedef enum {
 
 /**
  * @macro
+ *
+ * .. warning::
+ *
+ *   Deprecated.  The initial max concurrent streams is 0xffffffffu.
  *
  * Default maximum number of incoming concurrent streams.  Use
  * `nghttp2_submit_settings()` with
@@ -1449,9 +1458,19 @@ typedef int (*nghttp2_on_data_chunk_recv_callback)(nghttp2_session *session,
  * `nghttp2_session_server_new()`.
  *
  * The implementation of this function must return 0 if it succeeds.
- * If nonzero is returned, it is treated as fatal error and
- * `nghttp2_session_send()` and `nghttp2_session_mem_send()` functions
- * immediately return :enum:`NGHTTP2_ERR_CALLBACK_FAILURE`.
+ * It can also return :enum:`NGHTTP2_ERR_CANCEL` to cancel the
+ * transmission of the given frame.
+ *
+ * If there is a fatal error while executing this callback, the
+ * implementation should return :enum:`NGHTTP2_ERR_CALLBACK_FAILURE`,
+ * which makes `nghttp2_session_send()` and
+ * `nghttp2_session_mem_send()` functions immediately return
+ * :enum:`NGHTTP2_ERR_CALLBACK_FAILURE`.
+ *
+ * If the other value is returned, it is treated as if
+ * :enum:`NGHTTP2_ERR_CALLBACK_FAILURE` is returned.  But the
+ * implementation should not rely on this since the library may define
+ * new return value to extend its capability.
  *
  * To set this callback to :type:`nghttp2_session_callbacks`, use
  * `nghttp2_session_callbacks_set_before_frame_send_callback()`.
@@ -2376,6 +2395,26 @@ nghttp2_option_set_user_recv_extension_type(nghttp2_option *option,
 /**
  * @function
  *
+ * Sets extension frame type the application is willing to receive
+ * using builtin handler.  The |type| is the extension frame type to
+ * receive, and must be strictly greater than 0x9.  Otherwise, this
+ * function does nothing.  The application can call this function
+ * multiple times to set more than one frame type to receive.  The
+ * application does not have to call this function if it just sends
+ * extension frames.
+ *
+ * If same frame type is passed to both
+ * `nghttp2_option_set_builtin_recv_extension_type()` and
+ * `nghttp2_option_set_user_recv_extension_type()`, the latter takes
+ * precedence.
+ */
+NGHTTP2_EXTERN void
+nghttp2_option_set_builtin_recv_extension_type(nghttp2_option *option,
+                                               uint8_t type);
+
+/**
+ * @function
+ *
  * This option prevents the library from sending PING frame with ACK
  * flag set automatically when PING frame without ACK flag set is
  * received.  If this option is set to nonzero, the library won't send
@@ -2386,6 +2425,21 @@ nghttp2_option_set_user_recv_extension_type(nghttp2_option *option,
  */
 NGHTTP2_EXTERN void nghttp2_option_set_no_auto_ping_ack(nghttp2_option *option,
                                                         int val);
+
+/**
+ * @function
+ *
+ * This option sets the maximum length of header block (a set of
+ * header fields per one HEADERS frame) to send.  The length of a
+ * given set of header fields is calculated using
+ * `nghttp2_hd_deflate_bound()`.  The default value is 64KiB.  If
+ * application attempts to send header fields larger than this limit,
+ * the transmission of the frame fails with error code
+ * :enum:`NGHTTP2_ERR_FRAME_SIZE_ERROR`.
+ */
+NGHTTP2_EXTERN void
+nghttp2_option_set_max_send_header_block_length(nghttp2_option *option,
+                                                size_t val);
 
 /**
  * @function
@@ -2579,14 +2633,20 @@ NGHTTP2_EXTERN void nghttp2_session_del(nghttp2_session *session);
  *
  * 6. :type:`nghttp2_before_frame_send_callback` is invoked.
  *
- * 7. :type:`nghttp2_send_callback` is invoked one or more times to
+ * 7. If :enum:`NGHTTP2_ERR_CANCEL` is returned from
+ *    :type:`nghttp2_before_frame_send_callback`, the current frame
+ *    transmission is canceled, and
+ *    :type:`nghttp2_on_frame_not_send_callback` is invoked.  Abort
+ *    the following steps.
+ *
+ * 8. :type:`nghttp2_send_callback` is invoked one or more times to
  *    send the frame.
  *
- * 8. :type:`nghttp2_on_frame_send_callback` is invoked.
+ * 9. :type:`nghttp2_on_frame_send_callback` is invoked.
  *
- * 9. If the transmission of the frame triggers closure of the stream,
- *    the stream is closed and
- *    :type:`nghttp2_on_stream_close_callback` is invoked.
+ * 10. If the transmission of the frame triggers closure of the
+ *     stream, the stream is closed and
+ *     :type:`nghttp2_on_stream_close_callback` is invoked.
  *
  * This function returns 0 if it succeeds, or one of the following
  * negative error codes:
@@ -3558,8 +3618,8 @@ nghttp2_submit_response(nghttp2_session *session, int32_t stream_id,
  *
  * The |nva| is an array of name/value pair :type:`nghttp2_nv` with
  * |nvlen| elements.  The application is responsible not to include
- * required pseudo-header fields (header field whose name starts with
- * ":") in |nva|.
+ * pseudo-header fields (header field whose name starts with ":") in
+ * |nva|.
  *
  * This function creates copies of all name/value pairs in |nva|.  It
  * also lower-cases all names in |nva|.  The order of elements in
@@ -3574,20 +3634,20 @@ nghttp2_submit_response(nghttp2_session *session, int32_t stream_id,
  * :type:`nghttp2_on_frame_not_send_callback` is called.
  *
  * For server, trailer fields must follow response HEADERS or response
- * DATA with END_STREAM flag set.  The library does not enforce this
- * requirement, and applications should do this for themselves.  If
- * `nghttp2_submit_trailer()` is called before any response HEADERS
+ * DATA without END_STREAM flat set.  The library does not enforce
+ * this requirement, and applications should do this for themselves.
+ * If `nghttp2_submit_trailer()` is called before any response HEADERS
  * submission (usually by `nghttp2_submit_response()`), the content of
  * |nva| will be sent as response headers, which will result in error.
  *
  * This function has the same effect with `nghttp2_submit_headers()`,
- * with flags = :enum:`NGHTTP2_FLAG_END_HEADERS` and both pri_spec and
+ * with flags = :enum:`NGHTTP2_FLAG_END_STREAM` and both pri_spec and
  * stream_user_data to NULL.
  *
  * To submit trailer fields after `nghttp2_submit_response()` is
  * called, the application has to specify
- * :type:`nghttp2_data_provider` to `nghttp2_submit_response()`.  In
- * side :type:`nghttp2_data_source_read_callback`, when setting
+ * :type:`nghttp2_data_provider` to `nghttp2_submit_response()`.
+ * Inside of :type:`nghttp2_data_source_read_callback`, when setting
  * :enum:`NGHTTP2_DATA_FLAG_EOF`, also set
  * :enum:`NGHTTP2_DATA_FLAG_NO_END_STREAM`.  After that, the
  * application can send trailer fields using
@@ -4046,14 +4106,17 @@ nghttp2_session_check_server_session(nghttp2_session *session);
  * that value as window_size_increment is queued.  If the
  * |window_size_increment| is larger than the received bytes from the
  * remote endpoint, the local window size is increased by that
- * difference.
+ * difference.  If the sole purpose is to increase the local window
+ * size, consider to use `nghttp2_session_set_local_window_size()`.
  *
  * If the |window_size_increment| is negative, the local window size
  * is decreased by -|window_size_increment|.  If automatic
  * WINDOW_UPDATE is enabled
  * (`nghttp2_option_set_no_auto_window_update()`), and the library
  * decided that the WINDOW_UPDATE should be submitted, then
- * WINDOW_UPDATE is queued with the current received bytes count.
+ * WINDOW_UPDATE is queued with the current received bytes count.  If
+ * the sole purpose is to decrease the local window size, consider to
+ * use `nghttp2_session_set_local_window_size()`.
  *
  * If the |window_size_increment| is 0, the function does nothing and
  * returns 0.
@@ -4070,6 +4133,44 @@ NGHTTP2_EXTERN int nghttp2_submit_window_update(nghttp2_session *session,
                                                 uint8_t flags,
                                                 int32_t stream_id,
                                                 int32_t window_size_increment);
+
+/**
+ * @function
+ *
+ * Set local window size (local endpoints's window size) to the given
+ * |window_size| for the given stream denoted by |stream_id|.  To
+ * change connection level window size, specify 0 to |stream_id|.  To
+ * increase window size, this function may submit WINDOW_UPDATE frame
+ * to transmission queue.
+ *
+ * The |flags| is currently ignored and should be
+ * :enum:`NGHTTP2_FLAG_NONE`.
+ *
+ * This sounds similar to `nghttp2_submit_window_update()`, but there
+ * are 2 differences.  The first difference is that this function
+ * takes the absolute value of window size to set, rather than the
+ * delta.  To change the window size, this may be easier to use since
+ * the application just declares the intended window size, rather than
+ * calculating delta.  The second difference is that
+ * `nghttp2_submit_window_update()` affects the received bytes count
+ * which has not acked yet.  By the specification of
+ * `nghttp2_submit_window_update()`, to strictly increase the local
+ * window size, we have to submit delta including all received bytes
+ * count, which might not be desirable in some cases.  On the other
+ * hand, this function does not affect the received bytes count.  It
+ * just sets the local window size to the given value.
+ *
+ * This function returns 0 if it succeeds, or one of the following
+ * negative error codes:
+ *
+ * :enum:`NGHTTP2_ERR_INVALID_ARGUMENT`
+ *     The |stream_id| is negative.
+ * :enum:`NGHTTP2_ERR_NOMEM`
+ *     Out of memory.
+ */
+NGHTTP2_EXTERN int
+nghttp2_session_set_local_window_size(nghttp2_session *session, uint8_t flags,
+                                      int32_t stream_id, int32_t window_size);
 
 /**
  * @function
@@ -4112,6 +4213,80 @@ NGHTTP2_EXTERN int nghttp2_submit_window_update(nghttp2_session *session,
 NGHTTP2_EXTERN int nghttp2_submit_extension(nghttp2_session *session,
                                             uint8_t type, uint8_t flags,
                                             int32_t stream_id, void *payload);
+
+/**
+ * @struct
+ *
+ * The payload of ALTSVC frame.  ALTSVC frame is a non-critical
+ * extension to HTTP/2.  If this frame is received, and
+ * `nghttp2_option_set_user_recv_extension_type()` is not set, and
+ * `nghttp2_option_set_builtin_recv_extension_type()` is set for
+ * :enum:`NGHTTP2_ALTSVC`, ``nghttp2_extension.payload`` will point to
+ * this struct.
+ *
+ * It has the following members:
+ */
+typedef struct {
+  /**
+   * The pointer to origin which this alternative service is
+   * associated with.  This is not necessarily NULL-terminated.
+   */
+  uint8_t *origin;
+  /**
+   * The length of the |origin|.
+   */
+  size_t origin_len;
+  /**
+   * The pointer to Alt-Svc field value contained in ALTSVC frame.
+   * This is not necessarily NULL-terminated.
+   */
+  uint8_t *field_value;
+  /**
+   * The length of the |field_value|.
+   */
+  size_t field_value_len;
+} nghttp2_ext_altsvc;
+
+/**
+ * @function
+ *
+ * Submits ALTSVC frame.
+ *
+ * ALTSVC frame is a non-critical extension to HTTP/2, and defined in
+ * is defined in `RFC 7383
+ * <https://tools.ietf.org/html/rfc7838#section-4>`_.
+ *
+ * The |flags| is currently ignored and should be
+ * :enum:`NGHTTP2_FLAG_NONE`.
+ *
+ * The |origin| points to the origin this alternative service is
+ * associated with.  The |origin_len| is the length of the origin.  If
+ * |stream_id| is 0, the origin must be specified.  If |stream_id| is
+ * not zero, the origin must be empty (in other words, |origin_len|
+ * must be 0).
+ *
+ * The ALTSVC frame is only usable from server side.  If this function
+ * is invoked with client side session, this function returns
+ * :enum:`NGHTTP2_ERR_INVALID_STATE`.
+ *
+ * This function returns 0 if it succeeds, or one of the following
+ * negative error codes:
+ *
+ * :enum:`NGHTTP2_ERR_NOMEM`
+ *     Out of memory
+ * :enum:`NGHTTP2_ERR_INVALID_STATE`
+ *     The function is called from client side session
+ * :enum:`NGHTTP2_ERR_INVALID_ARGUMENT`
+ *     The sum of |origin_len| and |field_value_len| is larger than
+ *     16382; or |origin_len| is 0 while |stream_id| is 0; or
+ *     |origin_len| is not 0 while |stream_id| is not 0.
+ */
+NGHTTP2_EXTERN int nghttp2_submit_altsvc(nghttp2_session *session,
+                                         uint8_t flags, int32_t stream_id,
+                                         const uint8_t *origin,
+                                         size_t origin_len,
+                                         const uint8_t *field_value,
+                                         size_t field_value_len);
 
 /**
  * @function
@@ -4454,7 +4629,7 @@ NGHTTP2_EXTERN void nghttp2_hd_inflate_del(nghttp2_hd_inflater *inflater);
  * This function must not be called while header block is being
  * inflated.  In other words, this function must be called after
  * initialization of |inflater|, but before calling
- * `nghttp2_hd_inflate_hd()`, or after
+ * `nghttp2_hd_inflate_hd2()`, or after
  * `nghttp2_hd_inflate_end_headers()`.  Otherwise,
  * `NGHTTP2_ERR_INVALID_STATE` was returned.
  *
@@ -4494,6 +4669,10 @@ typedef enum {
 
 /**
  * @function
+ *
+ * .. warning::
+ *
+ *   Deprecated.  Use `nghttp2_hd_inflate_hd2()` instead.
  *
  * Inflates name/value block stored in |in| with length |inlen|.  This
  * function performs decompression.  For each successful emission of
@@ -4573,6 +4752,92 @@ NGHTTP2_EXTERN ssize_t nghttp2_hd_inflate_hd(nghttp2_hd_inflater *inflater,
                                              nghttp2_nv *nv_out,
                                              int *inflate_flags, uint8_t *in,
                                              size_t inlen, int in_final);
+
+/**
+ * @function
+ *
+ * Inflates name/value block stored in |in| with length |inlen|.  This
+ * function performs decompression.  For each successful emission of
+ * header name/value pair, :enum:`NGHTTP2_HD_INFLATE_EMIT` is set in
+ * |*inflate_flags| and name/value pair is assigned to the |nv_out|
+ * and the function returns.  The caller must not free the members of
+ * |nv_out|.
+ *
+ * The |nv_out| may include pointers to the memory region in the |in|.
+ * The caller must retain the |in| while the |nv_out| is used.
+ *
+ * The application should call this function repeatedly until the
+ * ``(*inflate_flags) & NGHTTP2_HD_INFLATE_FINAL`` is nonzero and
+ * return value is non-negative.  If that happens, all given input
+ * data (|inlen| bytes) are processed successfully.  Then the
+ * application must call `nghttp2_hd_inflate_end_headers()` to prepare
+ * for the next header block input.
+ *
+ * In other words, if |in_final| is nonzero, and this function returns
+ * |inlen|, you can assert that :enum:`NGHTTP2_HD_INFLATE_FINAL` is
+ * set in |*inflate_flags|.
+ *
+ * The caller can feed complete compressed header block.  It also can
+ * feed it in several chunks.  The caller must set |in_final| to
+ * nonzero if the given input is the last block of the compressed
+ * header.
+ *
+ * This function returns the number of bytes processed if it succeeds,
+ * or one of the following negative error codes:
+ *
+ * :enum:`NGHTTP2_ERR_NOMEM`
+ *     Out of memory.
+ * :enum:`NGHTTP2_ERR_HEADER_COMP`
+ *     Inflation process has failed.
+ * :enum:`NGHTTP2_ERR_BUFFER_ERROR`
+ *     The header field name or value is too large.
+ *
+ * Example follows::
+ *
+ *     int inflate_header_block(nghttp2_hd_inflater *hd_inflater,
+ *                              uint8_t *in, size_t inlen, int final)
+ *     {
+ *         ssize_t rv;
+ *
+ *         for(;;) {
+ *             nghttp2_nv nv;
+ *             int inflate_flags = 0;
+ *
+ *             rv = nghttp2_hd_inflate_hd2(hd_inflater, &nv, &inflate_flags,
+ *                                         in, inlen, final);
+ *
+ *             if(rv < 0) {
+ *                 fprintf(stderr, "inflate failed with error code %zd", rv);
+ *                 return -1;
+ *             }
+ *
+ *             in += rv;
+ *             inlen -= rv;
+ *
+ *             if(inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
+ *                 fwrite(nv.name, nv.namelen, 1, stderr);
+ *                 fprintf(stderr, ": ");
+ *                 fwrite(nv.value, nv.valuelen, 1, stderr);
+ *                 fprintf(stderr, "\n");
+ *             }
+ *             if(inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
+ *                 nghttp2_hd_inflate_end_headers(hd_inflater);
+ *                 break;
+ *             }
+ *             if((inflate_flags & NGHTTP2_HD_INFLATE_EMIT) == 0 &&
+ *                inlen == 0) {
+ *                break;
+ *             }
+ *         }
+ *
+ *         return 0;
+ *     }
+ *
+ */
+NGHTTP2_EXTERN ssize_t
+nghttp2_hd_inflate_hd2(nghttp2_hd_inflater *inflater, nghttp2_nv *nv_out,
+                       int *inflate_flags, const uint8_t *in, size_t inlen,
+                       int in_final);
 
 /**
  * @function

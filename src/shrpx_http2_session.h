@@ -56,10 +56,25 @@ struct StreamData {
   Http2DownstreamConnection *dconn;
 };
 
+enum FreelistZone {
+  // Http2Session object is not linked in any freelist.
+  FREELIST_ZONE_NONE,
+  // Http2Session object is linked in group scope
+  // http2_avail_freelist.
+  FREELIST_ZONE_AVAIL,
+  // Http2Session object is linked in address scope
+  // http2_extra_freelist.
+  FREELIST_ZONE_EXTRA,
+  // Http2Session object is about to be deleted, and it does not
+  // belong to any linked list.
+  FREELIST_ZONE_GONE
+};
+
 class Http2Session {
 public:
   Http2Session(struct ev_loop *loop, SSL_CTX *ssl_ctx, Worker *worker,
-               DownstreamAddrGroup *group);
+               const std::shared_ptr<DownstreamAddrGroup> &group,
+               DownstreamAddr *addr);
   ~Http2Session();
 
   // If hard is true, all pending requests are abandoned and
@@ -80,8 +95,6 @@ public:
   int terminate_session(uint32_t error_code);
 
   nghttp2_session *get_session() const;
-
-  bool get_flow_control() const;
 
   int resume_data(Http2DownstreamConnection *dconn);
 
@@ -149,7 +162,7 @@ public:
 
   DownstreamAddr *get_addr() const;
 
-  DownstreamAddrGroup *get_downstream_addr_group() const;
+  const std::shared_ptr<DownstreamAddrGroup> &get_downstream_addr_group() const;
 
   int handle_downstream_push_promise(Downstream *downstream,
                                      int32_t promised_stream_id);
@@ -160,9 +173,18 @@ public:
   // streams.
   size_t get_num_dconns() const;
 
-  // Returns true if this object is included in freelist.  See
-  // DownstreamAddrGroup object.
-  bool in_freelist() const;
+  // Adds to group scope http2_avail_freelist.
+  void add_to_avail_freelist();
+  // Adds to address scope http2_extra_freelist.
+  void add_to_extra_freelist();
+
+  // Removes this object from any freelist.  If this object is not
+  // linked from any freelist, this function does nothing.
+  void remove_from_freelist();
+
+  // Removes this object form any freelist, and marks this object as
+  // not schedulable.
+  void exclude_from_scheduling();
 
   // Returns true if the maximum concurrency is reached.  In other
   // words, the number of currently participated streams in this
@@ -171,6 +193,18 @@ public:
   // number of current concurrent streams when comparing against
   // server initiated concurrency limit.
   bool max_concurrency_reached(size_t extra = 0) const;
+
+  DefaultMemchunks *get_request_buf();
+
+  void on_timeout();
+
+  // This is called periodically using ev_prepare watcher, and if
+  // group_ is retired (backend has been replaced), send GOAWAY to
+  // shutdown the connection.
+  void check_retire();
+
+  void repeat_read_timer();
+  void stop_read_timer();
 
   enum {
     // Disconnected
@@ -211,6 +245,9 @@ private:
   // connection check has started, this timer is started again and
   // traps PING ACK timeout.
   ev_timer connchk_timer_;
+  // timer to initiate connection.  usually, this fires immediately.
+  ev_timer initiate_connection_timer_;
+  ev_prepare prep_;
   DList<Http2DownstreamConnection> dconns_;
   DList<StreamData> streams_;
   std::function<int(Http2Session &)> read_, write_;
@@ -221,13 +258,13 @@ private:
   Worker *worker_;
   // NULL if no TLS is configured
   SSL_CTX *ssl_ctx_;
-  DownstreamAddrGroup *group_;
+  std::shared_ptr<DownstreamAddrGroup> group_;
   // Address of remote endpoint
   DownstreamAddr *addr_;
   nghttp2_session *session_;
   int state_;
   int connection_check_state_;
-  bool flow_control_;
+  int freelist_zone_;
 };
 
 nghttp2_session_callbacks *create_http2_downstream_callbacks();

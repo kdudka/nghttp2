@@ -47,6 +47,7 @@ APIDOCS= \
 	nghttp2_hd_inflate_get_num_table_entries.rst \
 	nghttp2_hd_inflate_get_table_entry.rst \
 	nghttp2_hd_inflate_hd.rst \
+	nghttp2_hd_inflate_hd2.rst \
 	nghttp2_hd_inflate_new.rst \
 	nghttp2_hd_inflate_new2.rst \
 	nghttp2_http2_strerror.rst \
@@ -54,7 +55,9 @@ APIDOCS= \
 	nghttp2_nv_compare_name.rst \
 	nghttp2_option_del.rst \
 	nghttp2_option_new.rst \
+	nghttp2_option_set_builtin_recv_extension_type.rst \
 	nghttp2_option_set_max_reserved_remote_streams.rst \
+	nghttp2_option_set_max_send_header_block_length.rst \
 	nghttp2_option_set_no_auto_ping_ack.rst \
 	nghttp2_option_set_no_auto_window_update.rst \
 	nghttp2_option_set_no_http_messaging.rst \
@@ -125,6 +128,7 @@ APIDOCS= \
 	nghttp2_session_server_new.rst \
 	nghttp2_session_server_new2.rst \
 	nghttp2_session_server_new3.rst \
+	nghttp2_session_set_local_window_size.rst \
 	nghttp2_session_set_next_stream_id.rst \
 	nghttp2_session_set_stream_user_data.rst \
 	nghttp2_session_terminate_session.rst \
@@ -141,6 +145,7 @@ APIDOCS= \
 	nghttp2_stream_get_sum_dependency_weight.rst \
 	nghttp2_stream_get_weight.rst \
 	nghttp2_strerror.rst \
+	nghttp2_submit_altsvc.rst \
 	nghttp2_submit_data.rst \
 	nghttp2_submit_extension.rst \
 	nghttp2_submit_goaway.rst \
@@ -166,6 +171,7 @@ RST_FILES = \
 	h2load.1.rst
 
 EXTRA_DIST = \
+	CMakeLists.txt \
 	mkapiref.py \
 	$(RST_FILES) \
 	$(APIDOCS) \
