@@ -138,7 +138,9 @@ typedef struct {
   nghttp2_buf_chain *cur;
   /* Memory allocator */
   nghttp2_mem *mem;
-  /* The buffer capacity of each buf */
+  /* The buffer capacity of each buf.  This field may be 0 if
+     nghttp2_bufs is initialized by nghttp2_bufs_wrap_init* family
+     functions. */
   size_t chunk_length;
   /* The maximum number of nghttp2_buf_chain */
   size_t max_chunk;
@@ -201,6 +203,9 @@ void nghttp2_bufs_free(nghttp2_bufs *bufs);
  * words, max_chunk = chunk_keep = 1.  To free the resource allocated
  * for |bufs|, use nghttp2_bufs_wrap_free().
  *
+ * Don't use the function which performs allocation, such as
+ * nghttp2_bufs_realloc().
+ *
  * This function returns 0 if it succeeds, or one of the following
  * negative error codes:
  *
@@ -212,10 +217,13 @@ int nghttp2_bufs_wrap_init(nghttp2_bufs *bufs, uint8_t *begin, size_t len,
 
 /*
  * Initializes |bufs| using supplied |veclen| size of buf vector
- * |vec|, assuming that each buffer has length |chunklen|.  The buffer
- * size is fixed and no extra chunk buffer is allocated.  In other
- * words, max_chunk = chunk_keep = |in_len|.  To free the resource
- * allocated for |bufs|, use nghttp2_bufs_wrap_free().
+ * |vec|.  The number of buffers is fixed and no extra chunk buffer is
+ * allocated.  In other words, max_chunk = chunk_keep = |in_len|.  To
+ * free the resource allocated for |bufs|, use
+ * nghttp2_bufs_wrap_free().
+ *
+ * Don't use the function which performs allocation, such as
+ * nghttp2_bufs_realloc().
  *
  * This function returns 0 if it succeeds, or one of the following
  * negative error codes:
@@ -224,7 +232,7 @@ int nghttp2_bufs_wrap_init(nghttp2_bufs *bufs, uint8_t *begin, size_t len,
  *     Out of memory.
  */
 int nghttp2_bufs_wrap_init2(nghttp2_bufs *bufs, const nghttp2_vec *vec,
-                            size_t veclen, size_t chunklen, nghttp2_mem *mem);
+                            size_t veclen, nghttp2_mem *mem);
 
 /*
  * Frees any related resource to the |bufs|.  This function does not
