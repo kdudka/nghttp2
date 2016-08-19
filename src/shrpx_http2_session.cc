@@ -90,7 +90,10 @@ void connchk_timeout_cb(struct ev_loop *loop, ev_timer *w, int revents) {
 namespace {
 void settings_timeout_cb(struct ev_loop *loop, ev_timer *w, int revents) {
   auto http2session = static_cast<Http2Session *>(w->data);
-  SSLOG(INFO, http2session) << "SETTINGS timeout";
+
+  if (LOG_ENABLED(INFO)) {
+    SSLOG(INFO, http2session) << "SETTINGS timeout";
+  }
 
   downstream_failure(http2session->get_addr());
 
@@ -1804,10 +1807,8 @@ int Http2Session::write_noop() { return 0; }
 
 int Http2Session::connected() {
   if (!util::check_socket_connected(conn_.fd)) {
-    if (LOG_ENABLED(INFO)) {
-      SSLOG(INFO, this) << "Backend connect failed; addr="
-                        << util::to_numeric_addr(&addr_->addr);
-    }
+    SSLOG(WARN, this) << "Backend connect failed; addr="
+                      << util::to_numeric_addr(&addr_->addr);
 
     downstream_failure(addr_);
 
@@ -2209,6 +2210,9 @@ void Http2Session::on_timeout() {
     break;
   }
   case CONNECTING: {
+    SSLOG(WARN, this) << "Connect time out; addr="
+                      << util::to_numeric_addr(&addr_->addr);
+
     downstream_failure(addr_);
     break;
   }
