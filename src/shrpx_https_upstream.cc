@@ -76,7 +76,7 @@ int htp_msg_begin(http_parser *htp) {
 
   upstream->attach_downstream(std::move(downstream));
 
-  handler->stop_read_timer();
+  handler->repeat_read_timer();
 
   return 0;
 }
@@ -123,7 +123,6 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
   auto downstream = upstream->get_downstream();
   auto &req = downstream->request();
   auto &httpconf = get_config()->http;
-  auto &balloc = downstream->get_block_allocator();
 
   if (req.fs.buffer_size() + len > httpconf.request_header_field_buffer) {
     if (LOG_ENABLED(INFO)) {
@@ -141,16 +140,14 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
     } else {
       if (req.fs.num_fields() >= httpconf.max_request_header_fields) {
         if (LOG_ENABLED(INFO)) {
-          ULOG(INFO, upstream)
-              << "Too many header field num=" << req.fs.num_fields() + 1;
+          ULOG(INFO, upstream) << "Too many header field num="
+                               << req.fs.num_fields() + 1;
         }
         downstream->set_request_state(
             Downstream::HTTP1_REQUEST_HEADER_TOO_LARGE);
         return -1;
       }
-      auto name = http2::copy_lower(balloc, StringRef{data, len});
-      auto token = http2::lookup_token(name);
-      req.fs.add_header_token(name, StringRef{}, false, token);
+      req.fs.alloc_add_header_name(StringRef{data, len});
     }
   } else {
     // trailer part
@@ -159,14 +156,12 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
     } else {
       if (req.fs.num_fields() >= httpconf.max_request_header_fields) {
         if (LOG_ENABLED(INFO)) {
-          ULOG(INFO, upstream)
-              << "Too many header field num=" << req.fs.num_fields() + 1;
+          ULOG(INFO, upstream) << "Too many header field num="
+                               << req.fs.num_fields() + 1;
         }
         return -1;
       }
-      auto name = http2::copy_lower(balloc, StringRef{data, len});
-      auto token = http2::lookup_token(name);
-      req.fs.add_trailer_token(name, StringRef{}, false, token);
+      req.fs.alloc_add_trailer_name(StringRef{data, len});
     }
   }
   return 0;
@@ -297,6 +292,8 @@ int htp_hdrs_completecb(http_parser *htp) {
 
   req.connection_close = !http_should_keep_alive(htp);
 
+  handler->stop_read_timer();
+
   auto method = req.method;
 
   if (LOG_ENABLED(INFO)) {
@@ -312,10 +309,19 @@ int htp_hdrs_completecb(http_parser *htp) {
     ULOG(INFO, upstream) << "HTTP request headers\n" << ss.str();
   }
 
-  // set content-length if no transfer-encoding is given.  If
-  // transfer-encoding is given, leave req.fs.content_length to -1.
-  if (!req.fs.header(http2::HD_TRANSFER_ENCODING)) {
-    req.fs.content_length = htp->content_length;
+  // set content-length if method is not CONNECT, and no
+  // transfer-encoding is given.  If transfer-encoding is given, leave
+  // req.fs.content_length to -1.
+  if (method != HTTP_CONNECT && !req.fs.header(http2::HD_TRANSFER_ENCODING)) {
+    // http-parser returns (uint64_t)-1 if there is no content-length
+    // header field.  If we don't have both transfer-encoding, and
+    // content-length header field, we assume that there is no request
+    // body.
+    if (htp->content_length == std::numeric_limits<uint64_t>::max()) {
+      req.fs.content_length = 0;
+    } else {
+      req.fs.content_length = htp->content_length;
+    }
   }
 
   auto host = req.fs.header(http2::HD_HOST);
@@ -340,6 +346,7 @@ int htp_hdrs_completecb(http_parser *htp) {
 
   auto faddr = handler->get_upstream_addr();
   auto &balloc = downstream->get_block_allocator();
+  auto config = get_config();
 
   if (method != HTTP_CONNECT) {
     http_parser_url u{};
@@ -350,11 +357,6 @@ int htp_hdrs_completecb(http_parser *htp) {
     }
     // checking UF_HOST could be redundant, but just in case ...
     if (!(u.field_set & (1 << UF_SCHEMA)) || !(u.field_set & (1 << UF_HOST))) {
-      if (get_config()->http2_proxy && !faddr->alt_mode) {
-        // Request URI should be absolute-form for client proxy mode
-        return -1;
-      }
-
       req.no_authority = true;
 
       if (method == HTTP_OPTIONS && req.path == StringRef::from_lit("*")) {
@@ -373,9 +375,8 @@ int htp_hdrs_completecb(http_parser *htp) {
         req.scheme = StringRef::from_lit("http");
       }
     } else {
-      rewrite_request_host_path_from_uri(balloc, req, req.path, u,
-                                         get_config()->http2_proxy &&
-                                             !faddr->alt_mode);
+      rewrite_request_host_path_from_uri(
+          balloc, req, req.path, u, config->http2_proxy && !faddr->alt_mode);
     }
   }
 
@@ -394,6 +395,11 @@ int htp_hdrs_completecb(http_parser *htp) {
 #endif // HAVE_MRUBY
 
   // mruby hook may change method value
+
+  if (req.no_authority && config->http2_proxy && !faddr->alt_mode) {
+    // Request URI should be absolute-form for client proxy mode
+    return -1;
+  }
 
   if (downstream->get_response_state() == Downstream::MSG_COMPLETE) {
     return 0;
@@ -828,6 +834,7 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
   const auto &req = downstream->request();
   auto &resp = downstream->response();
   auto &balloc = downstream->get_block_allocator();
+  auto config = get_config();
 
   auto connection_close = false;
 
@@ -871,11 +878,11 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   if (!resp.fs.header(http2::HD_SERVER)) {
     output->append("Server: ");
-    output->append(get_config()->http.server_name);
+    output->append(config->http.server_name);
     output->append("\r\n");
   }
 
-  auto &httpconf = get_config()->http;
+  auto &httpconf = config->http;
 
   for (auto &p : httpconf.add_response_headers) {
     output->append(p.name);
@@ -926,8 +933,7 @@ void HttpsUpstream::error_reply(unsigned int status_code) {
   output->append("\r\nDate: ");
   auto lgconf = log_config();
   lgconf->update_tstamp(std::chrono::system_clock::now());
-  auto &date = lgconf->time_http_str;
-  output->append(date);
+  output->append(lgconf->time_http);
   output->append("\r\nContent-Type: text/html; "
                  "charset=UTF-8\r\nConnection: close\r\n\r\n");
   output->append(html);
@@ -956,13 +962,14 @@ std::unique_ptr<Downstream> HttpsUpstream::pop_downstream() {
 }
 
 namespace {
-void write_altsvc(DefaultMemchunks *buf, const AltSvc &altsvc) {
-  buf->append(util::percent_encode_token(altsvc.protocol_id));
+void write_altsvc(DefaultMemchunks *buf, BlockAllocator &balloc,
+                  const AltSvc &altsvc) {
+  buf->append(util::percent_encode_token(balloc, altsvc.protocol_id));
   buf->append("=\"");
-  buf->append(util::quote_string(altsvc.host));
-  buf->append(":");
+  buf->append(util::quote_string(balloc, altsvc.host));
+  buf->append(':');
   buf->append(altsvc.service);
-  buf->append("\"");
+  buf->append('"');
 }
 } // namespace
 
@@ -1007,9 +1014,10 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
   buf->append(http2::get_status_string(balloc, resp.http_status));
   buf->append("\r\n");
 
-  auto &httpconf = get_config()->http;
+  auto config = get_config();
+  auto &httpconf = config->http;
 
-  if (!get_config()->http2_proxy && !httpconf.no_location_rewrite) {
+  if (!config->http2_proxy && !httpconf.no_location_rewrite) {
     downstream->rewrite_location_response_header(
         get_client_handler()->get_upstream_scheme());
   }
@@ -1069,16 +1077,16 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
       buf->append("Alt-Svc: ");
 
       auto &altsvcs = httpconf.altsvcs;
-      write_altsvc(buf, altsvcs[0]);
+      write_altsvc(buf, downstream->get_block_allocator(), altsvcs[0]);
       for (size_t i = 1; i < altsvcs.size(); ++i) {
         buf->append(", ");
-        write_altsvc(buf, altsvcs[i]);
+        write_altsvc(buf, downstream->get_block_allocator(), altsvcs[i]);
       }
       buf->append("\r\n");
     }
   }
 
-  if (!get_config()->http2_proxy) {
+  if (!config->http2_proxy && !httpconf.no_server_rewrite) {
     buf->append("Server: ");
     buf->append(httpconf.server_name);
     buf->append("\r\n");
@@ -1202,9 +1210,11 @@ void HttpsUpstream::on_handler_delete() {
   }
 }
 
-int HttpsUpstream::on_downstream_reset(bool no_retry) {
+int HttpsUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   int rv;
   std::unique_ptr<DownstreamConnection> dconn;
+
+  assert(downstream == downstream_.get());
 
   if (!downstream_->request_submission_ready()) {
     // Return error so that caller can delete handler

@@ -135,6 +135,20 @@ OPTIONS = [
     "api-max-request-body",
     "backend-max-backoff",
     "server-name",
+    "no-server-rewrite",
+    "frontend-http2-optimize-write-buffer-size",
+    "frontend-http2-optimize-window-size",
+    "frontend-http2-window-size",
+    "frontend-http2-connection-window-size",
+    "backend-http2-window-size",
+    "backend-http2-connection-window-size",
+    "frontend-http2-encoder-dynamic-table-size",
+    "frontend-http2-decoder-dynamic-table-size",
+    "backend-http2-encoder-dynamic-table-size",
+    "backend-http2-decoder-dynamic-table-size",
+    "ecdh-curves",
+    "tls-sct-dir",
+    "backend-connect-timeout",
 ]
 
 LOGVARS = [

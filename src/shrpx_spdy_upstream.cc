@@ -54,6 +54,28 @@ constexpr size_t MAX_BUFFER_SIZE = 32_k;
 } // namespace
 
 namespace {
+int32_t get_connection_window_size() {
+  return std::max(get_config()->http2.upstream.connection_window_size,
+                  static_cast<int32_t>(64_k));
+}
+} // namespace
+
+namespace {
+int32_t get_window_size() {
+  auto n = get_config()->http2.upstream.window_size;
+
+  // 65535 is the default window size of HTTP/2.  OTOH, the default
+  // window size of SPDY is 65536.  The configuration defaults to
+  // HTTP/2, so if we have 65535, we use 65536 for SPDY.
+  if (n == 65535) {
+    return 64_k;
+  }
+
+  return n;
+}
+} // namespace
+
+namespace {
 ssize_t send_callback(spdylay_session *session, const uint8_t *data, size_t len,
                       int flags, void *user_data) {
   auto upstream = static_cast<SpdyUpstream *>(user_data);
@@ -114,7 +136,7 @@ void on_stream_close_callback(spdylay_session *session, int32_t stream_id,
 
   if (downstream->get_request_state() == Downstream::CONNECT_FAIL) {
     upstream->remove_downstream(downstream);
-    // downstrea was deleted
+    // downstream was deleted
 
     return;
   }
@@ -131,7 +153,7 @@ void on_stream_close_callback(spdylay_session *session, int32_t stream_id,
   // If shrpx_downstream::push_request_headers() failed, the
   // error is handled here.
   upstream->remove_downstream(downstream);
-  // downstrea was deleted
+  // downstream was deleted
 
   // How to test this case? Request sufficient large download
   // and make client send RST_STREAM after it gets first DATA
@@ -143,6 +165,7 @@ namespace {
 void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
                            spdylay_frame *frame, void *user_data) {
   auto upstream = static_cast<SpdyUpstream *>(user_data);
+  auto config = get_config();
 
   switch (type) {
   case SPDYLAY_SYN_STREAM: {
@@ -168,7 +191,8 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
         ss << TTY_HTTP_HD << nv[i] << TTY_RST << ": " << nv[i + 1] << "\n";
       }
       ULOG(INFO, upstream) << "HTTP request headers. stream_id="
-                           << downstream->get_stream_id() << "\n" << ss.str();
+                           << downstream->get_stream_id() << "\n"
+                           << ss.str();
     }
 
     size_t num_headers = 0;
@@ -180,7 +204,7 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
       header_buffer += strlen(nv[i]) + strlen(nv[i + 1]);
     }
 
-    auto &httpconf = get_config()->http;
+    auto &httpconf = config->http;
 
     // spdy does not define usage of trailer fields, and we ignores
     // them.
@@ -271,7 +295,7 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
       auto handler = upstream->get_client_handler();
       auto faddr = handler->get_upstream_addr();
 
-      if (get_config()->http2_proxy && !faddr->alt_mode) {
+      if (config->http2_proxy && !faddr->alt_mode) {
         req.path = path->value;
       } else if (method_token == HTTP_OPTIONS &&
                  path->value == StringRef::from_lit("*")) {
@@ -283,6 +307,8 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
 
     if (!(frame->syn_stream.hd.flags & SPDYLAY_CTRL_FLAG_FIN)) {
       req.http2_expect_body = true;
+    } else if (req.fs.content_length == -1) {
+      req.fs.content_length = 0;
     }
 
     downstream->inspect_http2_request();
@@ -402,33 +428,27 @@ void on_data_chunk_recv_callback(spdylay_session *session, uint8_t flags,
     return;
   }
 
-  auto &http2conf = get_config()->http2;
-
   // If connection-level window control is not enabled (e.g,
   // spdy/3), spdylay_session_get_recv_data_length() is always
   // returns 0.
   if (spdylay_session_get_recv_data_length(session) >
-      std::max(SPDYLAY_INITIAL_WINDOW_SIZE,
-               1 << http2conf.upstream.connection_window_bits)) {
+      std::max(SPDYLAY_INITIAL_WINDOW_SIZE, get_connection_window_size())) {
     if (LOG_ENABLED(INFO)) {
       ULOG(INFO, upstream) << "Flow control error on connection: "
                            << "recv_window_size="
                            << spdylay_session_get_recv_data_length(session)
-                           << ", window_size="
-                           << (1 << http2conf.upstream.connection_window_bits);
+                           << ", window_size=" << get_connection_window_size();
     }
     spdylay_session_fail_session(session, SPDYLAY_GOAWAY_PROTOCOL_ERROR);
     return;
   }
   if (spdylay_session_get_stream_recv_data_length(session, stream_id) >
-      std::max(SPDYLAY_INITIAL_WINDOW_SIZE,
-               1 << http2conf.upstream.window_bits)) {
+      std::max(SPDYLAY_INITIAL_WINDOW_SIZE, get_window_size())) {
     if (LOG_ENABLED(INFO)) {
       ULOG(INFO, upstream) << "Flow control error: recv_window_size="
                            << spdylay_session_get_stream_recv_data_length(
                                   session, stream_id)
-                           << ", initial_window_size="
-                           << (1 << http2conf.upstream.window_bits);
+                           << ", initial_window_size=" << get_window_size();
     }
     upstream->rst_stream(downstream, SPDYLAY_FLOW_CONTROL_ERROR);
     return;
@@ -566,7 +586,8 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
                                   &max_buffer, sizeof(max_buffer));
   assert(rv == 0);
 
-  auto &http2conf = get_config()->http2;
+  auto config = get_config();
+  auto &http2conf = config->http2;
 
   auto faddr = handler_->get_upstream_addr();
 
@@ -574,16 +595,17 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
   // going to be deprecated in the future, and the default stream
   // window is large enough for API request body (64KiB), we don't
   // expand window size depending on the options.
+  int32_t initial_window_size;
   if (version >= SPDYLAY_PROTO_SPDY3 && !faddr->alt_mode) {
     int val = 1;
     flow_control_ = true;
-    initial_window_size_ = 1 << http2conf.upstream.window_bits;
+    initial_window_size = get_window_size();
     rv = spdylay_session_set_option(
         session_, SPDYLAY_OPT_NO_AUTO_WINDOW_UPDATE2, &val, sizeof(val));
     assert(rv == 0);
   } else {
     flow_control_ = false;
-    initial_window_size_ = 0;
+    initial_window_size = 0;
   }
   // TODO Maybe call from outside?
   std::array<spdylay_settings_entry, 2> entry;
@@ -595,7 +617,7 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
   if (flow_control_) {
     ++num_entry;
     entry[1].settings_id = SPDYLAY_SETTINGS_INITIAL_WINDOW_SIZE;
-    entry[1].value = initial_window_size_;
+    entry[1].value = initial_window_size;
     entry[1].flags = SPDYLAY_ID_FLAG_SETTINGS_NONE;
   }
 
@@ -603,16 +625,17 @@ SpdyUpstream::SpdyUpstream(uint16_t version, ClientHandler *handler)
                                entry.data(), num_entry);
   assert(rv == 0);
 
+  auto connection_window_size = get_connection_window_size();
+
   if (flow_control_ && version >= SPDYLAY_PROTO_SPDY3_1 &&
-      http2conf.upstream.connection_window_bits > 16) {
-    int32_t delta = (1 << http2conf.upstream.connection_window_bits) -
-                    SPDYLAY_INITIAL_WINDOW_SIZE;
+      connection_window_size > static_cast<int32_t>(64_k)) {
+    int32_t delta = connection_window_size - SPDYLAY_INITIAL_WINDOW_SIZE;
     rv = spdylay_submit_window_update(session_, 0, delta);
     assert(rv == 0);
   }
 
   handler_->reset_upstream_read_timeout(
-      get_config()->conn.upstream.timeout.http2_read);
+      config->conn.upstream.timeout.http2_read);
 
   handler_->signal_write();
 }
@@ -850,8 +873,8 @@ ssize_t spdy_data_read_callback(spdylay_session *session, int32_t stream_id,
     } else {
       // For tunneling, issue RST_STREAM to finish the stream.
       if (LOG_ENABLED(INFO)) {
-        ULOG(INFO, upstream)
-            << "RST_STREAM to tunneled stream stream_id=" << stream_id;
+        ULOG(INFO, upstream) << "RST_STREAM to tunneled stream stream_id="
+                             << stream_id;
       }
       upstream->rst_stream(
           downstream, infer_upstream_rst_stream_status_code(
@@ -899,7 +922,8 @@ int SpdyUpstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   const auto &headers = resp.fs.headers();
 
-  auto &httpconf = get_config()->http;
+  auto config = get_config();
+  auto &httpconf = config->http;
 
   auto nva = std::vector<const char *>();
   // 6 for :status, :version and server.  1 for last terminal nullptr.
@@ -928,7 +952,7 @@ int SpdyUpstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   if (!resp.fs.header(http2::HD_SERVER)) {
     nva.push_back("server");
-    nva.push_back(get_config()->http.server_name.c_str());
+    nva.push_back(config->http.server_name.c_str());
   }
 
   for (auto &p : httpconf.add_response_headers) {
@@ -977,11 +1001,13 @@ int SpdyUpstream::error_reply(Downstream *downstream,
   auto content_length = util::make_string_ref_uint(balloc, html.size());
   auto status_string = http2::get_status_string(balloc, status_code);
 
-  const char *nv[] = {":status", status_string.c_str(), ":version", "http/1.1",
-                      "content-type", "text/html; charset=UTF-8", "server",
-                      get_config()->http.server_name.c_str(), "content-length",
-                      content_length.c_str(), "date",
-                      lgconf->time_http_str.c_str(), nullptr};
+  const char *nv[] = {":status",        status_string.c_str(),
+                      ":version",       "http/1.1",
+                      "content-type",   "text/html; charset=UTF-8",
+                      "server",         get_config()->http.server_name.c_str(),
+                      "content-length", content_length.c_str(),
+                      "date",           lgconf->time_http.c_str(),
+                      nullptr};
 
   rv = spdylay_submit_response(session_, downstream->get_stream_id(), nv,
                                &data_prd);
@@ -1064,9 +1090,10 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
     DLOG(INFO, downstream) << "HTTP response header completed";
   }
 
-  auto &httpconf = get_config()->http;
+  auto config = get_config();
+  auto &httpconf = config->http;
 
-  if (!get_config()->http2_proxy && !httpconf.no_location_rewrite) {
+  if (!config->http2_proxy && !httpconf.no_location_rewrite) {
     downstream->rewrite_location_response_header(req.scheme);
   }
 
@@ -1100,7 +1127,7 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
     nv[hdidx++] = hd.value.c_str();
   }
 
-  if (!get_config()->http2_proxy) {
+  if (!get_config()->http2_proxy && !httpconf.no_server_rewrite) {
     nv[hdidx++] = "server";
     nv[hdidx++] = httpconf.server_name.c_str();
   } else {
@@ -1142,7 +1169,8 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
       ss << TTY_HTTP_HD << nv[i] << TTY_RST << ": " << nv[i + 1] << "\n";
     }
     ULOG(INFO, this) << "HTTP response headers. stream_id="
-                     << downstream->get_stream_id() << "\n" << ss.str();
+                     << downstream->get_stream_id() << "\n"
+                     << ss.str();
   }
   spdylay_data_provider data_prd;
   data_prd.source.ptr = downstream;
@@ -1269,62 +1297,65 @@ void SpdyUpstream::on_handler_delete() {
   }
 }
 
-int SpdyUpstream::on_downstream_reset(bool no_retry) {
+int SpdyUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   int rv;
 
-  for (auto downstream = downstream_queue_.get_downstreams(); downstream;
-       downstream = downstream->dlnext) {
-    if (downstream->get_dispatch_state() != Downstream::DISPATCH_ACTIVE) {
-      // This is error condition when we failed push_request_headers()
-      // in initiate_downstream().  Otherwise, we have
-      // Downstream::DISPATCH_ACTIVE state, or we did not set
-      // DownstreamConnection.
-      downstream->pop_downstream_connection();
-      continue;
-    }
-
-    if (!downstream->request_submission_ready()) {
-      rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
-      downstream->pop_downstream_connection();
-      continue;
-    }
-
+  if (downstream->get_dispatch_state() != Downstream::DISPATCH_ACTIVE) {
+    // This is error condition when we failed push_request_headers()
+    // in initiate_downstream().  Otherwise, we have
+    // Downstream::DISPATCH_ACTIVE state, or we did not set
+    // DownstreamConnection.
     downstream->pop_downstream_connection();
 
-    downstream->add_retry();
+    handler_->signal_write();
 
-    std::unique_ptr<DownstreamConnection> dconn;
-
-    if (no_retry || downstream->no_more_retry()) {
-      goto fail;
-    }
-
-    // downstream connection is clean; we can retry with new
-    // downstream connection.
-
-    dconn = handler_->get_downstream_connection(downstream);
-    if (!dconn) {
-      goto fail;
-    }
-
-    rv = downstream->attach_downstream_connection(std::move(dconn));
-    if (rv != 0) {
-      goto fail;
-    }
-
-    rv = downstream->push_request_headers();
-    if (rv != 0) {
-      goto fail;
-    }
-
-    continue;
-
-  fail:
-    if (on_downstream_abort_request(downstream, 503) != 0) {
-      return -1;
-    }
-    downstream->pop_downstream_connection();
+    return 0;
   }
+
+  if (!downstream->request_submission_ready()) {
+    rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+    downstream->pop_downstream_connection();
+
+    handler_->signal_write();
+
+    return 0;
+  }
+
+  downstream->pop_downstream_connection();
+
+  downstream->add_retry();
+
+  std::unique_ptr<DownstreamConnection> dconn;
+
+  if (no_retry || downstream->no_more_retry()) {
+    goto fail;
+  }
+
+  // downstream connection is clean; we can retry with new
+  // downstream connection.
+
+  dconn = handler_->get_downstream_connection(downstream);
+  if (!dconn) {
+    goto fail;
+  }
+
+  rv = downstream->attach_downstream_connection(std::move(dconn));
+  if (rv != 0) {
+    goto fail;
+  }
+
+  rv = downstream->push_request_headers();
+  if (rv != 0) {
+    goto fail;
+  }
+
+  return 0;
+
+fail:
+  if (on_downstream_abort_request(downstream, 503) != 0) {
+    rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+  }
+  downstream->pop_downstream_connection();
 
   handler_->signal_write();
 

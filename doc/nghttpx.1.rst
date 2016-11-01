@@ -37,7 +37,7 @@ The options are categorized into several groups.
 Connections
 ~~~~~~~~~~~
 
-.. option:: -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][[;PARAM]...]
+.. option:: -b, --backend=(<HOST>,<PORT>|unix:<PATH>)[;[<PATTERN>[:...]][[;<PARAM>]...]
 
 
     Set  backend  host  and   port.   The  multiple  backend
@@ -70,7 +70,7 @@ Connections
 
     Host  can  include "\*"  in  the  left most  position  to
     indicate  wildcard match  (only suffix  match is  done).
-    The "*" must match at least one character.  For example,
+    The "\*" must match at least one character.  For example,
     host    pattern    "\*.nghttp2.org"    matches    against
     "www.nghttp2.org"  and  "git.ngttp2.org", but  does  not
     match  against  "nghttp2.org".   The exact  hosts  match
@@ -166,7 +166,7 @@ Connections
 
     Default: ``127.0.0.1,80``
 
-.. option:: -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)[[;PARAM]...]
+.. option:: -f, --frontend=(<HOST>,<PORT>|unix:<PATH>)[[;<PARAM>]...]
 
     Set  frontend  host and  port.   If  <HOST> is  '\*',  it
     assumes  all addresses  including  both  IPv4 and  IPv6.
@@ -417,6 +417,13 @@ Timeout
 
     Default: ``30s``
 
+.. option:: --backend-connect-timeout=<DURATION>
+
+    Specify  timeout before  establishing TCP  connection to
+    backend.
+
+    Default: ``30s``
+
 .. option:: --backend-keep-alive-timeout=<DURATION>
 
     Specify keep-alive timeout for backend connection.
@@ -467,6 +474,16 @@ SSL/TLS
     Set allowed  cipher list.  The  format of the  string is
     described in OpenSSL ciphers(1).
 
+.. option:: --ecdh-curves=<LIST>
+
+    Set  supported  curve  list  for  frontend  connections.
+    <LIST> is a  colon separated list of curve  NID or names
+    in the preference order.  The supported curves depend on
+    the  linked  OpenSSL  library.  This  function  requires
+    OpenSSL >= 1.0.2.
+
+    Default: ``P-256:P-384:P-521``
+
 .. option:: -k, --insecure
 
     Don't  verify backend  server's  certificate  if TLS  is
@@ -486,13 +503,22 @@ SSL/TLS
     private key.   If none is  given and the private  key is
     password protected it'll be requested interactively.
 
-.. option:: --subcert=<KEYPATH>:<CERTPATH>
+.. option:: --subcert=<KEYPATH>:<CERTPATH>[[;<PARAM>]...]
 
     Specify  additional certificate  and  private key  file.
     nghttpx will  choose certificates based on  the hostname
     indicated  by  client  using TLS  SNI  extension.   This
     option  can  be  used  multiple  times.   To  make  OCSP
     stapling work, <CERTPATH> must be absolute path.
+
+    Additional parameter  can be specified in  <PARAM>.  The
+    available <PARAM> is "sct-dir=<DIR>".
+
+    "sct-dir=<DIR>"  specifies the  path to  directory which
+    contains        \*.sct        files        for        TLS
+    signed_certificate_timestamp extension (RFC 6962).  This
+    feature   requires   OpenSSL   >=   1.0.2.    See   also
+    :option:`--tls-sct-dir` option.
 
 .. option:: --dh-param-file=<PATH>
 
@@ -709,6 +735,17 @@ SSL/TLS
     See  https://tools.ietf.org/html/rfc7540#appendix-A  for
     the complete HTTP/2 cipher suites black list.
 
+.. option:: --tls-sct-dir=<DIR>
+
+    Specifies the  directory where  \*.sct files  exist.  All
+    \*.sct   files   in  <DIR>   are   read,   and  sent   as
+    extension_data of  TLS signed_certificate_timestamp (RFC
+    6962)  to  client.   These   \*.sct  files  are  for  the
+    certificate   specified   in   positional   command-line
+    argument <CERT>, or  certificate option in configuration
+    file.   For   additional  certificates,   use  :option:`--subcert`
+    option.  This option requires OpenSSL >= 1.0.2.
+
 
 HTTP/2 and SPDY
 ~~~~~~~~~~~~~~~
@@ -729,35 +766,34 @@ HTTP/2 and SPDY
 
     Default: ``100``
 
-.. option:: --frontend-http2-window-bits=<N>
+.. option:: --frontend-http2-window-size=<SIZE>
 
-    Sets the  per-stream initial window size  of HTTP/2 SPDY
-    frontend connection.  For HTTP/2,  the size is 2\*\*<N>-1.
-    For SPDY, the size is 2\*\*<N>.
+    Sets the  per-stream initial  window size of  HTTP/2 and
+    SPDY frontend connection.
 
-    Default: ``16``
+    Default: ``65535``
 
-.. option:: --frontend-http2-connection-window-bits=<N>
+.. option:: --frontend-http2-connection-window-size=<SIZE>
 
     Sets the  per-connection window size of  HTTP/2 and SPDY
-    frontend   connection.    For   HTTP/2,  the   size   is
-    2**<N>-1. For SPDY, the size is 2\*\*<N>.
+    frontend  connection.  For  SPDY  connection, the  value
+    less than 64KiB is rounded up to 64KiB.
 
-    Default: ``16``
+    Default: ``65535``
 
-.. option:: --backend-http2-window-bits=<N>
+.. option:: --backend-http2-window-size=<SIZE>
 
     Sets  the   initial  window   size  of   HTTP/2  backend
-    connection to 2\*\*<N>-1.
+    connection.
 
-    Default: ``16``
+    Default: ``65535``
 
-.. option:: --backend-http2-connection-window-bits=<N>
+.. option:: --backend-http2-connection-window-size=<SIZE>
 
     Sets the  per-connection window  size of  HTTP/2 backend
-    connection to 2\*\*<N>-1.
+    connection.
 
-    Default: ``30``
+    Default: ``2147483647``
 
 .. option:: --http2-no-cookie-crumbling
 
@@ -779,6 +815,65 @@ HTTP/2 and SPDY
     backend session is relayed  to frontend, and server push
     via Link header field  is also supported.  SPDY frontend
     does not support server push.
+
+.. option:: --frontend-http2-optimize-write-buffer-size
+
+    (Experimental) Enable write  buffer size optimization in
+    frontend HTTP/2 TLS  connection.  This optimization aims
+    to reduce  write buffer  size so  that it  only contains
+    bytes  which can  send immediately.   This makes  server
+    more responsive to prioritized HTTP/2 stream because the
+    buffering  of lower  priority stream  is reduced.   This
+    option is only effective on recent Linux platform.
+
+.. option:: --frontend-http2-optimize-window-size
+
+    (Experimental)   Automatically  tune   connection  level
+    window size of frontend  HTTP/2 TLS connection.  If this
+    feature is  enabled, connection window size  starts with
+    the   default  window   size,   65535  bytes.    nghttpx
+    automatically  adjusts connection  window size  based on
+    TCP receiving  window size.  The maximum  window size is
+    capped      by      the     value      specified      by
+    :option:`--frontend-http2-connection-window-size`\.     Since   the
+    stream is subject to stream level window size, it should
+    be adjusted using :option:`--frontend-http2-window-size` option as
+    well.   This option  is only  effective on  recent Linux
+    platform.
+
+.. option:: --frontend-http2-encoder-dynamic-table-size=<SIZE>
+
+    Specify the maximum dynamic  table size of HPACK encoder
+    in the frontend HTTP/2 connection.  The decoder (client)
+    specifies  the maximum  dynamic table  size it  accepts.
+    Then the negotiated dynamic table size is the minimum of
+    this option value and the value which client specified.
+
+    Default: ``4K``
+
+.. option:: --frontend-http2-decoder-dynamic-table-size=<SIZE>
+
+    Specify the maximum dynamic  table size of HPACK decoder
+    in the frontend HTTP/2 connection.
+
+    Default: ``4K``
+
+.. option:: --backend-http2-encoder-dynamic-table-size=<SIZE>
+
+    Specify the maximum dynamic  table size of HPACK encoder
+    in the backend HTTP/2 connection.  The decoder (backend)
+    specifies  the maximum  dynamic table  size it  accepts.
+    Then the negotiated dynamic table size is the minimum of
+    this option value and the value which backend specified.
+
+    Default: ``4K``
+
+.. option:: --backend-http2-decoder-dynamic-table-size=<SIZE>
+
+    Specify the maximum dynamic  table size of HPACK decoder
+    in the backend HTTP/2 connection.
+
+    Default: ``4K``
 
 
 Mode
@@ -1015,9 +1110,21 @@ HTTP
     Set file path  to custom error page  served when nghttpx
     originally  generates  HTTP  error status  code  <CODE>.
     <CODE> must be greater than or equal to 400, and at most
-    599.  If "*"  is used instead of <CODE>,  it matches all
+    599.  If "\*"  is used instead of <CODE>,  it matches all
     HTTP  status  code.  If  error  status  code comes  from
     backend server, the custom error pages are not used.
+
+.. option:: --server-name=<NAME>
+
+    Change server response header field value to <NAME>.
+
+    Default: ``nghttpx nghttp2/1.16.0``
+
+.. option:: --no-server-rewrite
+
+    Don't rewrite server header field in default mode.  When
+    :option:`--http2-proxy` is used, these headers will not be altered
+    regardless of this option.
 
 
 API
@@ -1327,6 +1434,24 @@ from the given file.  In this case, nghttpx does not rotate key
 automatically.  To rotate key, one has to restart nghttpx (see
 SIGNALS).
 
+CERTIFICATE TRANSPARENCY
+------------------------
+
+nghttpx supports TLS ``signed_certificate_timestamp`` extension (`RFC
+6962 <https://tools.ietf.org/html/rfc6962>`_).  The relevant options
+are :option:`--tls-sct-dir` and ``sct-dir`` parameter in
+:option:`--subcert`.  They takes a directory, and nghttpx reads all
+files whose extension is ``.sct`` under the directory.  The ``*.sct``
+files are encoded as ``SignedCertificateTimestamp`` struct described
+in `section 3.2 of RFC 69662
+<https://tools.ietf.org/html/rfc6962#section-3.2>`_.  This format is
+the same one used by `nginx-ct
+<https://github.com/grahamedgecombe/nginx-ct>`_ and `mod_ssl_ct
+<https://httpd.apache.org/docs/trunk/mod/mod_ssl_ct.html>`_.
+`ct-submit <https://github.com/grahamedgecombe/ct-submit>`_ can be
+used to submit certificates to log servers, and obtain the
+``SignedCertificateTimestamp`` struct which can be used with nghttpx.
+
 MRUBY SCRIPTING
 ---------------
 
@@ -1408,6 +1533,10 @@ respectively.
     .. rb:attr_reader:: tls_used
 
         Return true if TLS is used on the connection.
+
+    .. rb:attr_reader:: tls_sni
+
+        Return the TLS SNI value which client sent in this connection.
 
 .. rb:class:: Request
 

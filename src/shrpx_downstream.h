@@ -86,6 +86,11 @@ public:
   void add_header_token(const StringRef &name, const StringRef &value,
                         bool no_index, int32_t token);
 
+  // Adds header field name |name|.  First, the copy of header field
+  // name pointed by name.c_str() of length name.size() is made, and
+  // stored.
+  void alloc_add_header_name(const StringRef &name);
+
   void append_last_header_key(const char *data, size_t len);
   void append_last_header_value(const char *data, size_t len);
 
@@ -100,6 +105,11 @@ public:
 
   void add_trailer_token(const StringRef &name, const StringRef &value,
                          bool no_index, int32_t token);
+
+  // Adds trailer field name |name|.  First, the copy of trailer field
+  // name pointed by name.c_str() of length name.size() is made, and
+  // stored.
+  void alloc_add_trailer_name(const StringRef &name);
 
   void append_last_trailer_key(const char *data, size_t len);
   void append_last_trailer_value(const char *data, size_t len);
@@ -302,7 +312,11 @@ public:
   DefaultMemchunks *get_request_buf();
   void set_request_pending(bool f);
   bool get_request_pending() const;
+  void set_request_header_sent(bool f);
   // Returns true if request is ready to be submitted to downstream.
+  // When sending pending request, get_request_pending() should be
+  // checked too because this function may return true when
+  // get_request_pending() returns false.
   bool request_submission_ready() const;
 
   // downstream response API
@@ -471,6 +485,8 @@ private:
   // has not been established or should be checked before use;
   // currently used only with HTTP/2 connection.
   bool request_pending_;
+  // true if downstream request header is considered to be sent.
+  bool request_header_sent_;
 };
 
 } // namespace shrpx
