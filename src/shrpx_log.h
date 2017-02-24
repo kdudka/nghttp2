@@ -34,6 +34,7 @@
 #include <vector>
 #include <chrono>
 
+#include "shrpx_config.h"
 #include "shrpx_log_config.h"
 #include "ssl.h"
 #include "template.h"
@@ -145,18 +146,10 @@ struct LogFragment {
 
 struct LogSpec {
   Downstream *downstream;
-  const DownstreamAddr *downstream_addr;
   StringRef remote_addr;
-  StringRef method;
-  StringRef path;
   StringRef alpn;
   const nghttp2::ssl::TLSSessionInfo *tls_info;
-  std::chrono::system_clock::time_point time_now;
-  std::chrono::high_resolution_clock::time_point request_start_time;
   std::chrono::high_resolution_clock::time_point request_end_time;
-  int major, minor;
-  unsigned int status;
-  int64_t body_bytes_sent;
   StringRef remote_port;
   uint16_t server_port;
   pid_t pid;
@@ -165,13 +158,31 @@ struct LogSpec {
 void upstream_accesslog(const std::vector<LogFragment> &lf,
                         const LogSpec &lgsp);
 
-int reopen_log_files();
+int reopen_log_files(const LoggingConfig &loggingconf);
 
 // Logs message when process whose pid is |pid| and exist status is
 // |rstatus| exited.  The |msg| is prepended to the log message.
 void log_chld(pid_t pid, int rstatus, const char *msg);
 
-void redirect_stderr_to_errorlog();
+void redirect_stderr_to_errorlog(const LoggingConfig &loggingconf);
+
+// Makes internal copy of stderr (and possibly stdout in the future),
+// which is then used as pointer to /dev/stderr or /proc/self/fd/2
+void store_original_fds();
+
+// Restores the original stderr that was stored with copy_original_fds
+// Used just before execv
+void restore_original_fds();
+
+// Closes |fd| which was returned by open_log_file (see below)
+// and sets it to -1. In the case that |fd| points to stdout or
+// stderr, or is -1, the descriptor is not closed (but still set to -1).
+void close_log_file(int &fd);
+
+// Opens |path| with O_APPEND enabled.  If file does not exist, it is
+// created first.  This function returns file descriptor referring the
+// opened file if it succeeds, or -1.
+int open_log_file(const char *path);
 
 } // namespace shrpx
 

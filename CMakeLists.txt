@@ -24,12 +24,12 @@
 
 cmake_minimum_required(VERSION 3.0)
 # XXX using 1.8.90 instead of 1.9.0-DEV
-project(nghttp2 VERSION 1.17.90)
+project(nghttp2 VERSION 1.19.90)
 
 # See versioning rule:
 #  http://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
 set(LT_CURRENT  26)
-set(LT_REVISION 2)
+set(LT_REVISION 4)
 set(LT_AGE      12)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -313,7 +313,6 @@ include(CheckFunctionExists)
 check_function_exists(_Exit     HAVE__EXIT)
 check_function_exists(accept4   HAVE_ACCEPT4)
 
-# timerfd_create was added in linux kernel 2.6.25
 include(CheckSymbolExists)
 # XXX does this correctly detect initgroups (un)availability on cygwin?
 check_symbol_exists(initgroups grp.h HAVE_DECL_INITGROUPS)
@@ -323,13 +322,6 @@ if(NOT HAVE_DECL_INITGROUPS AND HAVE_UNISTD_H)
   if(HAVE_DECL_INITGROUPS2)
     set(HAVE_DECL_INITGROUPS 1)
   endif()
-endif()
-
-check_function_exists(timerfd_create HAVE_TIMERFD_CREATE)
-# Checks for epoll availability, primarily for examples/tiny-nghttpd
-check_symbol_exists(epoll_create sys/epoll.h HAVE_EPOLL)
-if(HAVE_EPOLL AND HAVE_TIMERFD_CREATE)
-  set(ENABLE_TINY_NGHTTPD 1)
 endif()
 
 set(WARNCFLAGS)

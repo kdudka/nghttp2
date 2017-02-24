@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "NGHTTPX" "1" "Dec 11, 2016" "1.18.0-DEV" "nghttp2"
+.TH "NGHTTPX" "1" "Feb 20, 2017" "1.20.0-DEV" "nghttp2"
 .SH NAME
 nghttpx \- HTTP/2 proxy
 .
@@ -121,12 +121,12 @@ Several parameters <PARAM> are accepted after <PATTERN>.
 The  parameters are  delimited  by  ";".  The  available
 parameters       are:      "proto=<PROTO>",       "tls",
 "sni=<SNI_HOST>",         "fall=<N>",        "rise=<N>",
-"affinity=<METHOD>", and "dns".   The parameter consists
-of keyword,  and optionally  followed by "="  and value.
-For example,  the parameter  "proto=h2" consists  of the
-keyword  "proto" and  value "h2".   The parameter  "tls"
-consists  of  the  keyword "tls"  without  value.   Each
-parameter is described as follows.
+"affinity=<METHOD>",  "dns", and  "redirect\-if\-not\-tls".
+The  parameter  consists   of  keyword,  and  optionally
+followed by  "=" and value.  For  example, the parameter
+"proto=h2"  consists of  the keyword  "proto" and  value
+"h2".  The parameter "tls" consists of the keyword "tls"
+without value.  Each parameter is described as follows.
 .sp
 The backend application protocol  can be specified using
 optional  "proto"   parameter,  and   in  the   form  of
@@ -183,6 +183,19 @@ frequently.   If  "dns"  is given,  name  resolution  of
 backend   host   name   at  start   up,   or   reloading
 configuration is skipped.
 .sp
+If "redirect\-if\-not\-tls" parameter  is used, the matched
+backend  requires   that  frontend  connection   is  TLS
+encrypted.  If it isn\(aqt, nghttpx responds to the request
+with 308  status code, and  https URI the  client should
+use instead  is included in Location  header field.  The
+port number in  redirect URI is 443 by  default, and can
+be  changed using  \fI\%\-\-redirect\-https\-port\fP option.   If at
+least one  backend has  "redirect\-if\-not\-tls" parameter,
+this feature is enabled  for all backend servers sharing
+the   same   <PATTERN>.    It    is   advised   to   set
+"redirect\-if\-no\-tls"    parameter   to    all   backends
+explicitly if this feature is desired.
+.sp
 Since ";" and ":" are  used as delimiter, <PATTERN> must
 not  contain these  characters.  Since  ";" has  special
 meaning in shell, the option value must be quoted.
@@ -218,6 +231,10 @@ specify  "healthmon"  parameter.   This is  disabled  by
 default.  Any  requests which come through  this address
 are replied with 200 HTTP status, without no body.
 .sp
+To  accept   PROXY  protocol   version  1   on  frontend
+connection,  specify  "proxyproto" parameter.   This  is
+disabled by default.
+.sp
 Default: \fB*,3000\fP
 .UNINDENT
 .INDENT 0.0
@@ -225,7 +242,7 @@ Default: \fB*,3000\fP
 .B \-\-backlog=<N>
 Set listen backlog size.
 .sp
-Default: \fB512\fP
+Default: \fB65536\fP
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -252,11 +269,6 @@ handshake with  the downstream through the  tunnel.  The
 timeouts when connecting and  making CONNECT request can
 be     specified    by     \fI\%\-\-backend\-read\-timeout\fP    and
 \fI\%\-\-backend\-write\-timeout\fP options.
-.UNINDENT
-.INDENT 0.0
-.TP
-.B \-\-accept\-proxy\-protocol
-Accept PROXY protocol version 1 on frontend connection.
 .UNINDENT
 .SS Performance
 .INDENT 0.0
@@ -434,6 +446,14 @@ Default: \fB30s\fP
 .UNINDENT
 .INDENT 0.0
 .TP
+.B \-\-frontend\-keep\-alive\-timeout=<DURATION>
+Specify   keep\-alive   timeout   for   frontend   HTTP/1
+connection.
+.sp
+Default: \fB1m\fP
+.UNINDENT
+.INDENT 0.0
+.TP
 .B \-\-stream\-read\-timeout=<DURATION>
 Specify  read timeout  for HTTP/2  and SPDY  streams.  0
 means no timeout.
@@ -473,7 +493,8 @@ Default: \fB30s\fP
 .INDENT 0.0
 .TP
 .B \-\-backend\-keep\-alive\-timeout=<DURATION>
-Specify keep\-alive timeout for backend connection.
+Specify   keep\-alive   timeout    for   backend   HTTP/1
+connection.
 .sp
 Default: \fB2s\fP
 .UNINDENT
@@ -520,8 +541,18 @@ Default: \fB2m\fP
 .INDENT 0.0
 .TP
 .B \-\-ciphers=<SUITE>
-Set allowed  cipher list.  The  format of the  string is
-described in OpenSSL ciphers(1).
+Set allowed  cipher list  for frontend  connection.  The
+format of the string is described in OpenSSL ciphers(1).
+.sp
+Default: \fBECDHE\-ECDSA\-CHACHA20\-POLY1305:ECDHE\-RSA\-CHACHA20\-POLY1305:ECDHE\-ECDSA\-AES128\-GCM\-SHA256:ECDHE\-RSA\-AES128\-GCM\-SHA256:ECDHE\-ECDSA\-AES256\-GCM\-SHA384:ECDHE\-RSA\-AES256\-GCM\-SHA384:DHE\-RSA\-AES128\-GCM\-SHA256:DHE\-RSA\-AES256\-GCM\-SHA384:ECDHE\-ECDSA\-AES128\-SHA256:ECDHE\-RSA\-AES128\-SHA256:ECDHE\-ECDSA\-AES128\-SHA:ECDHE\-RSA\-AES256\-SHA384:ECDHE\-RSA\-AES128\-SHA:ECDHE\-ECDSA\-AES256\-SHA384:ECDHE\-ECDSA\-AES256\-SHA:ECDHE\-RSA\-AES256\-SHA:DHE\-RSA\-AES128\-SHA256:DHE\-RSA\-AES128\-SHA:DHE\-RSA\-AES256\-SHA256:DHE\-RSA\-AES256\-SHA:ECDHE\-ECDSA\-DES\-CBC3\-SHA:ECDHE\-RSA\-DES\-CBC3\-SHA:EDH\-RSA\-DES\-CBC3\-SHA:AES128\-GCM\-SHA256:AES256\-GCM\-SHA384:AES128\-SHA256:AES256\-SHA256:AES128\-SHA:AES256\-SHA:DES\-CBC3\-SHA:!DSS\fP
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-client\-ciphers=<SUITE>
+Set  allowed cipher  list for  backend connection.   The
+format of the string is described in OpenSSL ciphers(1).
+.sp
+Default: \fBECDHE\-ECDSA\-CHACHA20\-POLY1305:ECDHE\-RSA\-CHACHA20\-POLY1305:ECDHE\-ECDSA\-AES128\-GCM\-SHA256:ECDHE\-RSA\-AES128\-GCM\-SHA256:ECDHE\-ECDSA\-AES256\-GCM\-SHA384:ECDHE\-RSA\-AES256\-GCM\-SHA384:DHE\-RSA\-AES128\-GCM\-SHA256:DHE\-RSA\-AES256\-GCM\-SHA384:ECDHE\-ECDSA\-AES128\-SHA256:ECDHE\-RSA\-AES128\-SHA256:ECDHE\-ECDSA\-AES128\-SHA:ECDHE\-RSA\-AES256\-SHA384:ECDHE\-RSA\-AES128\-SHA:ECDHE\-ECDSA\-AES256\-SHA384:ECDHE\-ECDSA\-AES256\-SHA:ECDHE\-RSA\-AES256\-SHA:DHE\-RSA\-AES128\-SHA256:DHE\-RSA\-AES128\-SHA:DHE\-RSA\-AES256\-SHA256:DHE\-RSA\-AES256\-SHA:ECDHE\-ECDSA\-DES\-CBC3\-SHA:ECDHE\-RSA\-DES\-CBC3\-SHA:EDH\-RSA\-DES\-CBC3\-SHA:AES128\-GCM\-SHA256:AES256\-GCM\-SHA384:AES128\-SHA256:AES256\-SHA256:AES128\-SHA:AES256\-SHA:DES\-CBC3\-SHA:!DSS\fP
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -561,9 +592,14 @@ password protected it\(aqll be requested interactively.
 .B \-\-subcert=<KEYPATH>:<CERTPATH>[[;<PARAM>]...]
 Specify  additional certificate  and  private key  file.
 nghttpx will  choose certificates based on  the hostname
-indicated  by  client  using TLS  SNI  extension.   This
-option  can  be  used  multiple  times.   To  make  OCSP
-stapling work, <CERTPATH> must be absolute path.
+indicated by client using TLS SNI extension.  If nghttpx
+is  built with  OpenSSL >=  1.0.2, signature  algorithms
+(e.g., ECDSA+SHA256, RSA+SHA256) presented by client are
+also taken  into consideration.  This allows  nghttpx to
+send ECDSA certificate to  modern clients, while sending
+RSA based certificate to older clients.  This option can
+be  used multiple  times.  To  make OCSP  stapling work,
+<CERTPATH> must be absolute path.
 .sp
 Additional parameter  can be specified in  <PARAM>.  The
 available <PARAM> is "sct\-dir=<DIR>".
@@ -619,18 +655,29 @@ backend client authentication.
 .UNINDENT
 .INDENT 0.0
 .TP
-.B \-\-tls\-proto\-list=<LIST>
-Comma delimited list of  SSL/TLS protocol to be enabled.
-The following protocols  are available: TLSv1.2, TLSv1.1
-and   TLSv1.0.    The   name   matching   is   done   in
-case\-insensitive   manner.    The  parameter   must   be
-delimited by  a single comma  only and any  white spaces
-are  treated  as a  part  of  protocol string.   If  the
-protocol list advertised by client does not overlap this
-list,  you  will  receive  the  error  message  "unknown
-protocol".
+.B \-\-tls\-min\-proto\-version=<VER>
+Specify minimum SSL/TLS protocol.   The name matching is
+done in  case\-insensitive manner.  The  versions between
+\fI\%\-\-tls\-min\-proto\-version\fP and  \fI\%\-\-tls\-max\-proto\-version\fP are
+enabled.  If the protocol list advertised by client does
+not  overlap  this range,  you  will  receive the  error
+message "unknown protocol".  The available versions are:
+TLSv1.2, TLSv1.1, and TLSv1.0
 .sp
-Default: \fBTLSv1.2,TLSv1.1\fP
+Default: \fBTLSv1.1\fP
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-tls\-max\-proto\-version=<VER>
+Specify maximum SSL/TLS protocol.   The name matching is
+done in  case\-insensitive manner.  The  versions between
+\fI\%\-\-tls\-min\-proto\-version\fP and  \fI\%\-\-tls\-max\-proto\-version\fP are
+enabled.  If the protocol list advertised by client does
+not  overlap  this range,  you  will  receive the  error
+message "unknown protocol".  The available versions are:
+TLSv1.2, TLSv1.1, and TLSv1.0
+.sp
+Default: \fBTLSv1.2\fP
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -811,9 +858,18 @@ Default: \fB1s\fP
 .INDENT 0.0
 .TP
 .B \-\-no\-http2\-cipher\-black\-list
-Allow black  listed cipher  suite on  HTTP/2 connection.
-See  \fI\%https://tools.ietf.org/html/rfc7540#appendix\-A\fP  for
-the complete HTTP/2 cipher suites black list.
+Allow  black  listed  cipher suite  on  frontend  HTTP/2
+connection.                                          See
+\fI\%https://tools.ietf.org/html/rfc7540#appendix\-A\fP  for  the
+complete HTTP/2 cipher suites black list.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-client\-no\-http2\-cipher\-black\-list
+Allow  black  listed  cipher  suite  on  backend  HTTP/2
+connection.                                          See
+\fI\%https://tools.ietf.org/html/rfc7540#appendix\-A\fP  for  the
+complete HTTP/2 cipher suites black list.
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -826,6 +882,39 @@ certificate   specified   in   positional   command\-line
 argument <CERT>, or  certificate option in configuration
 file.   For   additional  certificates,   use  \fI\%\-\-subcert\fP
 option.  This option requires OpenSSL >= 1.0.2.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-psk\-secrets=<PATH>
+Read list of PSK identity and secrets from <PATH>.  This
+is used for frontend connection.  The each line of input
+file  is  formatted  as  <identity>:<hex\-secret>,  where
+<identity> is  PSK identity, and <hex\-secret>  is secret
+in hex.  An  empty line, and line which  starts with \(aq#\(aq
+are skipped.  The default  enabled cipher list might not
+contain any PSK cipher suite.  In that case, desired PSK
+cipher suites  must be  enabled using  \fI\%\-\-ciphers\fP option.
+The  desired PSK  cipher suite  may be  black listed  by
+HTTP/2.   To  use  those   cipher  suites  with  HTTP/2,
+consider  to  use  \fI\%\-\-no\-http2\-cipher\-black\-list\fP  option.
+But be aware its implications.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-client\-psk\-secrets=<PATH>
+Read PSK identity and secrets from <PATH>.  This is used
+for backend connection.  The each  line of input file is
+formatted  as <identity>:<hex\-secret>,  where <identity>
+is PSK identity, and <hex\-secret>  is secret in hex.  An
+empty line, and line which  starts with \(aq#\(aq are skipped.
+The first identity and  secret pair encountered is used.
+The default  enabled cipher  list might not  contain any
+PSK  cipher suite.   In  that case,  desired PSK  cipher
+suites  must be  enabled using  \fI\%\-\-client\-ciphers\fP option.
+The  desired PSK  cipher suite  may be  black listed  by
+HTTP/2.   To  use  those   cipher  suites  with  HTTP/2,
+consider   to  use   \fI\%\-\-client\-no\-http2\-cipher\-black\-list\fP
+option.  But be aware its implications.
 .UNINDENT
 .SS HTTP/2 and SPDY
 .INDENT 0.0
@@ -1065,6 +1154,13 @@ Default: \fB$remote_addr \- \- [$time_local] "$request" $status $body_bytes_sent
 .UNINDENT
 .INDENT 0.0
 .TP
+.B \-\-accesslog\-write\-early
+Write  access  log  when   response  header  fields  are
+received   from  backend   rather   than  when   request
+transaction finishes.
+.UNINDENT
+.INDENT 0.0
+.TP
 .B \-\-errorlog\-file=<PATH>
 Set path to write error  log.  To reopen file, send USR1
 signal  to nghttpx.   stderr will  be redirected  to the
@@ -1246,7 +1342,7 @@ backend server, the custom error pages are not used.
 .B \-\-server\-name=<NAME>
 Change server response header field value to <NAME>.
 .sp
-Default: \fBnghttpx nghttp2/1.18.0\-DEV\fP
+Default: \fBnghttpx nghttp2/1.20.0\-DEV\fP
 .UNINDENT
 .INDENT 0.0
 .TP
@@ -1254,6 +1350,15 @@ Default: \fBnghttpx nghttp2/1.18.0\-DEV\fP
 Don\(aqt rewrite server header field in default mode.  When
 \fI\%\-\-http2\-proxy\fP is used, these headers will not be altered
 regardless of this option.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-redirect\-https\-port=<PORT>
+Specify the port number which appears in Location header
+field  when  redirect  to  HTTPS  URI  is  made  due  to
+"redirect\-if\-not\-tls" parameter in \fI\%\-\-backend\fP option.
+.sp
+Default: \fB443\fP
 .UNINDENT
 .SS API
 .INDENT 0.0
@@ -1428,6 +1533,35 @@ positional arguments in command\-line, use \fBprivate\-key\-file\fP and
 .sp
 \fI\%\-\-conf\fP option cannot be used in the configuration file and
 will be ignored if specified.
+.TP
+.B Error log
+Error log is written to stderr by default.  It can be configured
+using \fI\%\-\-errorlog\-file\fP\&.  The format of log message is as
+follows:
+.sp
+<datetime> <master\-pid> <current\-pid> <thread\-id> <level> (<filename>:<line>) <msg>
+.INDENT 7.0
+.TP
+.B <datetime>
+It is a conbination of date and time when the log is written.  It
+is in ISO 8601 format.
+.TP
+.B <master\-pid>
+It is a master process ID.
+.TP
+.B <current\-pid>
+It is a process ID which writes this log.
+.TP
+.B <thread\-id>
+It is a thread ID which writes this log.  It would be unique
+within <current\-pid>.
+.TP
+.B <filename> and <line>
+They are source file name, and line number which produce this log.
+.TP
+.B <msg>
+It is a log message body.
+.UNINDENT
 .UNINDENT
 .SH SIGNALS
 .INDENT 0.0
@@ -1442,16 +1576,23 @@ Reload configuration file given in \fI\%\-\-conf\fP\&.
 .TP
 .B SIGUSR1
 Reopen log files.
-.TP
-.B SIGUSR2
+.UNINDENT
+.sp
+SIGUSR2
+.INDENT 0.0
+.INDENT 3.5
 Fork and execute nghttpx.  It will execute the binary in the same
-path with same command\-line arguments and environment variables.
-After new process comes up, sending SIGQUIT to the original process
-to perform hot swapping.  The difference between SIGUSR2 + SIGQUIT
-and SIGHUP is that former is usually used to execute new binary, and
-the master process is newly spawned.  On the other hand, the latter
-just reloads configuration file, and the same master process
-continues to exist.
+path with same command\-line arguments and environment variables.  As
+of nghttpx version 1.20.0, the new master process sends SIGQUIT to
+the original master process when it is ready to serve requests.  For
+the earlier versions of nghttpx, user has to send SIGQUIT to the
+original master process.
+.sp
+The difference between SIGUSR2 (+ SIGQUIT) and SIGHUP is that former
+is usually used to execute new binary, and the master process is
+newly spawned.  On the other hand, the latter just reloads
+configuration file, and the same master process continues to exist.
+.UNINDENT
 .UNINDENT
 .sp
 \fBNOTE:\fP
@@ -1872,6 +2013,19 @@ completely custom header fields, first call
 existing header fields, and then add required header fields.
 It is an error to call this method twice for a given request.
 .UNINDENT
+.INDENT 7.0
+.TP
+.B send_info(status, headers)
+Send non\-final (informational) response to a client.  \fIstatus\fP
+must be in the range [100, 199], inclusive.  \fIheaders\fP is a
+hash containing response header fields.  Its key must be a
+string, and the associated value must be either string or
+array of strings.  Since this is not a final response, even if
+this method is invoked, request is still forwarded to a
+backend unless \fI\%Nghttpx::Response#return\fP is called.
+This method can be called multiple times.  It cannot be called
+after \fI\%Nghttpx::Response#return\fP is called.
+.UNINDENT
 .UNINDENT
 .SS MRUBY EXAMPLES
 .sp
@@ -1947,15 +2101,18 @@ The request was failed.  No change has been made.
 HTTP status code
 .UNINDENT
 .sp
+Additionally, depending on the API endpoint, \fBdata\fP key may be
+present, and its value contains the API endpoint specific data.
+.sp
 We wrote "normally", since nghttpx may return ordinal HTML response in
 some cases where the error has occurred before reaching API endpoint
 (e.g., header field is too large).
 .sp
 The following section describes available API endpoints.
-.SS PUT /api/v1beta1/backendconfig
+.SS POST /api/v1beta1/backendconfig
 .sp
 This API replaces the current backend server settings with the
-requested ones.  The request method should be PUT, but POST is also
+requested ones.  The request method should be POST, but PUT is also
 acceptable.  The request body must be nghttpx configuration file
 format.  For configuration file format, see \fI\%FILES\fP section.  The
 line separator inside the request body must be single LF (0x0A).
@@ -1974,6 +2131,22 @@ The one limitation is that only numeric IP address is allowd in
 \fI\%backend\fP in request body unless "dns" parameter
 is used while non numeric hostname is allowed in command\-line or
 configuration file is read using \fI\%\-\-conf\fP\&.
+.SS GET /api/v1beta1/configrevision
+.sp
+This API returns configuration revision of the current nghttpx.  The
+configuration revision is opaque string, and it changes after each
+reloading by SIGHUP.  With this API, an external application knows
+that whether nghttpx has finished reloading its configuration by
+comparing the configuration revisions between before and after
+reloading.
+.sp
+This API returns response including \fBdata\fP key.  Its value is JSON
+object, and it contains at least the following key:
+.INDENT 0.0
+.TP
+.B configRevision
+The configuration revision of the current nghttpx
+.UNINDENT
 .SH SEE ALSO
 .sp
 \fBnghttp(1)\fP, \fBnghttpd(1)\fP, \fBh2load(1)\fP

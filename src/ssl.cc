@@ -38,22 +38,6 @@ namespace nghttp2 {
 
 namespace ssl {
 
-// Recommended general purpose "Intermediate compatibility" cipher
-// suites by mozilla.
-//
-// https://wiki.mozilla.org/Security/Server_Side_TLS
-const char *const DEFAULT_CIPHER_LIST =
-    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-"
-    "AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-"
-    "SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-"
-    "AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-"
-    "ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-"
-    "AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-"
-    "SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-"
-    "ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-"
-    "SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-"
-    "SHA:DES-CBC3-SHA:!DSS";
-
 #if OPENSSL_1_1_API
 
 // CRYPTO_LOCK is deprecated as of OpenSSL 1.1.0
@@ -99,6 +83,10 @@ const char *get_tls_protocol(SSL *ssl) {
     return "SSLv2";
   case SSL3_VERSION:
     return "SSLv3";
+#ifdef TLS1_3_VERSION
+  case TLS1_3_VERSION:
+    return "TLSv1.3";
+#endif // TLS1_3_VERSION
   case TLS1_2_VERSION:
     return "TLSv1.2";
   case TLS1_1_VERSION:
@@ -156,7 +144,7 @@ bool check_http2_cipher_black_list(SSL *ssl) {
 bool check_http2_tls_version(SSL *ssl) {
   auto tls_ver = SSL_version(ssl);
 
-  return tls_ver == TLS1_2_VERSION;
+  return tls_ver >= TLS1_2_VERSION;
 }
 
 bool check_http2_requirement(SSL *ssl) {
@@ -173,6 +161,45 @@ void libssl_init() {
   SSL_load_error_strings();
   SSL_library_init();
   OpenSSL_add_all_algorithms();
+}
+
+int ssl_ctx_set_proto_versions(SSL_CTX *ssl_ctx, int min, int max) {
+#if OPENSSL_1_1_API
+  if (SSL_CTX_set_min_proto_version(ssl_ctx, min) != 1 ||
+      SSL_CTX_set_max_proto_version(ssl_ctx, max) != 1) {
+    return -1;
+  }
+  return 0;
+#elif defined(OPENSSL_IS_BORINGSSL)
+  SSL_CTX_set_min_version(ssl_ctx, min);
+  SSL_CTX_set_max_version(ssl_ctx, max);
+  return 0;
+#else  // !defined(OPENSSL_IS_BORINGSSL)
+  long int opts = 0;
+
+  // TODO We depends on the ordering of protocol version macro in
+  // OpenSSL.
+  if (min > TLS1_VERSION) {
+    opts |= SSL_OP_NO_TLSv1;
+  }
+  if (min > TLS1_1_VERSION) {
+    opts |= SSL_OP_NO_TLSv1_1;
+  }
+  if (min > TLS1_2_VERSION) {
+    opts |= SSL_OP_NO_TLSv1_2;
+  }
+
+  if (max < TLS1_2_VERSION) {
+    opts |= SSL_OP_NO_TLSv1_2;
+  }
+  if (max < TLS1_1_VERSION) {
+    opts |= SSL_OP_NO_TLSv1_1;
+  }
+
+  SSL_CTX_set_options(ssl_ctx, opts);
+
+  return 0;
+#endif // !defined(OPENSSL_IS_BORINGSSL)
 }
 
 } // namespace ssl

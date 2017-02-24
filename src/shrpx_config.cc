@@ -638,6 +638,21 @@ int parse_duration(ev_tstamp *dest, const StringRef &opt,
 }
 } // namespace
 
+namespace {
+int parse_tls_proto_version(int &dest, const StringRef &opt,
+                            const StringRef &optarg) {
+  auto v = ssl::proto_version_from_string(optarg);
+  if (v == -1) {
+    LOG(ERROR) << opt << ": invalid TLS protocol version: " << optarg;
+    return -1;
+  }
+
+  dest = v;
+
+  return 0;
+}
+} // namespace
+
 struct MemcachedConnectionParams {
   bool tls;
 };
@@ -677,6 +692,7 @@ int parse_memcached_connection_params(MemcachedConnectionParams &out,
 struct UpstreamParams {
   int alt_mode;
   bool tls;
+  bool proxyproto;
 };
 
 namespace {
@@ -705,6 +721,8 @@ int parse_upstream_params(UpstreamParams &out, const StringRef &src_params) {
         return -1;
       }
       out.alt_mode = ALTMODE_HEALTHMON;
+    } else if (util::strieq_l("proxyproto", param)) {
+      out.proxyproto = true;
     } else if (!param.empty()) {
       LOG(ERROR) << "frontend: " << param << ": unknown keyword";
       return -1;
@@ -729,6 +747,7 @@ struct DownstreamParams {
   shrpx_session_affinity affinity;
   bool tls;
   bool dns;
+  bool redirect_if_not_tls;
 };
 
 namespace {
@@ -804,6 +823,8 @@ int parse_downstream_params(DownstreamParams &out,
       }
     } else if (util::strieq_l("dns", param)) {
       out.dns = true;
+    } else if (util::strieq_l("redirect-if-not-tls", param)) {
+      out.redirect_if_not_tls = true;
     } else if (!param.empty()) {
       LOG(ERROR) << "backend: " << param << ": unknown keyword";
       return -1;
@@ -896,6 +917,11 @@ int parse_mapping(Config *config, DownstreamAddrConfig &addr,
         if (params.affinity != AFFINITY_NONE) {
           g.affinity = params.affinity;
         }
+        // If at least one backend requires frontend TLS connection,
+        // enable it for all backends sharing the same pattern.
+        if (params.redirect_if_not_tls) {
+          g.redirect_if_not_tls = true;
+        }
         g.addrs.push_back(addr);
         done = true;
         break;
@@ -910,6 +936,7 @@ int parse_mapping(Config *config, DownstreamAddrConfig &addr,
     auto &g = addr_groups.back();
     g.addrs.push_back(addr);
     g.affinity = params.affinity;
+    g.redirect_if_not_tls = params.redirect_if_not_tls;
 
     if (pattern[0] == '*') {
       // wildcard pattern
@@ -1196,6 +1223,134 @@ int read_tls_sct_from_dir(std::vector<uint8_t> &dst, const StringRef &opt,
 }
 } // namespace
 
+#if !LIBRESSL_IN_USE
+namespace {
+// Reads PSK secrets from path, and parses each line.  The result is
+// directly stored into config->tls.psk_secrets.  This function
+// returns 0 if it succeeds, or -1.
+int parse_psk_secrets(Config *config, const StringRef &path) {
+  auto &tlsconf = config->tls;
+
+  std::ifstream f(path.c_str(), std::ios::binary);
+  if (!f) {
+    LOG(ERROR) << SHRPX_OPT_PSK_SECRETS << ": could not open file " << path;
+    return -1;
+  }
+
+  size_t lineno = 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    ++lineno;
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    auto sep_it = std::find(std::begin(line), std::end(line), ':');
+    if (sep_it == std::end(line)) {
+      LOG(ERROR) << SHRPX_OPT_PSK_SECRETS
+                 << ": could not fine separator at line " << lineno;
+      return -1;
+    }
+
+    if (sep_it == std::begin(line)) {
+      LOG(ERROR) << SHRPX_OPT_PSK_SECRETS << ": empty identity at line "
+                 << lineno;
+      return -1;
+    }
+
+    if (sep_it + 1 == std::end(line)) {
+      LOG(ERROR) << SHRPX_OPT_PSK_SECRETS << ": empty secret at line "
+                 << lineno;
+      return -1;
+    }
+
+    if (!util::is_hex_string(StringRef{sep_it + 1, std::end(line)})) {
+      LOG(ERROR) << SHRPX_OPT_PSK_SECRETS
+                 << ": secret must be hex string at line " << lineno;
+      return -1;
+    }
+
+    auto identity =
+        make_string_ref(config->balloc, StringRef{std::begin(line), sep_it});
+
+    auto secret =
+        util::decode_hex(config->balloc, StringRef{sep_it + 1, std::end(line)});
+
+    auto rv = tlsconf.psk_secrets.emplace(identity, secret);
+    if (!rv.second) {
+      LOG(ERROR) << SHRPX_OPT_PSK_SECRETS
+                 << ": identity has already been registered at line " << lineno;
+      return -1;
+    }
+  }
+
+  return 0;
+}
+} // namespace
+#endif // !LIBRESSL_IN_USE
+
+#if !LIBRESSL_IN_USE
+namespace {
+// Reads PSK secrets from path, and parses each line.  The result is
+// directly stored into config->tls.client.psk.  This function returns
+// 0 if it succeeds, or -1.
+int parse_client_psk_secrets(Config *config, const StringRef &path) {
+  auto &tlsconf = config->tls;
+
+  std::ifstream f(path.c_str(), std::ios::binary);
+  if (!f) {
+    LOG(ERROR) << SHRPX_OPT_CLIENT_PSK_SECRETS << ": could not open file "
+               << path;
+    return -1;
+  }
+
+  size_t lineno = 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    ++lineno;
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    auto sep_it = std::find(std::begin(line), std::end(line), ':');
+    if (sep_it == std::end(line)) {
+      LOG(ERROR) << SHRPX_OPT_CLIENT_PSK_SECRETS
+                 << ": could not find separator at line " << lineno;
+      return -1;
+    }
+
+    if (sep_it == std::begin(line)) {
+      LOG(ERROR) << SHRPX_OPT_CLIENT_PSK_SECRETS << ": empty identity at line "
+                 << lineno;
+      return -1;
+    }
+
+    if (sep_it + 1 == std::end(line)) {
+      LOG(ERROR) << SHRPX_OPT_CLIENT_PSK_SECRETS << ": empty secret at line "
+                 << lineno;
+      return -1;
+    }
+
+    if (!util::is_hex_string(StringRef{sep_it + 1, std::end(line)})) {
+      LOG(ERROR) << SHRPX_OPT_CLIENT_PSK_SECRETS
+                 << ": secret must be hex string at line " << lineno;
+      return -1;
+    }
+
+    tlsconf.client.psk.identity =
+        make_string_ref(config->balloc, StringRef{std::begin(line), sep_it});
+
+    tlsconf.client.psk.secret =
+        util::decode_hex(config->balloc, StringRef{sep_it + 1, std::end(line)});
+
+    return 0;
+  }
+
+  return 0;
+}
+} // namespace
+#endif // !LIBRESSL_IN_USE
+
 // generated by gennghttpxfun.py
 int option_lookup_token(const char *name, size_t namelen) {
   switch (namelen) {
@@ -1363,6 +1518,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("ecdh-curve", name, 10)) {
         return SHRPX_OPTID_ECDH_CURVES;
       }
+      if (util::strieq_l("psk-secret", name, 10)) {
+        return SHRPX_OPTID_PSK_SECRETS;
+      }
       break;
     case 't':
       if (util::strieq_l("write-burs", name, 10)) {
@@ -1415,6 +1573,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("add-forwarde", name, 12)) {
         return SHRPX_OPTID_ADD_FORWARDED;
       }
+      if (util::strieq_l("single-threa", name, 12)) {
+        return SHRPX_OPTID_SINGLE_THREAD;
+      }
       break;
     case 'e':
       if (util::strieq_l("dh-param-fil", name, 12)) {
@@ -1454,6 +1615,9 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 's':
       if (util::strieq_l("backend-no-tl", name, 13)) {
         return SHRPX_OPTID_BACKEND_NO_TLS;
+      }
+      if (util::strieq_l("client-cipher", name, 13)) {
+        return SHRPX_OPTID_CLIENT_CIPHERS;
       }
       break;
     case 't':
@@ -1550,6 +1714,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_ADD_REQUEST_HEADER;
       }
       break;
+    case 's':
+      if (util::strieq_l("client-psk-secret", name, 17)) {
+        return SHRPX_OPTID_CLIENT_PSK_SECRETS;
+      }
+      break;
     case 't':
       if (util::strieq_l("dns-lookup-timeou", name, 17)) {
         return SHRPX_OPTID_DNS_LOOKUP_TIMEOUT;
@@ -1587,6 +1756,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       }
       break;
     case 't':
+      if (util::strieq_l("redirect-https-por", name, 18)) {
+        return SHRPX_OPTID_REDIRECT_HTTPS_PORT;
+      }
       if (util::strieq_l("stream-read-timeou", name, 18)) {
         return SHRPX_OPTID_STREAM_READ_TIMEOUT;
       }
@@ -1635,9 +1807,22 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_ACCEPT_PROXY_PROTOCOL;
       }
       break;
+    case 'n':
+      if (util::strieq_l("tls-max-proto-versio", name, 20)) {
+        return SHRPX_OPTID_TLS_MAX_PROTO_VERSION;
+      }
+      if (util::strieq_l("tls-min-proto-versio", name, 20)) {
+        return SHRPX_OPTID_TLS_MIN_PROTO_VERSION;
+      }
+      break;
     case 'r':
       if (util::strieq_l("tls-ticket-key-ciphe", name, 20)) {
         return SHRPX_OPTID_TLS_TICKET_KEY_CIPHER;
+      }
+      break;
+    case 's':
+      if (util::strieq_l("frontend-max-request", name, 20)) {
+        return SHRPX_OPTID_FRONTEND_MAX_REQUESTS;
       }
       break;
     case 't':
@@ -1646,6 +1831,11 @@ int option_lookup_token(const char *name, size_t namelen) {
       }
       if (util::strieq_l("frontend-read-timeou", name, 20)) {
         return SHRPX_OPTID_FRONTEND_READ_TIMEOUT;
+      }
+      break;
+    case 'y':
+      if (util::strieq_l("accesslog-write-earl", name, 20)) {
+        return SHRPX_OPTID_ACCESSLOG_WRITE_EARLY;
       }
       break;
     }
@@ -1789,6 +1979,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("frontend-http2-read-timeou", name, 26)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_READ_TIMEOUT;
       }
+      if (util::strieq_l("frontend-keep-alive-timeou", name, 26)) {
+        return SHRPX_OPTID_FRONTEND_KEEP_ALIVE_TIMEOUT;
+      }
       break;
     }
     break;
@@ -1864,6 +2057,11 @@ int option_lookup_token(const char *name, size_t namelen) {
       }
       if (util::strieq_l("tls-ticket-key-memcached-max-fai", name, 32)) {
         return SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_FAIL;
+      }
+      break;
+    case 't':
+      if (util::strieq_l("client-no-http2-cipher-black-lis", name, 32)) {
+        return SHRPX_OPTID_CLIENT_NO_HTTP2_CIPHER_BLACK_LIST;
       }
       break;
     }
@@ -2088,6 +2286,7 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     addr.fd = -1;
     addr.tls = params.tls;
     addr.alt_mode = params.alt_mode;
+    addr.accept_proxy_protocol = params.proxyproto;
 
     if (addr.alt_mode == ALTMODE_API) {
       apiconf.enabled = true;
@@ -2227,21 +2426,8 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     config->logging.error.syslog = util::strieq_l("yes", optarg);
 
     return 0;
-  case SHRPX_OPTID_FASTOPEN: {
-    int n;
-    if (parse_int(&n, opt, optarg.c_str()) != 0) {
-      return -1;
-    }
-
-    if (n < 0) {
-      LOG(ERROR) << opt << ": " << optarg << " is not allowed";
-      return -1;
-    }
-
-    config->conn.listener.fastopen = n;
-
-    return 0;
-  }
+  case SHRPX_OPTID_FASTOPEN:
+    return parse_uint(&config->conn.listener.fastopen, opt, optarg);
   case SHRPX_OPTID_BACKEND_KEEP_ALIVE_TIMEOUT:
     return parse_duration(&config->conn.downstream->timeout.idle_read, opt,
                           optarg);
@@ -2428,22 +2614,8 @@ int parse_config(Config *config, int optid, const StringRef &opt,
 
     return 0;
   }
-  case SHRPX_OPTID_BACKLOG: {
-    int n;
-    if (parse_int(&n, opt, optarg.c_str()) != 0) {
-      return -1;
-    }
-
-    if (n < -1) {
-      LOG(ERROR) << opt << ": " << optarg << " is not allowed";
-
-      return -1;
-    }
-
-    config->conn.listener.backlog = n;
-
-    return 0;
-  }
+  case SHRPX_OPTID_BACKLOG:
+    return parse_uint(&config->conn.listener.backlog, opt, optarg);
   case SHRPX_OPTID_CIPHERS:
     config->tls.ciphers = make_string_ref(config->balloc, optarg);
 
@@ -2545,6 +2717,8 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     return 0;
   }
   case SHRPX_OPTID_TLS_PROTO_LIST: {
+    LOG(WARN) << opt << ": deprecated.  Use tls-min-proto-version and "
+                        "tls-max-proto-version instead.";
     auto list = util::split_str(optarg, ',');
     config->tls.tls_proto_list.resize(list.size());
     for (size_t i = 0; i < list.size(); ++i) {
@@ -2880,6 +3054,8 @@ int parse_config(Config *config, int optid, const StringRef &opt,
 #endif // !HAVE_MRUBY
     return 0;
   case SHRPX_OPTID_ACCEPT_PROXY_PROTOCOL:
+    LOG(WARN) << opt << ": deprecated.  Use proxyproto keyword in "
+              << SHRPX_OPT_FRONTEND << " instead.";
     config->conn.upstream.accept_proxy_protocol = util::strieq_l("yes", optarg);
 
     return 0;
@@ -3126,6 +3302,60 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     config->dns.max_try = n;
     return 0;
   }
+  case SHRPX_OPTID_FRONTEND_KEEP_ALIVE_TIMEOUT:
+    return parse_duration(&config->conn.upstream.timeout.idle_read, opt,
+                          optarg);
+  case SHRPX_OPTID_PSK_SECRETS:
+#if !LIBRESSL_IN_USE
+    return parse_psk_secrets(config, optarg);
+#else  // LIBRESSL_IN_USE
+    LOG(WARN)
+        << opt
+        << ": ignored because underlying TLS library does not support PSK";
+    return 0;
+#endif // LIBRESSL_IN_USE
+  case SHRPX_OPTID_CLIENT_PSK_SECRETS:
+#if !LIBRESSL_IN_USE
+    return parse_client_psk_secrets(config, optarg);
+#else  // LIBRESSL_IN_USE
+    LOG(WARN)
+        << opt
+        << ": ignored because underlying TLS library does not support PSK";
+    return 0;
+#endif // LIBRESSL_IN_USE
+  case SHRPX_OPTID_CLIENT_NO_HTTP2_CIPHER_BLACK_LIST:
+    config->tls.client.no_http2_cipher_black_list =
+        util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_CLIENT_CIPHERS:
+    config->tls.client.ciphers = make_string_ref(config->balloc, optarg);
+
+    return 0;
+  case SHRPX_OPTID_ACCESSLOG_WRITE_EARLY:
+    config->logging.access.write_early = util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_TLS_MIN_PROTO_VERSION:
+    return parse_tls_proto_version(config->tls.min_proto_version, opt, optarg);
+  case SHRPX_OPTID_TLS_MAX_PROTO_VERSION:
+    return parse_tls_proto_version(config->tls.max_proto_version, opt, optarg);
+  case SHRPX_OPTID_REDIRECT_HTTPS_PORT: {
+    auto n = util::parse_uint(optarg);
+    if (n == -1 || n < 0 || n > 65535) {
+      LOG(ERROR) << opt << ": bad value.  Specify an integer in the range [0, "
+                           "65535], inclusive";
+      return -1;
+    }
+    config->http.redirect_https_port = optarg;
+    return 0;
+  }
+  case SHRPX_OPTID_FRONTEND_MAX_REQUESTS:
+    return parse_uint(&config->http.max_requests, opt, optarg);
+  case SHRPX_OPTID_SINGLE_THREAD:
+    config->single_thread = util::strieq_l("yes", optarg);
+
+    return 0;
   case SHRPX_OPTID_CONF:
     LOG(WARN) << "conf: ignored";
 
@@ -3401,7 +3631,7 @@ int configure_downstream_group(Config *config, bool http2_proxy,
     auto &sni = tlsconf.backend_sni_name;
     for (auto &addr_group : addr_groups) {
       for (auto &addr : addr_group.addrs) {
-        addr.sni = StringRef{sni};
+        addr.sni = sni;
       }
     }
   }

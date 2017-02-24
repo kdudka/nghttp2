@@ -99,6 +99,7 @@ namespace {
 void timeoutcb(struct ev_loop *loop, ev_timer *w, int revents) {
   auto resolv = static_cast<DNSResolver *>(w->data);
   resolv->on_timeout();
+  process_result(resolv);
 }
 } // namespace
 
@@ -112,7 +113,8 @@ void stop_ev(struct ev_loop *loop,
 } // namespace
 
 DNSResolver::DNSResolver(struct ev_loop *loop)
-    : loop_(loop),
+    : result_{},
+      loop_(loop),
       channel_(nullptr),
       family_(AF_UNSPEC),
       status_(DNS_STATUS_IDLE) {
@@ -214,7 +216,9 @@ void DNSResolver::reset_timeout() {
   if (tv == nullptr) {
     return;
   }
-  timer_.repeat = tv->tv_sec + tv->tv_usec / 1000000.;
+  // To avoid that timer_.repeat becomes 0, which makes ev_timer_again
+  // useless, add tiny fraction of time.
+  timer_.repeat = tv->tv_sec + tv->tv_usec / 1000000. + 1e-9;
   ev_timer_again(loop_, &timer_);
 }
 
@@ -293,32 +297,35 @@ void DNSResolver::on_result(int status, hostent *hostent) {
     return;
   }
 
+  auto ap = *hostent->h_addr_list;
+  if (!ap) {
+    if (LOG_ENABLED(INFO)) {
+      LOG(INFO) << "Name lookup for " << name_ << "failed: no address returned";
+    }
+    status_ = DNS_STATUS_ERROR;
+    return;
+  }
+
   switch (hostent->h_addrtype) {
   case AF_INET:
-    for (auto ap = hostent->h_addr_list; *ap; ++ap) {
-      status_ = DNS_STATUS_OK;
-      result_.len = sizeof(result_.su.in);
-      result_.su.in = {};
-      result_.su.in.sin_family = AF_INET;
+    status_ = DNS_STATUS_OK;
+    result_.len = sizeof(result_.su.in);
+    result_.su.in = {};
+    result_.su.in.sin_family = AF_INET;
 #ifdef HAVE_SOCKADDR_IN_SIN_LEN
-      result_.su.in.sin_len = sizeof(result_.su.in);
+    result_.su.in.sin_len = sizeof(result_.su.in);
 #endif // HAVE_SOCKADDR_IN_SIN_LEN
-      memcpy(&result_.su.in.sin_addr, *ap, sizeof(result_.su.in.sin_addr));
-      break;
-    }
+    memcpy(&result_.su.in.sin_addr, ap, sizeof(result_.su.in.sin_addr));
     break;
   case AF_INET6:
-    for (auto ap = hostent->h_addr_list; *ap; ++ap) {
-      status_ = DNS_STATUS_OK;
-      result_.len = sizeof(result_.su.in6);
-      result_.su.in6 = {};
-      result_.su.in6.sin6_family = AF_INET6;
+    status_ = DNS_STATUS_OK;
+    result_.len = sizeof(result_.su.in6);
+    result_.su.in6 = {};
+    result_.su.in6.sin6_family = AF_INET6;
 #ifdef HAVE_SOCKADDR_IN6_SIN6_LEN
-      result_.su.in6.sin6_len = sizeof(result_.su.in6);
+    result_.su.in6.sin6_len = sizeof(result_.su.in6);
 #endif // HAVE_SOCKADDR_IN6_SIN6_LEN
-      memcpy(&result_.su.in6.sin6_addr, *ap, sizeof(result_.su.in6.sin6_addr));
-      break;
-    }
+    memcpy(&result_.su.in6.sin6_addr, ap, sizeof(result_.su.in6.sin6_addr));
     break;
   default:
     assert(0);

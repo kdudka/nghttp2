@@ -37,6 +37,7 @@
 #include "shrpx_log_config.h"
 #include "shrpx_worker.h"
 #include "shrpx_http2_session.h"
+#include "shrpx_log.h"
 #ifdef HAVE_MRUBY
 #include "shrpx_mruby.h"
 #endif // HAVE_MRUBY
@@ -51,7 +52,8 @@ namespace shrpx {
 HttpsUpstream::HttpsUpstream(ClientHandler *handler)
     : handler_(handler),
       current_header_length_(0),
-      ioctrl_(handler->get_rlimit()) {
+      ioctrl_(handler->get_rlimit()),
+      num_requests_(0) {
   http_parser_init(&htp_, HTTP_REQUEST);
   htp_.data = this;
 }
@@ -62,22 +64,30 @@ void HttpsUpstream::reset_current_header_length() {
   current_header_length_ = 0;
 }
 
+void HttpsUpstream::on_start_request() {
+  if (LOG_ENABLED(INFO)) {
+    ULOG(INFO, this) << "HTTP request started";
+  }
+  reset_current_header_length();
+
+  auto downstream = make_unique<Downstream>(this, handler_->get_mcpool(), 0);
+
+  attach_downstream(std::move(downstream));
+
+  auto conn = handler_->get_connection();
+  auto &upstreamconf = get_config()->conn.upstream;
+
+  conn->rt.repeat = upstreamconf.timeout.read;
+
+  handler_->repeat_read_timer();
+
+  ++num_requests_;
+}
+
 namespace {
 int htp_msg_begin(http_parser *htp) {
   auto upstream = static_cast<HttpsUpstream *>(htp->data);
-  if (LOG_ENABLED(INFO)) {
-    ULOG(INFO, upstream) << "HTTP request started";
-  }
-  upstream->reset_current_header_length();
-
-  auto handler = upstream->get_client_handler();
-
-  auto downstream = make_unique<Downstream>(upstream, handler->get_mcpool(), 0);
-
-  upstream->attach_downstream(std::move(downstream));
-
-  handler->repeat_read_timer();
-
+  upstream->on_start_request();
   return 0;
 }
 } // namespace
@@ -287,6 +297,10 @@ int htp_hdrs_completecb(http_parser *htp) {
   auto downstream = upstream->get_downstream();
   auto &req = downstream->request();
 
+  auto lgconf = log_config();
+  lgconf->update_tstamp(std::chrono::system_clock::now());
+  req.tstamp = lgconf->tstamp;
+
   req.http_major = htp->http_major;
   req.http_minor = htp->http_minor;
 
@@ -325,6 +339,12 @@ int htp_hdrs_completecb(http_parser *htp) {
   }
 
   auto host = req.fs.header(http2::HD_HOST);
+
+  if (req.http_major > 1 || req.http_minor > 1) {
+    req.http_major = 1;
+    req.http_minor = 1;
+    return -1;
+  }
 
   if (req.http_major == 1 && req.http_minor == 1 && !host) {
     return -1;
@@ -405,10 +425,18 @@ int htp_hdrs_completecb(http_parser *htp) {
     return 0;
   }
 
-  auto dconn = handler->get_downstream_connection(downstream);
+  auto dconn = handler->get_downstream_connection(rv, downstream);
 
-  if (!dconn ||
-      (rv = downstream->attach_downstream_connection(std::move(dconn))) != 0) {
+  if (!dconn) {
+    if (rv == SHRPX_ERR_TLS_REQUIRED) {
+      upstream->redirect_to_https(downstream);
+    }
+    downstream->set_request_state(Downstream::CONNECT_FAIL);
+
+    return -1;
+  }
+
+  if (downstream->attach_downstream_connection(std::move(dconn)) != 0) {
     downstream->set_request_state(Downstream::CONNECT_FAIL);
 
     return -1;
@@ -500,7 +528,7 @@ int htp_msg_completecb(http_parser *htp) {
 } // namespace
 
 namespace {
-http_parser_settings htp_hooks = {
+constexpr http_parser_settings htp_hooks = {
     htp_msg_begin,       // http_cb      on_message_begin;
     htp_uricb,           // http_data_cb on_url;
     nullptr,             // http_data_cb on_status;
@@ -527,7 +555,7 @@ int HttpsUpstream::on_read() {
   // callback chain called by http_parser_execute()
   if (downstream && downstream->get_upgraded()) {
 
-    auto rv = downstream->push_upload_data_chunk(rb->pos, rb->rleft());
+    auto rv = downstream->push_upload_data_chunk(rb->pos(), rb->rleft());
 
     if (rv != 0) {
       return -1;
@@ -560,8 +588,9 @@ int HttpsUpstream::on_read() {
   }
 
   // http_parser_execute() does nothing once it entered error state.
-  auto nread = http_parser_execute(
-      &htp_, &htp_hooks, reinterpret_cast<const char *>(rb->pos), rb->rleft());
+  auto nread = http_parser_execute(&htp_, &htp_hooks,
+                                   reinterpret_cast<const char *>(rb->pos()),
+                                   rb->rleft());
 
   rb->drain(nread);
   rlimit->startw();
@@ -672,6 +701,11 @@ int HttpsUpstream::on_write() {
         return 0;
       }
 
+      auto conn = handler_->get_connection();
+      auto &upstreamconf = get_config()->conn.upstream;
+
+      conn->rt.repeat = upstreamconf.timeout.idle_read;
+
       handler_->repeat_read_timer();
 
       return resume_read(SHRPX_NO_BUFFER, nullptr, 0);
@@ -699,7 +733,10 @@ int HttpsUpstream::resume_read(IOCtrlReason reason, Downstream *downstream,
     // Process remaining data in input buffer here because these bytes
     // are not notified by readcb until new data arrive.
     http_parser_pause(&htp_, 0);
-    return on_read();
+
+    auto conn = handler_->get_connection();
+    ev_feed_event(conn->loop, &conn->rev, EV_READ);
+    return 0;
   }
 
   return 0;
@@ -753,7 +790,7 @@ int HttpsUpstream::downstream_write(DownstreamConnection *dconn) {
   }
 
   if (rv != 0) {
-    return -1;
+    return rv;
   }
 
   return 0;
@@ -835,12 +872,14 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
   auto &resp = downstream->response();
   auto &balloc = downstream->get_block_allocator();
   auto config = get_config();
+  auto &httpconf = config->http;
 
   auto connection_close = false;
 
   auto worker = handler_->get_worker();
 
-  if (worker->get_graceful_shutdown()) {
+  if (httpconf.max_requests <= num_requests_ ||
+      worker->get_graceful_shutdown()) {
     resp.fs.add_header_token(StringRef::from_lit("connection"),
                              StringRef::from_lit("close"), false,
                              http2::HD_CONNECTION);
@@ -883,8 +922,6 @@ int HttpsUpstream::send_reply(Downstream *downstream, const uint8_t *body,
     output->append(config->http.server_name);
     output->append("\r\n");
   }
-
-  auto &httpconf = config->http;
 
   for (auto &p : httpconf.add_response_headers) {
     output->append(p.name);
@@ -931,12 +968,13 @@ void HttpsUpstream::error_reply(unsigned int status_code) {
   output->append("\r\nServer: ");
   output->append(get_config()->http.server_name);
   output->append("\r\nContent-Length: ");
-  auto cl = util::utos(html.size());
-  output->append(cl);
+  std::array<uint8_t, NGHTTP2_MAX_UINT64_DIGITS> intbuf;
+  output->append(StringRef{std::begin(intbuf),
+                           util::utos(std::begin(intbuf), html.size())});
   output->append("\r\nDate: ");
   auto lgconf = log_config();
   lgconf->update_tstamp(std::chrono::system_clock::now());
-  output->append(lgconf->time_http);
+  output->append(lgconf->tstamp->time_http);
   output->append("\r\nContent-Type: text/html; "
                  "charset=UTF-8\r\nConnection: close\r\n\r\n");
   output->append(html);
@@ -1008,11 +1046,10 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
   auto connect_method = req.method == HTTP_CONNECT;
 
   auto buf = downstream->get_response_buf();
-
   buf->append("HTTP/");
-  buf->append(util::utos(req.http_major));
-  buf->append(".");
-  buf->append(util::utos(req.http_minor));
+  buf->append('0' + req.http_major);
+  buf->append('.');
+  buf->append('0' + req.http_minor);
   buf->append(' ');
   buf->append(http2::stringify_status(balloc, resp.http_status));
   buf->append(' ');
@@ -1045,7 +1082,8 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
 
   // after graceful shutdown commenced, add connection: close header
   // field.
-  if (worker->get_graceful_shutdown()) {
+  if (httpconf.max_requests <= num_requests_ ||
+      worker->get_graceful_shutdown()) {
     resp.connection_close = true;
   }
 
@@ -1184,7 +1222,9 @@ int HttpsUpstream::on_downstream_body_complete(Downstream *downstream) {
     resp.connection_close = true;
   }
 
-  if (req.connection_close || resp.connection_close) {
+  if (req.connection_close || resp.connection_close ||
+      // To avoid to stall upload body
+      downstream->get_request_state() != Downstream::MSG_COMPLETE) {
     auto handler = get_client_handler();
     handler->set_should_close_after_write(true);
   }
@@ -1196,6 +1236,52 @@ int HttpsUpstream::on_downstream_abort_request(Downstream *downstream,
   error_reply(status_code);
   handler_->signal_write_no_wait();
   return 0;
+}
+
+int HttpsUpstream::on_downstream_abort_request_with_https_redirect(
+    Downstream *downstream) {
+  redirect_to_https(downstream);
+  handler_->signal_write_no_wait();
+  return 0;
+}
+
+int HttpsUpstream::redirect_to_https(Downstream *downstream) {
+  auto &req = downstream->request();
+  if (req.method == HTTP_CONNECT || req.scheme != "http" ||
+      req.authority.empty()) {
+    error_reply(400);
+    return 0;
+  }
+
+  auto authority = util::extract_host(req.authority);
+  if (authority.empty()) {
+    error_reply(400);
+    return 0;
+  }
+
+  auto &balloc = downstream->get_block_allocator();
+  auto config = get_config();
+  auto &httpconf = config->http;
+
+  StringRef loc;
+  if (httpconf.redirect_https_port == StringRef::from_lit("443")) {
+    loc = concat_string_ref(balloc, StringRef::from_lit("https://"), authority,
+                            req.path);
+  } else {
+    loc = concat_string_ref(balloc, StringRef::from_lit("https://"), authority,
+                            StringRef::from_lit(":"),
+                            httpconf.redirect_https_port, req.path);
+  }
+
+  auto &resp = downstream->response();
+  resp.http_status = 308;
+  resp.fs.add_header_token(StringRef::from_lit("location"), loc, false,
+                           http2::HD_LOCATION);
+  resp.fs.add_header_token(StringRef::from_lit("connection"),
+                           StringRef::from_lit("close"), false,
+                           http2::HD_CONNECTION);
+
+  return send_reply(downstream, nullptr, 0);
 }
 
 void HttpsUpstream::log_response_headers(DefaultMemchunks *buf) const {
@@ -1221,20 +1307,32 @@ int HttpsUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
 
   assert(downstream == downstream_.get());
 
+  downstream_->pop_downstream_connection();
+
   if (!downstream_->request_submission_ready()) {
+    switch (downstream_->get_response_state()) {
+    case Downstream::MSG_COMPLETE:
+      // We have got all response body already.  Send it off.
+      return 0;
+    case Downstream::INITIAL:
+      if (on_downstream_abort_request(downstream_.get(), 503) != 0) {
+        return -1;
+      }
+      return 0;
+    }
     // Return error so that caller can delete handler
     return -1;
   }
 
-  downstream_->pop_downstream_connection();
-
   downstream_->add_retry();
+
+  rv = 0;
 
   if (no_retry || downstream_->no_more_retry()) {
     goto fail;
   }
 
-  dconn = handler_->get_downstream_connection(downstream_.get());
+  dconn = handler_->get_downstream_connection(rv, downstream_.get());
   if (!dconn) {
     goto fail;
   }
@@ -1252,7 +1350,12 @@ int HttpsUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   return 0;
 
 fail:
-  if (on_downstream_abort_request(downstream_.get(), 503) != 0) {
+  if (rv == SHRPX_ERR_TLS_REQUIRED) {
+    rv = on_downstream_abort_request_with_https_redirect(downstream);
+  } else {
+    rv = on_downstream_abort_request(downstream_.get(), 503);
+  }
+  if (rv != 0) {
     return -1;
   }
   downstream_->pop_downstream_connection();

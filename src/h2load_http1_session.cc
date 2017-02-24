@@ -100,7 +100,7 @@ int htp_msg_completecb(http_parser *htp) {
     http_parser_pause(htp, 1);
     // Connection is going down.  If we have still request to do,
     // create new connection and keep on doing the job.
-    if (client->req_started < client->req_todo) {
+    if (client->req_left) {
       client->try_new_connection();
     }
 
@@ -146,7 +146,7 @@ int htp_body_cb(http_parser *htp, const char *data, size_t len) {
 } // namespace
 
 namespace {
-http_parser_settings htp_hooks = {
+constexpr http_parser_settings htp_hooks = {
     htp_msg_begincb,   // http_cb      on_message_begin;
     nullptr,           // http_data_cb on_url;
     htp_statuscb,      // http_data_cb on_status;

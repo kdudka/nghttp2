@@ -317,6 +317,25 @@ constexpr auto SHRPX_OPT_DNS_CACHE_TIMEOUT =
 constexpr auto SHRPX_OPT_DNS_LOOKUP_TIMEOUT =
     StringRef::from_lit("dns-lookup-timeout");
 constexpr auto SHRPX_OPT_DNS_MAX_TRY = StringRef::from_lit("dns-max-try");
+constexpr auto SHRPX_OPT_FRONTEND_KEEP_ALIVE_TIMEOUT =
+    StringRef::from_lit("frontend-keep-alive-timeout");
+constexpr auto SHRPX_OPT_PSK_SECRETS = StringRef::from_lit("psk-secrets");
+constexpr auto SHRPX_OPT_CLIENT_PSK_SECRETS =
+    StringRef::from_lit("client-psk-secrets");
+constexpr auto SHRPX_OPT_CLIENT_NO_HTTP2_CIPHER_BLACK_LIST =
+    StringRef::from_lit("client-no-http2-cipher-black-list");
+constexpr auto SHRPX_OPT_CLIENT_CIPHERS = StringRef::from_lit("client-ciphers");
+constexpr auto SHRPX_OPT_ACCESSLOG_WRITE_EARLY =
+    StringRef::from_lit("accesslog-write-early");
+constexpr auto SHRPX_OPT_TLS_MIN_PROTO_VERSION =
+    StringRef::from_lit("tls-min-proto-version");
+constexpr auto SHRPX_OPT_TLS_MAX_PROTO_VERSION =
+    StringRef::from_lit("tls-max-proto-version");
+constexpr auto SHRPX_OPT_REDIRECT_HTTPS_PORT =
+    StringRef::from_lit("redirect-https-port");
+constexpr auto SHRPX_OPT_FRONTEND_MAX_REQUESTS =
+    StringRef::from_lit("frontend-max-requests");
+constexpr auto SHRPX_OPT_SINGLE_THREAD = StringRef::from_lit("single-thread");
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
@@ -380,6 +399,8 @@ struct UpstreamAddr {
   bool host_unix;
   // true if TLS is enabled.
   bool tls;
+  // true if client is supposed to send PROXY protocol v1 header.
+  bool accept_proxy_protocol;
   int fd;
 };
 
@@ -418,7 +439,7 @@ struct AffinityHash {
 
 struct DownstreamAddrGroupConfig {
   DownstreamAddrGroupConfig(const StringRef &pattern)
-      : pattern(pattern), affinity(AFFINITY_NONE) {}
+      : pattern(pattern), affinity(AFFINITY_NONE), redirect_if_not_tls(false) {}
 
   StringRef pattern;
   std::vector<DownstreamAddrConfig> addrs;
@@ -427,6 +448,9 @@ struct DownstreamAddrGroupConfig {
   std::vector<AffinityHash> affinity_hash;
   // Session affinity
   shrpx_session_affinity affinity;
+  // true if this group requires that client connection must be TLS,
+  // and the request must be redirected to https URI.
+  bool redirect_if_not_tls;
 };
 
 struct TicketKey {
@@ -539,12 +563,23 @@ struct TLSConfig {
     bool enabled;
   } client_verify;
 
-  // Client private key and certificate used in backend connections.
+  // Client (backend connection) TLS configuration.
   struct {
+    // Client PSK configuration
+    struct {
+      // identity must be NULL terminated string.
+      StringRef identity;
+      StringRef secret;
+    } psk;
     StringRef private_key_file;
     StringRef cert_file;
+    StringRef ciphers;
+    bool no_http2_cipher_black_list;
   } client;
 
+  // PSK secrets.  The key is identity, and the associated value is
+  // its secret.
+  std::map<StringRef, StringRef> psk_secrets;
   // The list of additional TLS certificate pair
   std::vector<TLSCertificate> subcerts;
   std::vector<unsigned char> alpn_prefs;
@@ -567,6 +602,10 @@ struct TLSConfig {
   StringRef ciphers;
   StringRef ecdh_curves;
   StringRef cacert;
+  // The minimum and maximum TLS version.  These values are defined in
+  // OpenSSL header file.
+  int min_proto_version;
+  int max_proto_version;
   bool insecure;
   bool no_http2_cipher_black_list;
 };
@@ -604,10 +643,14 @@ struct HttpConfig {
   HeaderRefs add_request_headers;
   HeaderRefs add_response_headers;
   StringRef server_name;
+  // Port number which appears in Location header field when https
+  // redirect is made.
+  StringRef redirect_https_port;
   size_t request_header_field_buffer;
   size_t max_request_header_fields;
   size_t response_header_field_buffer;
   size_t max_response_header_fields;
+  size_t max_requests;
   bool no_via;
   bool no_location_rewrite;
   bool no_host_rewrite;
@@ -665,6 +708,9 @@ struct LoggingConfig {
     StringRef file;
     // Send accesslog to syslog, ignoring accesslog_file.
     bool syslog;
+    // Write accesslog when response headers are received from
+    // backend, rather than response body is received and sent.
+    bool write_early;
   } access;
   struct {
     StringRef file;
@@ -766,12 +812,14 @@ struct ConnectionConfig {
       ev_tstamp http2_read;
       ev_tstamp read;
       ev_tstamp write;
+      ev_tstamp idle_read;
     } timeout;
     struct {
       RateLimitConfig read;
       RateLimitConfig write;
     } ratelimit;
     size_t worker_connections;
+    // Deprecated.  See UpstreamAddr.accept_proxy_protocol.
     bool accept_proxy_protocol;
   } upstream;
 
@@ -806,6 +854,7 @@ struct Config {
         conn{},
         api{},
         dns{},
+        config_revision{0},
         num_worker{0},
         padding{0},
         rlimit_nofile{0},
@@ -815,6 +864,7 @@ struct Config {
         verbose{false},
         daemon{false},
         http2_proxy{false},
+        single_thread{false},
         ev_loop_flags{0} {}
   ~Config();
 
@@ -839,6 +889,13 @@ struct Config {
   StringRef conf_path;
   StringRef user;
   StringRef mruby_file;
+  // The revision of configuration which is opaque string, and changes
+  // on each configuration reloading.  This does not change on
+  // backendconfig API call.  This value is returned in health check
+  // as "nghttpx-conf-rev" response header field.  The external
+  // program can check this value to know whether reloading has
+  // completed or not.
+  uint64_t config_revision;
   size_t num_worker;
   size_t padding;
   size_t rlimit_nofile;
@@ -848,6 +905,7 @@ struct Config {
   bool verbose;
   bool daemon;
   bool http2_proxy;
+  bool single_thread;
   // flags passed to ev_default_loop() and ev_loop_new()
   int ev_loop_flags;
 };
@@ -865,6 +923,7 @@ enum {
   SHRPX_OPTID_ACCESSLOG_FILE,
   SHRPX_OPTID_ACCESSLOG_FORMAT,
   SHRPX_OPTID_ACCESSLOG_SYSLOG,
+  SHRPX_OPTID_ACCESSLOG_WRITE_EARLY,
   SHRPX_OPTID_ADD_FORWARDED,
   SHRPX_OPTID_ADD_REQUEST_HEADER,
   SHRPX_OPTID_ADD_RESPONSE_HEADER,
@@ -906,8 +965,11 @@ enum {
   SHRPX_OPTID_CIPHERS,
   SHRPX_OPTID_CLIENT,
   SHRPX_OPTID_CLIENT_CERT_FILE,
+  SHRPX_OPTID_CLIENT_CIPHERS,
+  SHRPX_OPTID_CLIENT_NO_HTTP2_CIPHER_BLACK_LIST,
   SHRPX_OPTID_CLIENT_PRIVATE_KEY_FILE,
   SHRPX_OPTID_CLIENT_PROXY,
+  SHRPX_OPTID_CLIENT_PSK_SECRETS,
   SHRPX_OPTID_CONF,
   SHRPX_OPTID_DAEMON,
   SHRPX_OPTID_DH_PARAM_FILE,
@@ -937,6 +999,8 @@ enum {
   SHRPX_OPTID_FRONTEND_HTTP2_SETTINGS_TIMEOUT,
   SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_BITS,
   SHRPX_OPTID_FRONTEND_HTTP2_WINDOW_SIZE,
+  SHRPX_OPTID_FRONTEND_KEEP_ALIVE_TIMEOUT,
+  SHRPX_OPTID_FRONTEND_MAX_REQUESTS,
   SHRPX_OPTID_FRONTEND_NO_TLS,
   SHRPX_OPTID_FRONTEND_READ_TIMEOUT,
   SHRPX_OPTID_FRONTEND_WRITE_TIMEOUT,
@@ -968,12 +1032,15 @@ enum {
   SHRPX_OPTID_PID_FILE,
   SHRPX_OPTID_PRIVATE_KEY_FILE,
   SHRPX_OPTID_PRIVATE_KEY_PASSWD_FILE,
+  SHRPX_OPTID_PSK_SECRETS,
   SHRPX_OPTID_READ_BURST,
   SHRPX_OPTID_READ_RATE,
+  SHRPX_OPTID_REDIRECT_HTTPS_PORT,
   SHRPX_OPTID_REQUEST_HEADER_FIELD_BUFFER,
   SHRPX_OPTID_RESPONSE_HEADER_FIELD_BUFFER,
   SHRPX_OPTID_RLIMIT_NOFILE,
   SHRPX_OPTID_SERVER_NAME,
+  SHRPX_OPTID_SINGLE_THREAD,
   SHRPX_OPTID_STREAM_READ_TIMEOUT,
   SHRPX_OPTID_STREAM_WRITE_TIMEOUT,
   SHRPX_OPTID_STRIP_INCOMING_FORWARDED,
@@ -982,6 +1049,8 @@ enum {
   SHRPX_OPTID_SYSLOG_FACILITY,
   SHRPX_OPTID_TLS_DYN_REC_IDLE_TIMEOUT,
   SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD,
+  SHRPX_OPTID_TLS_MAX_PROTO_VERSION,
+  SHRPX_OPTID_TLS_MIN_PROTO_VERSION,
   SHRPX_OPTID_TLS_PROTO_LIST,
   SHRPX_OPTID_TLS_SCT_DIR,
   SHRPX_OPTID_TLS_SESSION_CACHE_MEMCACHED,

@@ -593,4 +593,38 @@ void test_util_format_hex(void) {
   CU_ASSERT("" == util::format_hex(balloc, StringRef::from_lit("")));
 }
 
+void test_util_is_hex_string(void) {
+  CU_ASSERT(util::is_hex_string(StringRef{}));
+  CU_ASSERT(util::is_hex_string(StringRef::from_lit("0123456789abcdef")));
+  CU_ASSERT(util::is_hex_string(StringRef::from_lit("0123456789ABCDEF")));
+  CU_ASSERT(!util::is_hex_string(StringRef::from_lit("000")));
+  CU_ASSERT(!util::is_hex_string(StringRef::from_lit("XX")));
+}
+
+void test_util_decode_hex(void) {
+  BlockAllocator balloc(4096, 4096);
+
+  CU_ASSERT("\x0f\xf0" ==
+            util::decode_hex(balloc, StringRef::from_lit("0ff0")));
+  CU_ASSERT("" == util::decode_hex(balloc, StringRef{}));
+}
+
+void test_util_extract_host(void) {
+  CU_ASSERT(StringRef::from_lit("foo") ==
+            util::extract_host(StringRef::from_lit("foo")));
+  CU_ASSERT(StringRef::from_lit("foo") ==
+            util::extract_host(StringRef::from_lit("foo:")));
+  CU_ASSERT(StringRef::from_lit("foo") ==
+            util::extract_host(StringRef::from_lit("foo:0")));
+  CU_ASSERT(StringRef::from_lit("[::1]") ==
+            util::extract_host(StringRef::from_lit("[::1]")));
+  CU_ASSERT(StringRef::from_lit("[::1]") ==
+            util::extract_host(StringRef::from_lit("[::1]:")));
+
+  CU_ASSERT(util::extract_host(StringRef::from_lit(":foo")).empty());
+  CU_ASSERT(util::extract_host(StringRef::from_lit("[::1")).empty());
+  CU_ASSERT(util::extract_host(StringRef::from_lit("[::1]0")).empty());
+  CU_ASSERT(util::extract_host(StringRef{}).empty());
+}
+
 } // namespace shrpx

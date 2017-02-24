@@ -27,6 +27,7 @@
 #include <limits>
 
 #include "shrpx_connection.h"
+#include "shrpx_log.h"
 
 namespace shrpx {
 
@@ -83,13 +84,16 @@ void RateLimit::regen() {
     avail_ += rate_;
   }
 
-  if (avail_ > 0 && startw_req_) {
+  if (w_->fd >= 0 && avail_ > 0 && startw_req_) {
     ev_io_start(loop_, w_);
     handle_tls_pending_read();
   }
 }
 
 void RateLimit::startw() {
+  if (w_->fd < 0) {
+    return;
+  }
   startw_req_ = true;
   if (rate_ == 0 || avail_ > 0) {
     ev_io_start(loop_, w_);

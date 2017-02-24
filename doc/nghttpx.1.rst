@@ -105,12 +105,12 @@ Connections
     The  parameters are  delimited  by  ";".  The  available
     parameters       are:      "proto=<PROTO>",       "tls",
     "sni=<SNI_HOST>",         "fall=<N>",        "rise=<N>",
-    "affinity=<METHOD>", and "dns".   The parameter consists
-    of keyword,  and optionally  followed by "="  and value.
-    For example,  the parameter  "proto=h2" consists  of the
-    keyword  "proto" and  value "h2".   The parameter  "tls"
-    consists  of  the  keyword "tls"  without  value.   Each
-    parameter is described as follows.
+    "affinity=<METHOD>",  "dns", and  "redirect-if-not-tls".
+    The  parameter  consists   of  keyword,  and  optionally
+    followed by  "=" and value.  For  example, the parameter
+    "proto=h2"  consists of  the keyword  "proto" and  value
+    "h2".  The parameter "tls" consists of the keyword "tls"
+    without value.  Each parameter is described as follows.
 
     The backend application protocol  can be specified using
     optional  "proto"   parameter,  and   in  the   form  of
@@ -167,6 +167,19 @@ Connections
     backend   host   name   at  start   up,   or   reloading
     configuration is skipped.
 
+    If "redirect-if-not-tls" parameter  is used, the matched
+    backend  requires   that  frontend  connection   is  TLS
+    encrypted.  If it isn't, nghttpx responds to the request
+    with 308  status code, and  https URI the  client should
+    use instead  is included in Location  header field.  The
+    port number in  redirect URI is 443 by  default, and can
+    be  changed using  :option:`--redirect-https-port` option.   If at
+    least one  backend has  "redirect-if-not-tls" parameter,
+    this feature is enabled  for all backend servers sharing
+    the   same   <PATTERN>.    It    is   advised   to   set
+    "redirect-if-no-tls"    parameter   to    all   backends
+    explicitly if this feature is desired.
+
     Since ";" and ":" are  used as delimiter, <PATTERN> must
     not  contain these  characters.  Since  ";" has  special
     meaning in shell, the option value must be quoted.
@@ -202,6 +215,10 @@ Connections
     default.  Any  requests which come through  this address
     are replied with 200 HTTP status, without no body.
 
+    To  accept   PROXY  protocol   version  1   on  frontend
+    connection,  specify  "proxyproto" parameter.   This  is
+    disabled by default.
+
 
     Default: ``*,3000``
 
@@ -209,7 +226,7 @@ Connections
 
     Set listen backlog size.
 
-    Default: ``512``
+    Default: ``65536``
 
 .. option:: --backend-address-family=(auto|IPv4|IPv6)
 
@@ -234,10 +251,6 @@ Connections
     timeouts when connecting and  making CONNECT request can
     be     specified    by     :option:`--backend-read-timeout`    and
     :option:`--backend-write-timeout` options.
-
-.. option:: --accept-proxy-protocol
-
-    Accept PROXY protocol version 1 on frontend connection.
 
 
 Performance
@@ -399,6 +412,13 @@ Timeout
 
     Default: ``30s``
 
+.. option:: --frontend-keep-alive-timeout=<DURATION>
+
+    Specify   keep-alive   timeout   for   frontend   HTTP/1
+    connection.
+
+    Default: ``1m``
+
 .. option:: --stream-read-timeout=<DURATION>
 
     Specify  read timeout  for HTTP/2  and SPDY  streams.  0
@@ -434,7 +454,8 @@ Timeout
 
 .. option:: --backend-keep-alive-timeout=<DURATION>
 
-    Specify keep-alive timeout for backend connection.
+    Specify   keep-alive   timeout    for   backend   HTTP/1
+    connection.
 
     Default: ``2s``
 
@@ -479,8 +500,17 @@ SSL/TLS
 
 .. option:: --ciphers=<SUITE>
 
-    Set allowed  cipher list.  The  format of the  string is
-    described in OpenSSL ciphers(1).
+    Set allowed  cipher list  for frontend  connection.  The
+    format of the string is described in OpenSSL ciphers(1).
+
+    Default: ``ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS``
+
+.. option:: --client-ciphers=<SUITE>
+
+    Set  allowed cipher  list for  backend connection.   The
+    format of the string is described in OpenSSL ciphers(1).
+
+    Default: ``ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS``
 
 .. option:: --ecdh-curves=<LIST>
 
@@ -515,9 +545,14 @@ SSL/TLS
 
     Specify  additional certificate  and  private key  file.
     nghttpx will  choose certificates based on  the hostname
-    indicated  by  client  using TLS  SNI  extension.   This
-    option  can  be  used  multiple  times.   To  make  OCSP
-    stapling work, <CERTPATH> must be absolute path.
+    indicated by client using TLS SNI extension.  If nghttpx
+    is  built with  OpenSSL >=  1.0.2, signature  algorithms
+    (e.g., ECDSA+SHA256, RSA+SHA256) presented by client are
+    also taken  into consideration.  This allows  nghttpx to
+    send ECDSA certificate to  modern clients, while sending
+    RSA based certificate to older clients.  This option can
+    be  used multiple  times.  To  make OCSP  stapling work,
+    <CERTPATH> must be absolute path.
 
     Additional parameter  can be specified in  <PARAM>.  The
     available <PARAM> is "sct-dir=<DIR>".
@@ -565,19 +600,29 @@ SSL/TLS
     Path to  file that  contains client certificate  used in
     backend client authentication.
 
-.. option:: --tls-proto-list=<LIST>
+.. option:: --tls-min-proto-version=<VER>
 
-    Comma delimited list of  SSL/TLS protocol to be enabled.
-    The following protocols  are available: TLSv1.2, TLSv1.1
-    and   TLSv1.0.    The   name   matching   is   done   in
-    case-insensitive   manner.    The  parameter   must   be
-    delimited by  a single comma  only and any  white spaces
-    are  treated  as a  part  of  protocol string.   If  the
-    protocol list advertised by client does not overlap this
-    list,  you  will  receive  the  error  message  "unknown
-    protocol".
+    Specify minimum SSL/TLS protocol.   The name matching is
+    done in  case-insensitive manner.  The  versions between
+    :option:`--tls-min-proto-version` and  :option:`\--tls-max-proto-version` are
+    enabled.  If the protocol list advertised by client does
+    not  overlap  this range,  you  will  receive the  error
+    message "unknown protocol".  The available versions are:
+    TLSv1.2, TLSv1.1, and TLSv1.0
 
-    Default: ``TLSv1.2,TLSv1.1``
+    Default: ``TLSv1.1``
+
+.. option:: --tls-max-proto-version=<VER>
+
+    Specify maximum SSL/TLS protocol.   The name matching is
+    done in  case-insensitive manner.  The  versions between
+    :option:`--tls-min-proto-version` and  :option:`\--tls-max-proto-version` are
+    enabled.  If the protocol list advertised by client does
+    not  overlap  this range,  you  will  receive the  error
+    message "unknown protocol".  The available versions are:
+    TLSv1.2, TLSv1.1, and TLSv1.0
+
+    Default: ``TLSv1.2``
 
 .. option:: --tls-ticket-key-file=<PATH>
 
@@ -739,9 +784,17 @@ SSL/TLS
 
 .. option:: --no-http2-cipher-black-list
 
-    Allow black  listed cipher  suite on  HTTP/2 connection.
-    See  https://tools.ietf.org/html/rfc7540#appendix-A  for
-    the complete HTTP/2 cipher suites black list.
+    Allow  black  listed  cipher suite  on  frontend  HTTP/2
+    connection.                                          See
+    https://tools.ietf.org/html/rfc7540#appendix-A  for  the
+    complete HTTP/2 cipher suites black list.
+
+.. option:: --client-no-http2-cipher-black-list
+
+    Allow  black  listed  cipher  suite  on  backend  HTTP/2
+    connection.                                          See
+    https://tools.ietf.org/html/rfc7540#appendix-A  for  the
+    complete HTTP/2 cipher suites black list.
 
 .. option:: --tls-sct-dir=<DIR>
 
@@ -753,6 +806,37 @@ SSL/TLS
     argument <CERT>, or  certificate option in configuration
     file.   For   additional  certificates,   use  :option:`--subcert`
     option.  This option requires OpenSSL >= 1.0.2.
+
+.. option:: --psk-secrets=<PATH>
+
+    Read list of PSK identity and secrets from <PATH>.  This
+    is used for frontend connection.  The each line of input
+    file  is  formatted  as  <identity>:<hex-secret>,  where
+    <identity> is  PSK identity, and <hex-secret>  is secret
+    in hex.  An  empty line, and line which  starts with '#'
+    are skipped.  The default  enabled cipher list might not
+    contain any PSK cipher suite.  In that case, desired PSK
+    cipher suites  must be  enabled using  :option:`--ciphers` option.
+    The  desired PSK  cipher suite  may be  black listed  by
+    HTTP/2.   To  use  those   cipher  suites  with  HTTP/2,
+    consider  to  use  :option:`--no-http2-cipher-black-list`  option.
+    But be aware its implications.
+
+.. option:: --client-psk-secrets=<PATH>
+
+    Read PSK identity and secrets from <PATH>.  This is used
+    for backend connection.  The each  line of input file is
+    formatted  as <identity>:<hex-secret>,  where <identity>
+    is PSK identity, and <hex-secret>  is secret in hex.  An
+    empty line, and line which  starts with '#' are skipped.
+    The first identity and  secret pair encountered is used.
+    The default  enabled cipher  list might not  contain any
+    PSK  cipher suite.   In  that case,  desired PSK  cipher
+    suites  must be  enabled using  :option:`--client-ciphers` option.
+    The  desired PSK  cipher suite  may be  black listed  by
+    HTTP/2.   To  use  those   cipher  suites  with  HTTP/2,
+    consider   to  use   :option:`--client-no-http2-cipher-black-list`
+    option.  But be aware its implications.
 
 
 HTTP/2 and SPDY
@@ -961,6 +1045,12 @@ Logging
 
     Default: ``$remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"``
 
+.. option:: --accesslog-write-early
+
+    Write  access  log  when   response  header  fields  are
+    received   from  backend   rather   than  when   request
+    transaction finishes.
+
 .. option:: --errorlog-file=<PATH>
 
     Set path to write error  log.  To reopen file, send USR1
@@ -1126,13 +1216,21 @@ HTTP
 
     Change server response header field value to <NAME>.
 
-    Default: ``nghttpx nghttp2/1.18.0-DEV``
+    Default: ``nghttpx nghttp2/1.20.0-DEV``
 
 .. option:: --no-server-rewrite
 
     Don't rewrite server header field in default mode.  When
     :option:`--http2-proxy` is used, these headers will not be altered
     regardless of this option.
+
+.. option:: --redirect-https-port=<PORT>
+
+    Specify the port number which appears in Location header
+    field  when  redirect  to  HTTPS  URI  is  made  due  to
+    "redirect-if-not-tls" parameter in :option:`--backend` option.
+
+    Default: ``443``
 
 
 API
@@ -1301,6 +1399,33 @@ FILES
   :option:`--conf` option cannot be used in the configuration file and
   will be ignored if specified.
 
+Error log
+  Error log is written to stderr by default.  It can be configured
+  using :option:`--errorlog-file`.  The format of log message is as
+  follows:
+
+  <datetime> <master-pid> <current-pid> <thread-id> <level> (<filename>:<line>) <msg>
+
+  <datetime>
+    It is a conbination of date and time when the log is written.  It
+    is in ISO 8601 format.
+
+  <master-pid>
+    It is a master process ID.
+
+  <current-pid>
+    It is a process ID which writes this log.
+
+  <thread-id>
+    It is a thread ID which writes this log.  It would be unique
+    within <current-pid>.
+
+  <filename> and <line>
+    They are source file name, and line number which produce this log.
+
+  <msg>
+    It is a log message body.
+
 SIGNALS
 -------
 
@@ -1316,14 +1441,18 @@ SIGUSR1
   Reopen log files.
 
 SIGUSR2
+
   Fork and execute nghttpx.  It will execute the binary in the same
-  path with same command-line arguments and environment variables.
-  After new process comes up, sending SIGQUIT to the original process
-  to perform hot swapping.  The difference between SIGUSR2 + SIGQUIT
-  and SIGHUP is that former is usually used to execute new binary, and
-  the master process is newly spawned.  On the other hand, the latter
-  just reloads configuration file, and the same master process
-  continues to exist.
+  path with same command-line arguments and environment variables.  As
+  of nghttpx version 1.20.0, the new master process sends SIGQUIT to
+  the original master process when it is ready to serve requests.  For
+  the earlier versions of nghttpx, user has to send SIGQUIT to the
+  original master process.
+
+  The difference between SIGUSR2 (+ SIGQUIT) and SIGHUP is that former
+  is usually used to execute new binary, and the master process is
+  newly spawned.  On the other hand, the latter just reloads
+  configuration file, and the same master process continues to exist.
 
 .. note::
 
@@ -1715,6 +1844,18 @@ respectively.
         existing header fields, and then add required header fields.
         It is an error to call this method twice for a given request.
 
+    .. rb:method:: send_info(status, headers)
+
+        Send non-final (informational) response to a client.  *status*
+        must be in the range [100, 199], inclusive.  *headers* is a
+        hash containing response header fields.  Its key must be a
+        string, and the associated value must be either string or
+        array of strings.  Since this is not a final response, even if
+        this method is invoked, request is still forwarded to a
+        backend unless :rb:meth:`Nghttpx::Response#return` is called.
+        This method can be called multiple times.  It cannot be called
+        after :rb:meth:`Nghttpx::Response#return` is called.
+
 MRUBY EXAMPLES
 ~~~~~~~~~~~~~~
 
@@ -1776,17 +1917,20 @@ status
 code
   HTTP status code
 
+Additionally, depending on the API endpoint, ``data`` key may be
+present, and its value contains the API endpoint specific data.
+
 We wrote "normally", since nghttpx may return ordinal HTML response in
 some cases where the error has occurred before reaching API endpoint
 (e.g., header field is too large).
 
 The following section describes available API endpoints.
 
-PUT /api/v1beta1/backendconfig
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+POST /api/v1beta1/backendconfig
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 This API replaces the current backend server settings with the
-requested ones.  The request method should be PUT, but POST is also
+requested ones.  The request method should be POST, but PUT is also
 acceptable.  The request body must be nghttpx configuration file
 format.  For configuration file format, see `FILES`_ section.  The
 line separator inside the request body must be single LF (0x0A).
@@ -1806,6 +1950,23 @@ The one limitation is that only numeric IP address is allowd in
 :option:`backend <--backend>` in request body unless "dns" parameter
 is used while non numeric hostname is allowed in command-line or
 configuration file is read using :option:`--conf`.
+
+GET /api/v1beta1/configrevision
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This API returns configuration revision of the current nghttpx.  The
+configuration revision is opaque string, and it changes after each
+reloading by SIGHUP.  With this API, an external application knows
+that whether nghttpx has finished reloading its configuration by
+comparing the configuration revisions between before and after
+reloading.
+
+This API returns response including ``data`` key.  Its value is JSON
+object, and it contains at least the following key:
+
+configRevision
+  The configuration revision of the current nghttpx
+
 
 SEE ALSO
 --------

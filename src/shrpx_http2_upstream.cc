@@ -37,6 +37,7 @@
 #include "shrpx_http.h"
 #include "shrpx_worker.h"
 #include "shrpx_http2_session.h"
+#include "shrpx_log.h"
 #ifdef HAVE_MRUBY
 #include "shrpx_mruby.h"
 #endif // HAVE_MRUBY
@@ -270,16 +271,21 @@ int on_begin_headers_callback(nghttp2_session *session,
                          << frame->hd.stream_id;
   }
 
-  auto handler = upstream->get_client_handler();
+  upstream->on_start_request(frame);
 
-  auto downstream = make_unique<Downstream>(upstream, handler->get_mcpool(),
+  return 0;
+}
+} // namespace
+
+void Http2Upstream::on_start_request(const nghttp2_frame *frame) {
+  auto downstream = make_unique<Downstream>(this, handler_->get_mcpool(),
                                             frame->hd.stream_id);
-  nghttp2_session_set_stream_user_data(session, frame->hd.stream_id,
+  nghttp2_session_set_stream_user_data(session_, frame->hd.stream_id,
                                        downstream.get());
 
   downstream->reset_upstream_rtimer();
 
-  handler->repeat_read_timer();
+  handler_->repeat_read_timer();
 
   auto &req = downstream->request();
 
@@ -288,19 +294,28 @@ int on_begin_headers_callback(nghttp2_session *session,
   req.http_major = 2;
   req.http_minor = 0;
 
-  upstream->add_pending_downstream(std::move(downstream));
+  add_pending_downstream(std::move(downstream));
 
-  return 0;
+  ++num_requests_;
+
+  auto config = get_config();
+  auto &httpconf = config->http;
+  if (httpconf.max_requests <= num_requests_) {
+    start_graceful_shutdown();
+  }
 }
-} // namespace
 
 int Http2Upstream::on_request_headers(Downstream *downstream,
                                       const nghttp2_frame *frame) {
+  auto lgconf = log_config();
+  lgconf->update_tstamp(std::chrono::system_clock::now());
+  auto &req = downstream->request();
+  req.tstamp = lgconf->tstamp;
+
   if (downstream->get_response_state() == Downstream::MSG_COMPLETE) {
     return 0;
   }
 
-  auto &req = downstream->request();
   auto &nva = req.fs.headers();
 
   if (LOG_ENABLED(INFO)) {
@@ -429,9 +444,25 @@ void Http2Upstream::start_downstream(Downstream *downstream) {
 void Http2Upstream::initiate_downstream(Downstream *downstream) {
   int rv;
 
-  auto dconn = handler_->get_downstream_connection(downstream);
-  if (!dconn ||
-      (rv = downstream->attach_downstream_connection(std::move(dconn))) != 0) {
+  auto dconn = handler_->get_downstream_connection(rv, downstream);
+  if (!dconn) {
+    if (rv == SHRPX_ERR_TLS_REQUIRED) {
+      rv = redirect_to_https(downstream);
+    } else {
+      rv = error_reply(downstream, 503);
+    }
+    if (rv != 0) {
+      rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+    }
+
+    downstream->set_request_state(Downstream::CONNECT_FAIL);
+    downstream_queue_.mark_failure(downstream);
+
+    return;
+  }
+
+  rv = downstream->attach_downstream_connection(std::move(dconn));
+  if (rv != 0) {
     // downstream connection fails, send error page
     if (error_reply(downstream, 503) != 0) {
       rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
@@ -782,7 +813,11 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
 
   wb->append(PADDING.data(), padlen);
 
-  downstream->reset_upstream_wtimer();
+  if (body->rleft() == 0) {
+    downstream->disable_upstream_wtimer();
+  } else {
+    downstream->reset_upstream_wtimer();
+  }
 
   if (length > 0 && downstream->resume_read(SHRPX_NO_BUFFER, length) != 0) {
     return NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -848,8 +883,6 @@ void Http2Upstream::submit_goaway() {
 }
 
 void Http2Upstream::check_shutdown() {
-  int rv;
-
   auto worker = handler_->get_worker();
 
   if (!worker->get_graceful_shutdown()) {
@@ -857,6 +890,15 @@ void Http2Upstream::check_shutdown() {
   }
 
   ev_prepare_stop(handler_->get_loop(), &prep_);
+
+  start_graceful_shutdown();
+}
+
+void Http2Upstream::start_graceful_shutdown() {
+  int rv;
+  if (ev_is_active(&shutdown_timer_)) {
+    return;
+  }
 
   rv = nghttp2_submit_shutdown_notice(session_);
   if (rv != 0) {
@@ -940,7 +982,8 @@ Http2Upstream::Http2Upstream(ClientHandler *handler)
                         !get_config()->http2_proxy),
       handler_(handler),
       session_(nullptr),
-      max_buffer_size_(MAX_BUFFER_SIZE) {
+      max_buffer_size_(MAX_BUFFER_SIZE),
+      num_requests_(0) {
   int rv;
 
   auto config = get_config();
@@ -1055,7 +1098,7 @@ int Http2Upstream::on_read() {
   auto rlimit = handler_->get_rlimit();
 
   if (rb->rleft()) {
-    rv = nghttp2_session_mem_recv(session_, rb->pos, rb->rleft());
+    rv = nghttp2_session_mem_recv(session_, rb->pos(), rb->rleft());
     if (rv < 0) {
       if (rv != NGHTTP2_ERR_BAD_CLIENT_MAGIC) {
         ULOG(ERROR, this) << "nghttp2_session_mem_recv() returned error: "
@@ -1212,7 +1255,7 @@ int Http2Upstream::downstream_write(DownstreamConnection *dconn) {
     return downstream_error(dconn, Downstream::EVENT_ERROR);
   }
   if (rv != 0) {
-    return -1;
+    return rv;
   }
   return 0;
 }
@@ -1392,6 +1435,7 @@ ssize_t downstream_data_read_callback(nghttp2_session *session,
   }
 
   if (nread == 0 && ((*data_flags) & NGHTTP2_DATA_FLAG_EOF) == 0) {
+    downstream->disable_upstream_wtimer();
     return NGHTTP2_ERR_DEFERRED;
   }
 
@@ -1464,6 +1508,10 @@ int Http2Upstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   downstream->set_response_state(Downstream::MSG_COMPLETE);
 
+  if (data_prd_ptr) {
+    downstream->reset_upstream_wtimer();
+  }
+
   return 0;
 }
 
@@ -1489,7 +1537,7 @@ int Http2Upstream::error_reply(Downstream *downstream,
 
   auto response_status = http2::stringify_status(balloc, status_code);
   auto content_length = util::make_string_ref_uint(balloc, html.size());
-  auto date = make_string_ref(balloc, lgconf->time_http);
+  auto date = make_string_ref(balloc, lgconf->tstamp->time_http);
 
   auto nva = std::array<nghttp2_nv, 5>{
       {http2::make_nv_ls_nocopy(":status", response_status),
@@ -1505,6 +1553,8 @@ int Http2Upstream::error_reply(Downstream *downstream,
                       << nghttp2_strerror(rv);
     return -1;
   }
+
+  downstream->reset_upstream_wtimer();
 
   return 0;
 }
@@ -1712,6 +1762,10 @@ int Http2Upstream::on_downstream_header_complete(Downstream *downstream) {
     return -1;
   }
 
+  if (data_prdptr) {
+    downstream->reset_upstream_wtimer();
+  }
+
   return 0;
 }
 
@@ -1787,6 +1841,52 @@ int Http2Upstream::on_downstream_abort_request(Downstream *downstream,
   return 0;
 }
 
+int Http2Upstream::on_downstream_abort_request_with_https_redirect(
+    Downstream *downstream) {
+  int rv;
+
+  rv = redirect_to_https(downstream);
+  if (rv != 0) {
+    return -1;
+  }
+
+  handler_->signal_write();
+  return 0;
+}
+
+int Http2Upstream::redirect_to_https(Downstream *downstream) {
+  auto &req = downstream->request();
+  if (req.method == HTTP_CONNECT || req.scheme != "http") {
+    return error_reply(downstream, 400);
+  }
+
+  auto authority = util::extract_host(req.authority);
+  if (authority.empty()) {
+    return error_reply(downstream, 400);
+  }
+
+  auto &balloc = downstream->get_block_allocator();
+  auto config = get_config();
+  auto &httpconf = config->http;
+
+  StringRef loc;
+  if (httpconf.redirect_https_port == StringRef::from_lit("443")) {
+    loc = concat_string_ref(balloc, StringRef::from_lit("https://"), authority,
+                            req.path);
+  } else {
+    loc = concat_string_ref(balloc, StringRef::from_lit("https://"), authority,
+                            StringRef::from_lit(":"),
+                            httpconf.redirect_https_port, req.path);
+  }
+
+  auto &resp = downstream->response();
+  resp.http_status = 308;
+  resp.fs.add_header_token(StringRef::from_lit("location"), loc, false,
+                           http2::HD_LOCATION);
+
+  return send_reply(downstream, nullptr, 0);
+}
+
 int Http2Upstream::consume(int32_t stream_id, size_t len) {
   int rv;
 
@@ -1825,7 +1925,8 @@ int Http2Upstream::on_timeout(Downstream *downstream) {
                      << downstream->get_stream_id();
   }
 
-  rst_stream(downstream, NGHTTP2_NO_ERROR);
+  rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
+  handler_->signal_write();
 
   return 0;
 }
@@ -1854,6 +1955,11 @@ int Http2Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   }
 
   if (!downstream->request_submission_ready()) {
+    if (downstream->get_response_state() == Downstream::MSG_COMPLETE) {
+      // We have got all response body already.  Send it off.
+      downstream->pop_downstream_connection();
+      return 0;
+    }
     // pushed stream is handled here
     rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
     downstream->pop_downstream_connection();
@@ -1869,6 +1975,8 @@ int Http2Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
 
   std::unique_ptr<DownstreamConnection> dconn;
 
+  rv = 0;
+
   if (no_retry || downstream->no_more_retry()) {
     goto fail;
   }
@@ -1876,7 +1984,7 @@ int Http2Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   // downstream connection is clean; we can retry with new
   // downstream connection.
 
-  dconn = handler_->get_downstream_connection(downstream);
+  dconn = handler_->get_downstream_connection(rv, downstream);
   if (!dconn) {
     goto fail;
   }
@@ -1894,7 +2002,12 @@ int Http2Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   return 0;
 
 fail:
-  if (on_downstream_abort_request(downstream, 503) != 0) {
+  if (rv == SHRPX_ERR_TLS_REQUIRED) {
+    rv = on_downstream_abort_request_with_https_redirect(downstream);
+  } else {
+    rv = on_downstream_abort_request(downstream, 503);
+  }
+  if (rv != 0) {
     rst_stream(downstream, NGHTTP2_INTERNAL_ERROR);
   }
   downstream->pop_downstream_connection();

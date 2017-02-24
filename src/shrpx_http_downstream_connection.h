@@ -71,6 +71,7 @@ public:
 
   int initiate_connection();
 
+  int write_reuse_first();
   int read_clear();
   int write_clear();
   int read_tls();
@@ -90,8 +91,8 @@ public:
 
 private:
   Connection conn_;
-  std::function<int(HttpDownstreamConnection &)> do_read_, do_write_,
-      do_signal_write_;
+  std::function<int(HttpDownstreamConnection &)> on_read_, on_write_,
+      signal_write_;
   Worker *worker_;
   // nullptr if TLS is not used.
   SSL_CTX *ssl_ctx_;
@@ -108,6 +109,11 @@ private:
   IOControl ioctrl_;
   http_parser response_htp_;
   ssize_t initial_addr_idx_;
+  // true if first write of reused connection succeeded.  For
+  // convenience, this is initialized as true.
+  bool reuse_first_write_done_;
+  // true if this object can be reused
+  bool reusable_;
 };
 
 } // namespace shrpx

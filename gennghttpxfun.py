@@ -152,6 +152,17 @@ OPTIONS = [
     "dns-cache-timeout",
     "dns-lookup-timeout",
     "dns-max-try",
+    "frontend-keep-alive-timeout",
+    "psk-secrets",
+    "client-psk-secrets",
+    "client-no-http2-cipher-black-list",
+    "client-ciphers",
+    "accesslog-write-early",
+    "tls-min-proto-version",
+    "tls-max-proto-version",
+    "redirect-https-port",
+    "frontend-max-requests",
+    "single-thread",
 ]
 
 LOGVARS = [

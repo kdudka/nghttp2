@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -100,9 +101,8 @@ func newServerTesterInternal(src_args []string, t *testing.T, handler http.Handl
 
 	args := []string{}
 
-	backendTLS := false
-	dns := false
-	externalDNS := false
+	var backendTLS, dns, externalDNS, acceptProxyProtocol, redirectIfNotTLS bool
+
 	for _, k := range src_args {
 		switch k {
 		case "--http2-bridge":
@@ -112,6 +112,10 @@ func newServerTesterInternal(src_args []string, t *testing.T, handler http.Handl
 		case "--external-dns":
 			dns = true
 			externalDNS = true
+		case "--accept-proxy-protocol":
+			acceptProxyProtocol = true
+		case "--redirect-if-not-tls":
+			redirectIfNotTLS = true
 		default:
 			args = append(args, k)
 		}
@@ -160,12 +164,21 @@ func newServerTesterInternal(src_args []string, t *testing.T, handler http.Handl
 		b += ";dns"
 	}
 
-	noTLS := "no-tls"
+	if redirectIfNotTLS {
+		b += ";redirect-if-not-tls"
+	}
+
+	noTLS := ";no-tls"
 	if frontendTLS {
 		noTLS = ""
 	}
 
-	args = append(args, fmt.Sprintf("-f127.0.0.1,%v;%v", serverPort, noTLS), b,
+	var proxyProto string
+	if acceptProxyProtocol {
+		proxyProto = ";proxyproto"
+	}
+
+	args = append(args, fmt.Sprintf("-f127.0.0.1,%v%v%v", serverPort, noTLS, proxyProto), b,
 		"--errorlog-file="+logDir+"/log.txt", "-LINFO")
 
 	authority := fmt.Sprintf("127.0.0.1:%v", connectPort)
@@ -183,6 +196,9 @@ func newServerTesterInternal(src_args []string, t *testing.T, handler http.Handl
 		spdyFrCh:     make(chan spdy.Frame),
 		errCh:        make(chan error),
 	}
+
+	st.cmd.Stdout = os.Stdout
+	st.cmd.Stderr = os.Stderr
 
 	if err := st.cmd.Start(); err != nil {
 		st.t.Fatalf("Error starting %v: %v", serverBin, err)
@@ -785,6 +801,7 @@ func cloneHeader(h http.Header) http.Header {
 func noopHandler(w http.ResponseWriter, r *http.Request) {}
 
 type APIResponse struct {
-	Status string `json:"status,omitempty"`
-	Code   int    `json:"code,omitempty"`
+	Status string                 `json:"status,omitempty"`
+	Code   int                    `json:"code,omitempty"`
+	Data   map[string]interface{} `json:"data,omitempty"`
 }

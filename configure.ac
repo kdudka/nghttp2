@@ -25,7 +25,7 @@ dnl Do not change user variables!
 dnl http://www.gnu.org/software/automake/manual/html_node/Flag-Variables-Ordering.html
 
 AC_PREREQ(2.61)
-AC_INIT([nghttp2], [1.18.0-DEV], [t-tujikawa@users.sourceforge.net])
+AC_INIT([nghttp2], [1.20.0-DEV], [t-tujikawa@users.sourceforge.net])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_HEADERS([config.h])
@@ -45,7 +45,7 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 dnl See versioning rule:
 dnl  http://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
 AC_SUBST(LT_CURRENT, 26)
-AC_SUBST(LT_REVISION, 2)
+AC_SUBST(LT_REVISION, 4)
 AC_SUBST(LT_AGE, 12)
 
 major=`echo $PACKAGE_VERSION |cut -d. -f1 | sed -e "s/[^0-9]//g"`
@@ -119,8 +119,13 @@ AC_ARG_WITH([jemalloc],
 
 AC_ARG_WITH([spdylay],
     [AS_HELP_STRING([--with-spdylay],
-                    [Use spdylay [default=check]])],
-    [request_spdylay=$withval], [request_spdylay=check])
+                    [Use spdylay [default=no]])],
+    [request_spdylay=$withval], [request_spdylay=no])
+
+AC_ARG_WITH([systemd],
+    [AS_HELP_STRING([--with-systemd],
+                    [Enable systemd support in nghttpx [default=check]])],
+    [request_systemd=$withval], [request_systemd=check])
 
 AC_ARG_WITH([mruby],
     [AS_HELP_STRING([--with-mruby],
@@ -395,16 +400,32 @@ else
   AC_MSG_NOTICE($JANSSON_PKG_ERRORS)
 fi
 
-# libxml2 (for src/nghttp)
-have_libxml2=no
-if test "x${request_libxml2}" != "xno"; then
-  m4_ifdef([AM_PATH_XML2],
-    [AM_PATH_XML2(2.7.7, [have_libxml2=yes], [have_libxml2=no])],
-    [AC_MSG_WARN([configure was created without libxml2 detection macro; libxml2 detection is disabled])])
 
-  if test "x${have_libxml2}" = "xyes"; then
-    AC_DEFINE([HAVE_LIBXML2], [1], [Define to 1 if you have `libxml2` library.])
+#  libsystemd (for src/nghttpx)
+have_libsystemd=no
+if test "x${request_systemd}" != "xno"; then
+  PKG_CHECK_MODULES([SYSTEMD], [libsystemd >= 209], [have_libsystemd=yes],
+                    [have_libsystemd=no])
+  if test "x${have_libsystemd}" = "xyes"; then
+    AC_DEFINE([HAVE_LIBSYSTEMD], [1],
+              [Define to 1 if you have `libsystemd` library.])
+  else
+    AC_MSG_NOTICE($SYSTEMD_PKG_ERRORS)
   fi
+fi
+
+if test "x${request_systemd}" = "xyes" &&
+   test "x${have_libsystemd}" != "xyes"; then
+  AC_MSG_ERROR([systemd was requested (--with-systemd) but not found])
+fi
+
+# libxml2 (for src/nghttp)
+PKG_CHECK_MODULES([LIBXML2], [libxml-2.0 >= 2.7.7],
+                  [have_libxml2=yes], [have_libxml2=no])
+if test "x${have_libxml2}" = "xyes"; then
+  AC_DEFINE([HAVE_LIBXML2], [1], [Define to 1 if you have `libxml2` library.])
+else
+  AC_MSG_NOTICE($LIBXML2_PKG_ERRORS)
 fi
 
 if test "x${request_libxml2}" = "xyes" &&
@@ -729,13 +750,6 @@ AC_CHECK_DECLS([initgroups], [], [], [[
   #include <grp.h>
 ]])
 
-# Checks for epoll availability, primarily for examples/tiny-nghttpd
-AX_HAVE_EPOLL([have_epoll=yes], [have_epoll=no])
-
-AM_CONDITIONAL([ENABLE_TINY_NGHTTPD],
-               [ test "x${have_epoll}" = "xyes" &&
-                 test "x${have_timerfd_create}" = "xyes"])
-
 save_CFLAGS=$CFLAGS
 save_CXXFLAGS=$CXXFLAGS
 
@@ -916,7 +930,7 @@ AC_MSG_NOTICE([summary of build options:
       Failmalloc:     ${enable_failmalloc}
     Libs:
       OpenSSL:        ${have_openssl} (CFLAGS='${OPENSSL_CFLAGS}' LIBS='${OPENSSL_LIBS}')
-      Libxml2:        ${have_libxml2} (CFLAGS='${XML_CPPFLAGS}' LIBS='${XML_LIBS}')
+      Libxml2:        ${have_libxml2} (CFLAGS='${LIBXML2_CPPFLAGS}' LIBS='${LIBXML2_LIBS}')
       Libev:          ${have_libev} (CFLAGS='${LIBEV_CFLAGS}' LIBS='${LIBEV_LIBS}')
       Libc-ares       ${have_libcares} (CFLAGS='${LIBCARES_CFLAGS}' LIBS='${LIBCARES_LIBS}')
       Libevent(SSL):  ${have_libevent_openssl} (CFLAGS='${LIBEVENT_OPENSSL_CFLAGS}' LIBS='${LIBEVENT_OPENSSL_LIBS}')
@@ -924,6 +938,7 @@ AC_MSG_NOTICE([summary of build options:
       Jansson:        ${have_jansson} (CFLAGS='${JANSSON_CFLAGS}' LIBS='${JANSSON_LIBS}')
       Jemalloc:       ${have_jemalloc} (LIBS='${JEMALLOC_LIBS}')
       Zlib:           ${have_zlib} (CFLAGS='${ZLIB_CFLAGS}' LIBS='${ZLIB_LIBS}')
+      Systemd:        ${have_libsystemd} (CFLAGS='${SYSTEMD_CFLAGS}' LIBS='${SYSTEMD_LIBS}')
       Boost CPPFLAGS: ${BOOST_CPPFLAGS}
       Boost LDFLAGS:  ${BOOST_LDFLAGS}
       Boost::ASIO:    ${BOOST_ASIO_LIB}

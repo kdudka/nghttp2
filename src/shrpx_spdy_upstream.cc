@@ -41,6 +41,7 @@
 #endif // HAVE_MRUBY
 #include "shrpx_worker.h"
 #include "shrpx_http2_session.h"
+#include "shrpx_log.h"
 #include "http2.h"
 #include "util.h"
 #include "template.h"
@@ -105,7 +106,7 @@ ssize_t recv_callback(spdylay_session *session, uint8_t *buf, size_t len,
 
   auto nread = std::min(rb->rleft(), len);
 
-  memcpy(buf, rb->pos, nread);
+  memcpy(buf, rb->pos(), nread);
   rb->drain(nread);
   rlimit->startw();
 
@@ -180,6 +181,10 @@ void on_ctrl_recv_callback(spdylay_session *session, spdylay_frame_type type,
     auto &req = downstream->request();
 
     auto &balloc = downstream->get_block_allocator();
+
+    auto lgconf = log_config();
+    lgconf->update_tstamp(std::chrono::system_clock::now());
+    req.tstamp = lgconf->tstamp;
 
     downstream->reset_upstream_rtimer();
 
@@ -365,7 +370,7 @@ void SpdyUpstream::start_downstream(Downstream *downstream) {
 void SpdyUpstream::initiate_downstream(Downstream *downstream) {
   int rv;
 
-  auto dconn = handler_->get_downstream_connection(downstream);
+  auto dconn = handler_->get_downstream_connection(rv, downstream);
 
   if (!dconn ||
       (rv = downstream->attach_downstream_connection(std::move(dconn))) != 0) {
@@ -743,7 +748,7 @@ int SpdyUpstream::downstream_write(DownstreamConnection *dconn) {
     return downstream_error(dconn, Downstream::EVENT_ERROR);
   }
   if (rv != 0) {
-    return -1;
+    return rv;
   }
   return 0;
 }
@@ -976,6 +981,10 @@ int SpdyUpstream::send_reply(Downstream *downstream, const uint8_t *body,
 
   downstream->set_response_state(Downstream::MSG_COMPLETE);
 
+  if (data_prd_ptr) {
+    downstream->reset_upstream_wtimer();
+  }
+
   return 0;
 }
 
@@ -1006,7 +1015,7 @@ int SpdyUpstream::error_reply(Downstream *downstream,
                       "content-type",   "text/html; charset=UTF-8",
                       "server",         get_config()->http.server_name.c_str(),
                       "content-length", content_length.c_str(),
-                      "date",           lgconf->time_http.c_str(),
+                      "date",           lgconf->tstamp->time_http.c_str(),
                       nullptr};
 
   rv = spdylay_submit_response(session_, downstream->get_stream_id(), nv,
@@ -1016,6 +1025,8 @@ int SpdyUpstream::error_reply(Downstream *downstream,
                       << spdylay_strerror(rv);
     return -1;
   }
+
+  downstream->reset_upstream_wtimer();
 
   return 0;
 }
@@ -1185,6 +1196,8 @@ int SpdyUpstream::on_downstream_header_complete(Downstream *downstream) {
     return -1;
   }
 
+  downstream->reset_upstream_wtimer();
+
   return 0;
 }
 
@@ -1260,6 +1273,13 @@ int SpdyUpstream::on_downstream_abort_request(Downstream *downstream,
   return 0;
 }
 
+int SpdyUpstream::on_downstream_abort_request_with_https_redirect(
+    Downstream *downstream) {
+  // This should not be called since SPDY is only available with TLS.
+  assert(0);
+  return 0;
+}
+
 int SpdyUpstream::consume(int32_t stream_id, size_t len) {
   int rv;
 
@@ -1285,6 +1305,8 @@ int SpdyUpstream::on_timeout(Downstream *downstream) {
   }
 
   rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
+
+  handler_->signal_write();
 
   return 0;
 }
@@ -1314,6 +1336,11 @@ int SpdyUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   }
 
   if (!downstream->request_submission_ready()) {
+    if (downstream->get_response_state() == Downstream::MSG_COMPLETE) {
+      // We have got all response body already.  Send it off.
+      downstream->pop_downstream_connection();
+      return 0;
+    }
     rst_stream(downstream, SPDYLAY_INTERNAL_ERROR);
     downstream->pop_downstream_connection();
 
@@ -1335,7 +1362,7 @@ int SpdyUpstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   // downstream connection is clean; we can retry with new
   // downstream connection.
 
-  dconn = handler_->get_downstream_connection(downstream);
+  dconn = handler_->get_downstream_connection(rv, downstream);
   if (!dconn) {
     goto fail;
   }

@@ -38,6 +38,7 @@
 #include <nghttp2/nghttp2.h>
 
 #include "shrpx_io_control.h"
+#include "shrpx_log_config.h"
 #include "http2.h"
 #include "memchunk.h"
 #include "allocator.h"
@@ -152,6 +153,8 @@ struct Request {
   }
 
   FieldStore fs;
+  // Timestamp when all request header fields are received.
+  std::shared_ptr<Timestamp> tstamp;
   // Request scheme.  For HTTP/2, this is :scheme header field value.
   // For HTTP/1.1, this is deduced from URI or connection.
   StringRef scheme;
@@ -312,6 +315,7 @@ public:
   void set_request_pending(bool f);
   bool get_request_pending() const;
   void set_request_header_sent(bool f);
+  bool get_request_header_sent() const;
   // Returns true if request is ready to be submitted to downstream.
   // When sending pending request, get_request_pending() should be
   // checked too because this function may return true when
@@ -403,6 +407,8 @@ public:
 
   const DownstreamAddr *get_addr() const;
 
+  void set_accesslog_written(bool f);
+
   enum {
     EVENT_ERROR = 0x1,
     EVENT_TIMEOUT = 0x2,
@@ -486,6 +492,8 @@ private:
   bool request_pending_;
   // true if downstream request header is considered to be sent.
   bool request_header_sent_;
+  // true if access.log has been written.
+  bool accesslog_written_;
 };
 
 } // namespace shrpx

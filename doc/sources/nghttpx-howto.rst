@@ -229,12 +229,18 @@ Hot swapping
 nghttpx supports hot swapping using signals.  The hot swapping in
 nghttpx is multi step process.  First send USR2 signal to nghttpx
 process.  It will do fork and execute new executable, using same
-command-line arguments and environment variables.  At this point, both
-current and new processes can accept requests.  To gracefully shutdown
-current process, send QUIT signal to current nghttpx process.  When
-all existing frontend connections are done, the current process will
-exit.  At this point, only new nghttpx process exists and serves
-incoming requests.
+command-line arguments and environment variables.
+
+As of nghttpx version 1.20.0, that is all you have to do.  The new
+master process sends QUIT signal to the original process, when it is
+ready to serve requests, to shut it down gracefully.
+
+For earlier versions of nghttpx, you have to do one more thing.  At
+this point, both current and new processes can accept requests.  To
+gracefully shutdown current process, send QUIT signal to current
+nghttpx process.  When all existing frontend connections are done, the
+current process will exit.  At this point, only new nghttpx process
+exists and serves incoming requests.
 
 If you want to just reload configuration file without executing new
 binary, send SIGHUP to nghttpx master process.
@@ -343,10 +349,9 @@ requests, do this:
    backend=serv1,3000;/;proto=h2
    backend=serv1,3000;/ws/;proto=http/1.1
 
-Note that the backends share the same pattern must have the same
-backend protocol.  The default backend protocol is HTTP/1.1.
+The default backend protocol is HTTP/1.1.
 
-TLS can be enabed per pattern basis:
+TLS can be enabled per pattern basis:
 
 .. code-block:: text
 
@@ -355,6 +360,96 @@ TLS can be enabed per pattern basis:
 
 In the above case, connection to serv1 will be encrypted by TLS.  On
 the other hand, connection to serv2 will not be encrypted by TLS.
+
+Dynamic hostname lookup
+-----------------------
+
+By default, nghttpx performs backend hostname lookup at start up, or
+configuration reload, and keeps using them in its entire session.  To
+make nghttpx perform hostname lookup dynamically, use ``dns``
+parameter in :option:`--backend` option, like so:
+
+.. code-block:: text
+
+   backend=foo.example.com;;dns
+
+nghttpx will cache resolved addresses for certain period of time.  To
+change this cache period, use :option:`--dns-cache-timeout`.
+
+Enable PROXY protocol
+---------------------
+
+PROXY protocol can be enabled per frontend.  In order to enable PROXY
+protocol, use ``proxyproto`` parameter in :option:`--frontend` option,
+like so:
+
+.. code-block:: text
+
+   frontend=*,443;proxyproto
+
+PSK cipher suites
+-----------------
+
+nghttpx supports pre-shared key (PSK) cipher suites for both frontend
+and backend TLS connections.  For frontend connection, use
+:option:`--psk-secrets` option to specify a file which contains PSK
+identity and secrets.  The format of the file is
+``<identity>:<hex-secret>``, where ``<identity>`` is PSK identity, and
+``<hex-secret>`` is PSK secret in hex, like so:
+
+.. code-block:: text
+
+   client1:9567800e065e078085c241d54a01c6c3f24b3bab71a606600f4c6ad2c134f3b9
+   client2:b1376c3f8f6dcf7c886c5bdcceecd1e6f1d708622b6ddd21bda26ebd0c0bca99
+
+nghttpx server accepts any of the identity and secret pairs in the
+file.  The default cipher suite list does not contain PSK cipher
+suites.  In order to use PSK, PSK cipher suite must be enabled by
+using :option:`--ciphers` option.  The desired PSK cipher suite may be
+listed in `HTTP/2 cipher black list
+<https://tools.ietf.org/html/rfc7540#appendix-A>`_.  In order to use
+such PSK cipher suite with HTTP/2, disable HTTP/2 cipher black list by
+using :option:`--no-http2-cipher-black-list` option.  But you should
+understand its implications.
+
+At the time of writing, even if only PSK cipher suites are specified
+in :option:`--ciphers` option, certificate and private key are still
+required.
+
+For backend connection, use :option:`--client-psk-secrets` option to
+specify a file which contains single PSK identity and secret.  The
+format is the same as the file used by :option:`--psk-secrets`
+described above, but only first identity and secret pair is solely
+used, like so:
+
+.. code-block:: text
+
+   client2:b1376c3f8f6dcf7c886c5bdcceecd1e6f1d708622b6ddd21bda26ebd0c0bca99
+
+The default cipher suite list does not contain PSK cipher suites.  In
+order to use PSK, PSK cipher suite must be enabled by using
+:option:`--client-ciphers` option.  The desired PSK cipher suite may
+be listed in `HTTP/2 cipher black list
+<https://tools.ietf.org/html/rfc7540#appendix-A>`_.  In order to use
+such PSK cipher suite with HTTP/2, disable HTTP/2 cipher black list by
+using :option:`--client-no-http2-cipher-black-list` option.  But you
+should understand its implications.
+
+Migration from nghttpx v1.18.x or earlier
+-----------------------------------------
+
+As of nghttpx v1.19.0, :option:`--ciphers` option only changes cipher
+list for frontend TLS connection.  In order to change cipher list for
+backend connection, use :option:`--client-ciphers` option.
+
+Similarly, :option:`--no-http2-cipher-black-list` option only disables
+HTTP/2 cipher black list for frontend connection.  In order to disable
+HTTP/2 cipher black list for backend connection, use
+:option:`--client-no-http2-cipher-black-list` option.
+
+``--accept-proxy-protocol`` option was deprecated.  Instead, use
+``proxyproto`` parameter in :option:`--frontend` option to enable
+PROXY protocol support per frontend.
 
 Migration from nghttpx v1.8.0 or earlier
 ----------------------------------------

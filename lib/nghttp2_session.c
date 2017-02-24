@@ -494,6 +494,11 @@ static int session_new(nghttp2_session **session_ptr,
     if (option->opt_set_mask & NGHTTP2_OPT_MAX_DEFLATE_DYNAMIC_TABLE_SIZE) {
       max_deflate_dynamic_table_size = option->max_deflate_dynamic_table_size;
     }
+
+    if ((option->opt_set_mask & NGHTTP2_OPT_NO_CLOSED_STREAMS) &&
+        option->no_closed_streams) {
+      (*session_ptr)->opt_flags |= NGHTTP2_OPTMASK_NO_CLOSED_STREAMS;
+    }
   }
 
   rv = nghttp2_hd_deflate_init2(&(*session_ptr)->hd_deflater,
@@ -1051,17 +1056,24 @@ nghttp2_stream *nghttp2_session_open_stream(nghttp2_session *session,
     flags |= NGHTTP2_STREAM_FLAG_PUSH;
   }
 
-  nghttp2_stream_init(stream, stream_id, flags, initial_state, pri_spec->weight,
-                      (int32_t)session->remote_settings.initial_window_size,
-                      (int32_t)session->local_settings.initial_window_size,
-                      stream_user_data, mem);
-
   if (stream_alloc) {
+    nghttp2_stream_init(stream, stream_id, flags, initial_state,
+                        pri_spec->weight,
+                        (int32_t)session->remote_settings.initial_window_size,
+                        (int32_t)session->local_settings.initial_window_size,
+                        stream_user_data, mem);
+
     rv = nghttp2_map_insert(&session->streams, &stream->map_entry);
     if (rv != 0) {
+      nghttp2_stream_free(stream);
       nghttp2_mem_free(mem, stream);
       return NULL;
     }
+  } else {
+    stream->flags = flags;
+    stream->state = initial_state;
+    stream->weight = pri_spec->weight;
+    stream->stream_user_data = stream_user_data;
   }
 
   switch (initial_state) {
@@ -1179,7 +1191,8 @@ int nghttp2_session_close_stream(nghttp2_session *session, int32_t stream_id,
   /* Closes both directions just in case they are not closed yet */
   stream->flags |= NGHTTP2_STREAM_FLAG_CLOSED;
 
-  if (session->server && !is_my_stream_id &&
+  if ((session->opt_flags & NGHTTP2_OPTMASK_NO_CLOSED_STREAMS) == 0 &&
+      session->server && !is_my_stream_id &&
       nghttp2_stream_in_dep_tree(stream)) {
     /* On server side, retain stream at most MAX_CONCURRENT_STREAMS
        combined with the current active incoming streams to make
@@ -7023,7 +7036,7 @@ int nghttp2_session_resume_data(nghttp2_session *session, int32_t stream_id) {
     return rv;
   }
 
-  return rv;
+  return 0;
 }
 
 size_t nghttp2_session_get_outbound_queue_size(nghttp2_session *session) {

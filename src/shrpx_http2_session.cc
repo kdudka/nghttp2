@@ -43,6 +43,7 @@
 #include "shrpx_http.h"
 #include "shrpx_worker.h"
 #include "shrpx_connect_blocker.h"
+#include "shrpx_log.h"
 #include "http2.h"
 #include "util.h"
 #include "base64.h"
@@ -638,7 +639,7 @@ int htp_hdrs_completecb(http_parser *htp) {
 } // namespace
 
 namespace {
-http_parser_settings htp_hooks = {
+constexpr http_parser_settings htp_hooks = {
     nullptr,             // http_cb      on_message_begin;
     nullptr,             // http_data_cb on_url;
     nullptr,             // http_data_cb on_status;
@@ -1090,10 +1091,14 @@ int on_response_headers(Http2Session *http2session, Downstream *downstream,
   int rv;
 
   auto upstream = downstream->get_upstream();
+  auto handler = upstream->get_client_handler();
   const auto &req = downstream->request();
   auto &resp = downstream->response();
 
   auto &nva = resp.fs.headers();
+
+  auto config = get_config();
+  auto &loggingconf = config->logging;
 
   downstream->set_expect_final_response(false);
 
@@ -1147,7 +1152,7 @@ int on_response_headers(Http2Session *http2session, Downstream *downstream,
     // On upgrade sucess, both ends can send data
     if (upstream->resume_read(SHRPX_NO_BUFFER, downstream, 0) != 0) {
       // If resume_read fails, just drop connection. Not ideal.
-      delete upstream->get_client_handler();
+      delete handler;
       return -1;
     }
     downstream->set_request_state(Downstream::HEADER_COMPLETE);
@@ -1182,6 +1187,11 @@ int on_response_headers(Http2Session *http2session, Downstream *downstream,
 
   if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
     resp.headers_only = true;
+  }
+
+  if (loggingconf.access.write_early && downstream->accesslog_ready()) {
+    handler->write_accesslog(downstream);
+    downstream->set_accesslog_written(true);
   }
 
   rv = upstream->on_downstream_header_complete(downstream);
@@ -1562,7 +1572,11 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
 
   wb->append(PADDING.data(), padlen);
 
-  downstream->reset_downstream_wtimer();
+  if (input->rleft() == 0) {
+    downstream->disable_downstream_wtimer();
+  } else {
+    downstream->reset_downstream_wtimer();
+  }
 
   if (length > 0) {
     // This is important because it will handle flow control
@@ -1702,24 +1716,9 @@ int Http2Session::connection_made() {
     return -1;
   }
 
-  auto must_terminate =
-      addr_->tls && !nghttp2::ssl::check_http2_requirement(conn_.tls.ssl);
-
   reset_connection_check_timer(CONNCHK_TIMEOUT);
 
-  if (must_terminate) {
-    if (LOG_ENABLED(INFO)) {
-      LOG(INFO) << "TLSv1.2 was not negotiated. HTTP/2 must not be negotiated.";
-    }
-
-    rv = terminate_session(NGHTTP2_INADEQUATE_SECURITY);
-
-    if (rv != 0) {
-      return -1;
-    }
-  } else {
-    submit_pending_requests();
-  }
+  submit_pending_requests();
 
   signal_write();
   return 0;
@@ -2022,7 +2021,12 @@ int Http2Session::write_clear() {
       }
 
       if (nwrite < 0) {
-        return nwrite;
+        // We may have pending data in receive buffer which may
+        // contain part of response body.  So keep reading.  Invoke
+        // read event to get read(2) error just in case.
+        ev_feed_event(conn_.loop, &conn_.rev, EV_READ);
+        write_ = &Http2Session::write_void;
+        break;
       }
 
       wb_.drain(nwrite);
@@ -2132,7 +2136,12 @@ int Http2Session::write_tls() {
       }
 
       if (nwrite < 0) {
-        return nwrite;
+        // We may have pending data in receive buffer which may
+        // contain part of response body.  So keep reading.  Invoke
+        // read event to get read(2) error just in case.
+        ev_feed_event(conn_.loop, &conn_.rev, EV_READ);
+        write_ = &Http2Session::write_void;
+        break;
       }
 
       wb_.drain(nwrite);
@@ -2152,6 +2161,11 @@ int Http2Session::write_tls() {
   conn_.wlimit.stopw();
   ev_timer_stop(conn_.loop, &conn_.wt);
 
+  return 0;
+}
+
+int Http2Session::write_void() {
+  conn_.wlimit.stopw();
   return 0;
 }
 

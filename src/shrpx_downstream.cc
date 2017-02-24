@@ -36,6 +36,7 @@
 #include "shrpx_downstream_queue.h"
 #include "shrpx_worker.h"
 #include "shrpx_http2_session.h"
+#include "shrpx_log.h"
 #ifdef HAVE_MRUBY
 #include "shrpx_mruby.h"
 #endif // HAVE_MRUBY
@@ -138,7 +139,8 @@ Downstream::Downstream(Upstream *upstream, MemchunkPool *mcpool,
       chunked_response_(false),
       expect_final_response_(false),
       request_pending_(false),
-      request_header_sent_(false) {
+      request_header_sent_(false),
+      accesslog_written_(false) {
 
   auto &timeoutconf = get_config()->http2.timeout;
 
@@ -906,7 +908,9 @@ void Downstream::disable_downstream_wtimer() {
   disable_timer(loop, &downstream_wtimer_);
 }
 
-bool Downstream::accesslog_ready() const { return resp_.http_status > 0; }
+bool Downstream::accesslog_ready() const {
+  return !accesslog_written_ && resp_.http_status > 0;
+}
 
 void Downstream::add_retry() { ++num_retry_; }
 
@@ -921,6 +925,10 @@ void Downstream::set_request_pending(bool f) { request_pending_ = f; }
 bool Downstream::get_request_pending() const { return request_pending_; }
 
 void Downstream::set_request_header_sent(bool f) { request_header_sent_ = f; }
+
+bool Downstream::get_request_header_sent() const {
+  return request_header_sent_;
+}
 
 bool Downstream::request_submission_ready() const {
   return (request_state_ == Downstream::HEADER_COMPLETE ||
@@ -980,5 +988,7 @@ void Downstream::set_downstream_addr_group(
 void Downstream::set_addr(const DownstreamAddr *addr) { addr_ = addr; }
 
 const DownstreamAddr *Downstream::get_addr() const { return addr_; }
+
+void Downstream::set_accesslog_written(bool f) { accesslog_written_ = f; }
 
 } // namespace shrpx

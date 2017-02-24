@@ -22,23 +22,21 @@ unpacked:
 .. code-block:: text
 
     $ build/tools/make_standalone_toolchain.py \
-      --arch arm --api 16 --stl gnustl
+      --arch arm --api 16 --stl gnustl \
       --install-dir $ANDROID_HOME/toolchain
 
 The API level (``--api``) is not important here because we don't use
 Android specific C/C++ API.
 
-The dependent libraries, such as OpenSSL and libev should be built
-with the toolchain and installed under ``$ANDROID_HOME/usr/local``.
-We recommend to build these libraries as static library to make the
-deployment easier.  libxml2 support is currently disabled.
+The dependent libraries, such as OpenSSL, libev, and c-ares should be
+built with the toolchain and installed under
+``$ANDROID_HOME/usr/local``.  We recommend to build these libraries as
+static library to make the deployment easier.  libxml2 support is
+currently disabled.
 
 Although zlib comes with Android NDK, it seems not to be a part of
 public API, so we have to built it for our own.  That also provides us
 proper .pc file as a bonus.
-
-If SPDY support is required for nghttpx and h2load, build and install
-spdylay as well.
 
 Before running ``android-config`` and ``android-make``,
 ``ANDROID_HOME`` environment variable must be set to point to the
@@ -96,6 +94,26 @@ patch, to configure libev, use the following script:
 
 And run ``make install`` to build and install.
 
+To configure c-ares, use the following script:
+
+.. code-block:: sh
+
+    #!/bin/sh -e
+
+    if [ -z "$ANDROID_HOME" ]; then
+        echo 'No $ANDROID_HOME specified.'
+        exit 1
+    fi
+    PREFIX=$ANDROID_HOME/usr/local
+    TOOLCHAIN=$ANDROID_HOME/toolchain
+    PATH=$TOOLCHAIN/bin:$PATH
+
+    ./configure \
+        --host=arm-linux-androideabi \
+        --build=`dpkg-architecture -qDEB_BUILD_GNU_TYPE` \
+        --prefix=$PREFIX \
+        --disable-shared
+
 To configure zlib, use the following script:
 
 .. code-block:: sh
@@ -122,34 +140,6 @@ To configure zlib, use the following script:
         --libdir=$PREFIX/lib \
         --includedir=$PREFIX/include \
         --static
-
-And run ``make install`` to build and install.
-
-To configure spdylay, use the following script:
-
-.. code-block:: sh
-
-    #!/bin/sh -e
-
-    if [ -z "$ANDROID_HOME" ]; then
-        echo 'No $ANDROID_HOME specified.'
-        exit 1
-    fi
-    PREFIX=$ANDROID_HOME/usr/local
-    TOOLCHAIN=$ANDROID_HOME/toolchain
-    PATH=$TOOLCHAIN/bin:$PATH
-
-    ./configure \
-        --disable-shared \
-        --host=arm-linux-androideabi \
-        --build=`dpkg-architecture -qDEB_BUILD_GNU_TYPE` \
-        --prefix=$PREFIX \
-        --without-libxml2 \
-        --disable-src \
-        --disable-examples \
-        CPPFLAGS="-I$PREFIX/include" \
-        PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-        LDFLAGS="-L$PREFIX/lib"
 
 And run ``make install`` to build and install.
 

@@ -23,14 +23,38 @@
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "shrpx_log_config.h"
+
+#include <unistd.h>
+
+#include <thread>
+#include <sstream>
+
 #include "util.h"
 
 using namespace nghttp2;
 
 namespace shrpx {
 
+Timestamp::Timestamp(const std::chrono::system_clock::time_point &tp) {
+  time_local = util::format_common_log(time_local_buf.data(), tp);
+  time_iso8601 = util::format_iso8601(time_iso8601_buf.data(), tp);
+  time_http = util::format_http_date(time_http_buf.data(), tp);
+}
+
 LogConfig::LogConfig()
-    : accesslog_fd(-1), errorlog_fd(-1), errorlog_tty(false) {}
+    : time_str_updated(std::chrono::system_clock::now()),
+      tstamp(std::make_shared<Timestamp>(time_str_updated)),
+      pid(getpid()),
+      accesslog_fd(-1),
+      errorlog_fd(-1),
+      errorlog_tty(false) {
+  auto tid = std::this_thread::get_id();
+  auto tid_hash =
+      util::hash32(StringRef{reinterpret_cast<uint8_t *>(&tid),
+                             reinterpret_cast<uint8_t *>(&tid) + sizeof(tid)});
+  thread_id = util::format_hex(reinterpret_cast<uint8_t *>(&tid_hash),
+                               sizeof(tid_hash));
+}
 
 #ifndef NOTHREADS
 #ifdef HAVE_THREAD_LOCAL
@@ -72,19 +96,32 @@ LogConfig *log_config() { return config.get(); }
 void delete_log_config() {}
 #endif // NOTHREADS
 
-void LogConfig::update_tstamp(
+void LogConfig::update_tstamp_millis(
     const std::chrono::system_clock::time_point &now) {
-  auto t0 = std::chrono::system_clock::to_time_t(time_str_updated_);
-  auto t1 = std::chrono::system_clock::to_time_t(now);
-  if (t0 == t1) {
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(
+          now.time_since_epoch()) ==
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          time_str_updated.time_since_epoch())) {
     return;
   }
 
-  time_str_updated_ = now;
+  time_str_updated = now;
 
-  time_local = util::format_common_log(time_local_buf.data(), now);
-  time_iso8601 = util::format_iso8601(time_iso8601_buf.data(), now);
-  time_http = util::format_http_date(time_http_buf.data(), now);
+  tstamp = std::make_shared<Timestamp>(now);
+}
+
+void LogConfig::update_tstamp(
+    const std::chrono::system_clock::time_point &now) {
+  if (std::chrono::duration_cast<std::chrono::seconds>(
+          now.time_since_epoch()) ==
+      std::chrono::duration_cast<std::chrono::seconds>(
+          time_str_updated.time_since_epoch())) {
+    return;
+  }
+
+  time_str_updated = now;
+
+  tstamp = std::make_shared<Timestamp>(now);
 }
 
 } // namespace shrpx

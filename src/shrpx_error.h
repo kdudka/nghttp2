@@ -37,6 +37,8 @@ enum ErrorCode {
   SHRPX_ERR_EOF = -101,
   SHRPX_ERR_INPROGRESS = -102,
   SHRPX_ERR_DCONN_CANCELED = -103,
+  SHRPX_ERR_RETRY = -104,
+  SHRPX_ERR_TLS_REQUIRED = -105,
 };
 
 } // namespace shrpx
