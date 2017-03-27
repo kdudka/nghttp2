@@ -715,6 +715,13 @@ int create_tcp_server_socket(UpstreamAddr &faddr,
 
   addrinfo *res, *rp;
   rv = getaddrinfo(node, service.c_str(), &hints, &res);
+#ifdef AI_ADDRCONFIG
+  if (rv != 0) {
+    // Retry without AI_ADDRCONFIG
+    hints.ai_flags &= ~AI_ADDRCONFIG;
+    rv = getaddrinfo(node, service.c_str(), &hints, &res);
+  }
+#endif // AI_ADDRCONFIG
   if (rv != 0) {
     LOG(FATAL) << "Unable to get IPv" << (faddr.family == AF_INET ? "4" : "6")
                << " address for " << faddr.host << ", port " << faddr.port
@@ -1437,11 +1444,11 @@ void fill_default_config(Config *config) {
       ssl::proto_version_from_string(DEFAULT_TLS_MIN_PROTO_VERSION);
   tlsconf.max_proto_version =
       ssl::proto_version_from_string(DEFAULT_TLS_MAX_PROTO_VERSION);
-#if OPENSSL_1_1_API
+#if OPENSSL_1_1_API || defined(OPENSSL_IS_BORINGSSL)
   tlsconf.ecdh_curves = StringRef::from_lit("X25519:P-256:P-384:P-521");
-#else  // !OPENSSL_1_1_API
+#else  // !OPENSSL_1_1_API && !defined(OPENSSL_IS_BORINGSSL)
   tlsconf.ecdh_curves = StringRef::from_lit("P-256:P-384:P-521");
-#endif // !OPENSSL_1_1_API
+#endif // !OPENSSL_1_1_API && !defined(OPENSSL_IS_BORINGSSL)
 
   auto &httpconf = config->http;
   httpconf.server_name = StringRef::from_lit("nghttpx");
@@ -1589,7 +1596,7 @@ void fill_default_config(Config *config) {
 
 namespace {
 void print_version(std::ostream &out) {
-  out << get_config()->http.server_name.c_str() << std::endl;
+  out << "nghttpx nghttp2/" NGHTTP2_VERSION << std::endl;
 }
 } // namespace
 
