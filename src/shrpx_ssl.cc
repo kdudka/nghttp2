@@ -755,7 +755,6 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
     BIO_free(bio);
   }
 
-  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
   SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
   if (!tlsconf.private_key_passwd.empty()) {
     SSL_CTX_set_default_passwd_cb(ssl_ctx, ssl_pem_passwd_cb);
@@ -947,7 +946,6 @@ SSL_CTX *create_ssl_client_context(
     DIE();
   }
 
-  SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
   SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
 
   if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
@@ -962,6 +960,10 @@ SSL_CTX *create_ssl_client_context(
                  << ": " << ERR_error_string(ERR_get_error(), nullptr);
       DIE();
     }
+  }
+
+  if (!tlsconf.insecure) {
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
   }
 
   if (!cert_file.empty()) {
@@ -1286,12 +1288,6 @@ int check_cert(SSL *ssl, const Address *addr, const StringRef &host) {
     return 0;
   }
   auto cert_deleter = defer(X509_free, cert);
-  auto verify_res = SSL_get_verify_result(ssl);
-  if (verify_res != X509_V_OK) {
-    LOG(ERROR) << "Certificate verification failed: "
-               << X509_verify_cert_error_string(verify_res);
-    return -1;
-  }
 
   if (verify_hostname(cert, host, addr) != 0) {
     LOG(ERROR) << "Certificate verification failed: hostname does not match";
