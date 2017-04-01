@@ -22,7 +22,7 @@
  * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-#include "shrpx_ssl.h"
+#include "shrpx_tls.h"
 
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
@@ -62,7 +62,7 @@
 #include "shrpx_memcached_dispatcher.h"
 #include "shrpx_connection_handler.h"
 #include "util.h"
-#include "ssl.h"
+#include "tls.h"
 #include "template.h"
 #include "ssl_compat.h"
 
@@ -70,7 +70,7 @@ using namespace nghttp2;
 
 namespace shrpx {
 
-namespace ssl {
+namespace tls {
 
 #if !OPENSSL_1_1_API
 namespace {
@@ -687,7 +687,7 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
 
   SSL_CTX_set_options(ssl_ctx, ssl_opts | tlsconf.tls_proto_mask);
 
-  if (nghttp2::ssl::ssl_ctx_set_proto_versions(
+  if (nghttp2::tls::ssl_ctx_set_proto_versions(
           ssl_ctx, tlsconf.min_proto_version, tlsconf.max_proto_version) != 0) {
     LOG(FATAL) << "Could not set TLS protocol version";
     DIE();
@@ -934,7 +934,7 @@ SSL_CTX *create_ssl_client_context(
                                               SSL_SESS_CACHE_NO_INTERNAL_STORE);
   SSL_CTX_sess_set_new_cb(ssl_ctx, tls_session_client_new_cb);
 
-  if (nghttp2::ssl::ssl_ctx_set_proto_versions(
+  if (nghttp2::tls::ssl_ctx_set_proto_versions(
           ssl_ctx, tlsconf.min_proto_version, tlsconf.max_proto_version) != 0) {
     LOG(FATAL) << "Could not set TLS protocol version";
     DIE();
@@ -1596,14 +1596,13 @@ setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
 
   auto &tlsconf = config->tls;
 
-  auto ssl_ctx =
-      ssl::create_ssl_context(tlsconf.private_key_file.c_str(),
-                              tlsconf.cert_file.c_str(), tlsconf.sct_data
+  auto ssl_ctx = create_ssl_context(tlsconf.private_key_file.c_str(),
+                                    tlsconf.cert_file.c_str(), tlsconf.sct_data
 #ifdef HAVE_NEVERBLEED
-                              ,
-                              nb
+                                    ,
+                                    nb
 #endif // HAVE_NEVERBLEED
-                              );
+                                    );
 
   all_ssl_ctx.push_back(ssl_ctx);
 
@@ -1617,24 +1616,23 @@ setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
     return ssl_ctx;
   }
 
-  if (ssl::cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx, ssl_ctx) ==
-      -1) {
+  if (cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx, ssl_ctx) == -1) {
     LOG(FATAL) << "Failed to add default certificate.";
     DIE();
   }
 
   for (auto &c : tlsconf.subcerts) {
-    auto ssl_ctx = ssl::create_ssl_context(c.private_key_file.c_str(),
-                                           c.cert_file.c_str(), c.sct_data
+    auto ssl_ctx = create_ssl_context(c.private_key_file.c_str(),
+                                      c.cert_file.c_str(), c.sct_data
 #ifdef HAVE_NEVERBLEED
-                                           ,
-                                           nb
+                                      ,
+                                      nb
 #endif // HAVE_NEVERBLEED
-                                           );
+                                      );
     all_ssl_ctx.push_back(ssl_ctx);
 
-    if (ssl::cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx,
-                                          ssl_ctx) == -1) {
+    if (cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx, ssl_ctx) ==
+        -1) {
       LOG(FATAL) << "Failed to add sub certificate.";
       DIE();
     }
@@ -1650,7 +1648,7 @@ SSL_CTX *setup_downstream_client_ssl_context(
     ) {
   auto &tlsconf = get_config()->tls;
 
-  return ssl::create_ssl_client_context(
+  return create_ssl_client_context(
 #ifdef HAVE_NEVERBLEED
       nb,
 #endif // HAVE_NEVERBLEED
@@ -1737,6 +1735,6 @@ int proto_version_from_string(const StringRef &v) {
   return -1;
 }
 
-} // namespace ssl
+} // namespace tls
 
 } // namespace shrpx

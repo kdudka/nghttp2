@@ -42,7 +42,7 @@
 #include "shrpx_config.h"
 #include "shrpx_http_downstream_connection.h"
 #include "shrpx_http2_downstream_connection.h"
-#include "shrpx_ssl.h"
+#include "shrpx_tls.h"
 #include "shrpx_worker.h"
 #include "shrpx_downstream_connection_pool.h"
 #include "shrpx_downstream.h"
@@ -56,7 +56,7 @@
 #endif // HAVE_SPDYLAY
 #include "util.h"
 #include "template.h"
-#include "ssl.h"
+#include "tls.h"
 
 using namespace nghttp2;
 
@@ -576,7 +576,7 @@ int ClientHandler::validate_next_proto() {
     CLOG(INFO, this) << "The negotiated next protocol: " << proto;
   }
 
-  if (!ssl::in_proto_list(get_config()->tls.npn_list, proto)) {
+  if (!tls::in_proto_list(get_config()->tls.npn_list, proto)) {
     if (LOG_ENABLED(INFO)) {
       CLOG(INFO, this) << "The negotiated protocol is not supported: " << proto;
     }
@@ -1202,7 +1202,7 @@ void ClientHandler::start_immediate_shutdown() {
 }
 
 void ClientHandler::write_accesslog(Downstream *downstream) {
-  nghttp2::ssl::TLSSessionInfo tls_info;
+  nghttp2::tls::TLSSessionInfo tls_info;
   auto &req = downstream->request();
 
   auto config = get_config();
@@ -1217,7 +1217,7 @@ void ClientHandler::write_accesslog(Downstream *downstream) {
       config->logging.access.format,
       LogSpec{
           downstream, ipaddr_, alpn_,
-          nghttp2::ssl::get_tls_session_info(&tls_info, conn_.tls.ssl),
+          nghttp2::tls::get_tls_session_info(&tls_info, conn_.tls.ssl),
           std::chrono::high_resolution_clock::now(), // request_end_time
           port_, faddr_->port, config->pid,
       });
