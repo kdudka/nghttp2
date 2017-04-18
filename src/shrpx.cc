@@ -1205,12 +1205,16 @@ pid_t fork_worker_process(int &main_ipc_fd,
     return -1;
   }
 
-  auto pid = fork();
+  auto config = get_config();
+
+  pid_t pid = 0;
+
+  if (!config->single_process) {
+    pid = fork();
+  }
 
   if (pid == 0) {
     ev_loop_fork(EV_DEFAULT);
-
-    auto config = get_config();
 
     for (auto &addr : config->conn.listener.addrs) {
       util::make_socket_closeonexec(addr.fd);
@@ -1230,22 +1234,37 @@ pid_t fork_worker_process(int &main_ipc_fd,
       LOG(FATAL) << "Unblocking all signals failed: "
                  << xsi_strerror(error, errbuf.data(), errbuf.size());
 
-      nghttp2_Exit(EXIT_FAILURE);
+      if (config->single_process) {
+        exit(EXIT_FAILURE);
+      } else {
+        nghttp2_Exit(EXIT_FAILURE);
+      }
     }
 
-    close(ipc_fd[1]);
+    if (!config->single_process) {
+      close(ipc_fd[1]);
+    }
+
     WorkerProcessConfig wpconf{ipc_fd[0]};
     rv = worker_process_event_loop(&wpconf);
     if (rv != 0) {
       LOG(FATAL) << "Worker process returned error";
 
-      nghttp2_Exit(EXIT_FAILURE);
+      if (config->single_process) {
+        exit(EXIT_FAILURE);
+      } else {
+        nghttp2_Exit(EXIT_FAILURE);
+      }
     }
 
     LOG(NOTICE) << "Worker process shutting down momentarily";
 
     // call exit(...) instead of nghttp2_Exit to get leak sanitizer report
-    nghttp2_Exit(EXIT_SUCCESS);
+    if (config->single_process) {
+      exit(EXIT_SUCCESS);
+    } else {
+      nghttp2_Exit(EXIT_SUCCESS);
+    }
   }
 
   // parent process
@@ -1322,7 +1341,7 @@ int event_loop() {
 
   auto loop = ev_default_loop(config->ev_loop_flags);
 
-  int ipc_fd;
+  int ipc_fd = 0;
 
   auto pid = fork_worker_process(ipc_fd, {});
 
@@ -1459,6 +1478,8 @@ void fill_default_config(Config *config) {
   httpconf.max_response_header_fields = 500;
   httpconf.redirect_https_port = StringRef::from_lit("443");
   httpconf.max_requests = std::numeric_limits<size_t>::max();
+  httpconf.xfp.add = true;
+  httpconf.xfp.strip_incoming = true;
 
   auto &http2conf = config->http2;
   {
@@ -2426,10 +2447,10 @@ Logging:
               * $alpn: ALPN identifier of the protocol which generates
                 the response.   For HTTP/1,  ALPN is  always http/1.1,
                 regardless of minor version.
-              * $ssl_cipher: cipher used for SSL/TLS connection.
-              * $ssl_protocol: protocol for SSL/TLS connection.
-              * $ssl_session_id: session ID for SSL/TLS connection.
-              * $ssl_session_reused:  "r"   if  SSL/TLS   session  was
+              * $tls_cipher: cipher used for SSL/TLS connection.
+              * $tls_protocol: protocol for SSL/TLS connection.
+              * $tls_session_id: session ID for SSL/TLS connection.
+              * $tls_session_reused:  "r"   if  SSL/TLS   session  was
                 reused.  Otherwise, "."
               * $backend_host:  backend  host   used  to  fulfill  the
                 request.  "-" if backend host is not available.
@@ -2466,6 +2487,15 @@ HTTP:
   --strip-incoming-x-forwarded-for
               Strip X-Forwarded-For  header field from  inbound client
               requests.
+  --no-add-x-forwarded-proto
+              Don't append  additional X-Forwarded-Proto  header field
+              to  the   backend  request.   If  inbound   client  sets
+              X-Forwarded-Proto,                                   and
+              --no-strip-incoming-x-forwarded-proto  option  is  used,
+              they are passed to the backend.
+  --no-strip-incoming-x-forwarded-proto
+              Don't strip X-Forwarded-Proto  header field from inbound
+              client requests.
   --add-forwarded=<LIST>
               Append RFC  7239 Forwarded header field  with parameters
               specified in comma delimited list <LIST>.  The supported
@@ -2635,6 +2665,14 @@ Process:
   --user=<USER>
               Run this program as <USER>.   This option is intended to
               be used to drop root privileges.
+  --single-process
+              Run this program in a  single process mode for debugging
+              purpose.  Without this option,  nghttpx creates at least
+              2  processes:  master  and worker  processes.   If  this
+              option is  used, master  and worker  are unified  into a
+              single process.  nghttpx still spawns additional process
+              if neverbleed is used.  In  the single process mode, the
+              signal handling feature is disabled.
 
 Scripting:
   --mruby-file=<PATH>
@@ -2994,7 +3032,7 @@ void reload_config(WorkerProcess *wp) {
   // already created first default loop.
   auto loop = ev_default_loop(new_config->ev_loop_flags);
 
-  int ipc_fd;
+  int ipc_fd = 0;
 
   // fork_worker_process and forked child process assumes new
   // configuration can be obtained from get_config().
@@ -3300,6 +3338,10 @@ int main(int argc, char **argv) {
         {SHRPX_OPT_FRONTEND_MAX_REQUESTS.c_str(), required_argument, &flag,
          155},
         {SHRPX_OPT_SINGLE_THREAD.c_str(), no_argument, &flag, 156},
+        {SHRPX_OPT_NO_ADD_X_FORWARDED_PROTO.c_str(), no_argument, &flag, 157},
+        {SHRPX_OPT_NO_STRIP_INCOMING_X_FORWARDED_PROTO.c_str(), no_argument,
+         &flag, 158},
+        {SHRPX_OPT_SINGLE_PROCESS.c_str(), no_argument, &flag, 159},
         {nullptr, 0, nullptr, 0}};
 
     int option_index = 0;
@@ -4034,6 +4076,21 @@ int main(int argc, char **argv) {
       case 156:
         // --single-thread
         cmdcfgs.emplace_back(SHRPX_OPT_SINGLE_THREAD,
+                             StringRef::from_lit("yes"));
+        break;
+      case 157:
+        // --no-add-x-forwarded-proto
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_ADD_X_FORWARDED_PROTO,
+                             StringRef::from_lit("yes"));
+        break;
+      case 158:
+        // --no-strip-incoming-x-forwarded-proto
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_STRIP_INCOMING_X_FORWARDED_PROTO,
+                             StringRef::from_lit("yes"));
+        break;
+      case 159:
+        // --single-process
+        cmdcfgs.emplace_back(SHRPX_OPT_SINGLE_PROCESS,
                              StringRef::from_lit("yes"));
         break;
       default:

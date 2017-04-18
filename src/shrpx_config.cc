@@ -419,6 +419,9 @@ LogFragmentType log_var_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("ssl_ciphe", name, 9)) {
         return SHRPX_LOGF_SSL_CIPHER;
       }
+      if (util::strieq_l("tls_ciphe", name, 9)) {
+        return SHRPX_LOGF_TLS_CIPHER;
+      }
       break;
     }
     break;
@@ -455,6 +458,9 @@ LogFragmentType log_var_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("ssl_protoco", name, 11)) {
         return SHRPX_LOGF_SSL_PROTOCOL;
       }
+      if (util::strieq_l("tls_protoco", name, 11)) {
+        return SHRPX_LOGF_TLS_PROTOCOL;
+      }
       break;
     case 't':
       if (util::strieq_l("backend_hos", name, 11)) {
@@ -471,6 +477,9 @@ LogFragmentType log_var_lookup_token(const char *name, size_t namelen) {
     case 'd':
       if (util::strieq_l("ssl_session_i", name, 13)) {
         return SHRPX_LOGF_SSL_SESSION_ID;
+      }
+      if (util::strieq_l("tls_session_i", name, 13)) {
+        return SHRPX_LOGF_TLS_SESSION_ID;
       }
       break;
     }
@@ -489,6 +498,9 @@ LogFragmentType log_var_lookup_token(const char *name, size_t namelen) {
     case 'd':
       if (util::strieq_l("ssl_session_reuse", name, 17)) {
         return SHRPX_LOGF_SSL_SESSION_REUSED;
+      }
+      if (util::strieq_l("tls_session_reuse", name, 17)) {
+        return SHRPX_LOGF_TLS_SESSION_REUSED;
       }
       break;
     }
@@ -1620,6 +1632,9 @@ int option_lookup_token(const char *name, size_t namelen) {
       if (util::strieq_l("client-cipher", name, 13)) {
         return SHRPX_OPTID_CLIENT_CIPHERS;
       }
+      if (util::strieq_l("single-proces", name, 13)) {
+        return SHRPX_OPTID_SINGLE_PROCESS;
+      }
       break;
     case 't':
       if (util::strieq_l("tls-proto-lis", name, 13)) {
@@ -1902,6 +1917,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_FETCH_OCSP_RESPONSE_FILE;
       }
       break;
+    case 'o':
+      if (util::strieq_l("no-add-x-forwarded-prot", name, 23)) {
+        return SHRPX_OPTID_NO_ADD_X_FORWARDED_PROTO;
+      }
+      break;
     case 't':
       if (util::strieq_l("listener-disable-timeou", name, 23)) {
         return SHRPX_OPTID_LISTENER_DISABLE_TIMEOUT;
@@ -2096,6 +2116,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 'e':
       if (util::strieq_l("frontend-http2-optimize-window-siz", name, 34)) {
         return SHRPX_OPTID_FRONTEND_HTTP2_OPTIMIZE_WINDOW_SIZE;
+      }
+      break;
+    case 'o':
+      if (util::strieq_l("no-strip-incoming-x-forwarded-prot", name, 34)) {
+        return SHRPX_OPTID_NO_STRIP_INCOMING_X_FORWARDED_PROTO;
       }
       break;
     case 'r':
@@ -3355,6 +3380,18 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     return parse_uint(&config->http.max_requests, opt, optarg);
   case SHRPX_OPTID_SINGLE_THREAD:
     config->single_thread = util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_SINGLE_PROCESS:
+    config->single_process = util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_NO_ADD_X_FORWARDED_PROTO:
+    config->http.xfp.add = !util::strieq_l("yes", optarg);
+
+    return 0;
+  case SHRPX_OPTID_NO_STRIP_INCOMING_X_FORWARDED_PROTO:
+    config->http.xfp.strip_incoming = !util::strieq_l("yes", optarg);
 
     return 0;
   case SHRPX_OPTID_CONF:

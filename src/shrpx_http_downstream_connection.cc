@@ -630,10 +630,25 @@ int HttpDownstreamConnection::push_request_headers() {
     buf->append("\r\n");
   }
   if (!config->http2_proxy && !connect_method) {
-    buf->append("X-Forwarded-Proto: ");
-    assert(!req.scheme.empty());
-    buf->append(req.scheme);
-    buf->append("\r\n");
+    auto &xfpconf = httpconf.xfp;
+    auto xfp = xfpconf.strip_incoming
+                   ? nullptr
+                   : req.fs.header(http2::HD_X_FORWARDED_PROTO);
+
+    if (xfpconf.add) {
+      buf->append("X-Forwarded-Proto: ");
+      if (xfp) {
+        buf->append((*xfp).value);
+        buf->append(", ");
+      }
+      assert(!req.scheme.empty());
+      buf->append(req.scheme);
+      buf->append("\r\n");
+    } else if (xfp) {
+      buf->append("X-Forwarded-Proto: ");
+      buf->append((*xfp).value);
+      buf->append("\r\n");
+    }
   }
   auto via = req.fs.header(http2::HD_VIA);
   if (httpconf.no_via) {
@@ -877,13 +892,12 @@ int htp_hdrs_completecb(http_parser *htp) {
     if (resp.fs.parse_content_length() != 0) {
       return -1;
     }
-    if (resp.fs.content_length != 0) {
-      return -1;
-    }
     if (resp.fs.content_length == 0) {
       auto cl = resp.fs.header(http2::HD_CONTENT_LENGTH);
       assert(cl);
       http2::erase_header(cl);
+    } else if (resp.fs.content_length != -1) {
+      return -1;
     }
   } else if (resp.http_status / 100 == 1 ||
              (resp.http_status == 200 && req.method == HTTP_CONNECT)) {
