@@ -2688,7 +2688,9 @@ Scripting:
 
 Misc:
   --conf=<PATH>
-              Load configuration from <PATH>.
+              Load  configuration  from   <PATH>.   Please  note  that
+              nghttpx always  tries to read the  default configuration
+              file if --conf is not given.
               Default: )"
       << config->conf_path << R"(
   --include=<PATH>
@@ -2718,6 +2720,7 @@ int process_options(Config *config,
                     std::vector<std::pair<StringRef, StringRef>> &cmdcfgs) {
   std::array<char, STRERROR_BUFSIZE> errbuf;
   if (conf_exists(config->conf_path.c_str())) {
+    LOG(NOTICE) << "Loading configuration from " << config->conf_path;
     std::set<StringRef> include_set;
     if (load_config(config, config->conf_path.c_str(), include_set) == -1) {
       LOG(FATAL) << "Failed to load configuration from " << config->conf_path;
