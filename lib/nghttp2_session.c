@@ -1524,13 +1524,14 @@ static int session_predicate_response_headers_send(nghttp2_session *session,
   if (nghttp2_session_is_my_stream_id(session, stream->stream_id)) {
     return NGHTTP2_ERR_INVALID_STREAM_ID;
   }
-  if (stream->state == NGHTTP2_STREAM_OPENING) {
+  switch (stream->state) {
+  case NGHTTP2_STREAM_OPENING:
     return 0;
-  }
-  if (stream->state == NGHTTP2_STREAM_CLOSING) {
+  case NGHTTP2_STREAM_CLOSING:
     return NGHTTP2_ERR_STREAM_CLOSING;
+  default:
+    return NGHTTP2_ERR_INVALID_STREAM_STATE;
   }
-  return NGHTTP2_ERR_INVALID_STREAM_STATE;
 }
 
 /*
@@ -1573,9 +1574,6 @@ session_predicate_push_response_headers_send(nghttp2_session *session,
   if (stream->state != NGHTTP2_STREAM_RESERVED) {
     return NGHTTP2_ERR_PROTO;
   }
-  if (stream->state == NGHTTP2_STREAM_CLOSING) {
-    return NGHTTP2_ERR_STREAM_CLOSING;
-  }
   if (session->goaway_flags & NGHTTP2_GOAWAY_RECV) {
     return NGHTTP2_ERR_START_STREAM_NOT_ALLOWED;
   }
@@ -1610,19 +1608,18 @@ static int session_predicate_headers_send(nghttp2_session *session,
     return rv;
   }
   assert(stream);
-  if (nghttp2_session_is_my_stream_id(session, stream->stream_id)) {
-    if (stream->state == NGHTTP2_STREAM_CLOSING) {
-      return NGHTTP2_ERR_STREAM_CLOSING;
-    }
+
+  switch (stream->state) {
+  case NGHTTP2_STREAM_OPENED:
     return 0;
-  }
-  if (stream->state == NGHTTP2_STREAM_OPENED) {
-    return 0;
-  }
-  if (stream->state == NGHTTP2_STREAM_CLOSING) {
+  case NGHTTP2_STREAM_CLOSING:
     return NGHTTP2_ERR_STREAM_CLOSING;
+  default:
+    if (nghttp2_session_is_my_stream_id(session, stream->stream_id)) {
+      return 0;
+    }
+    return NGHTTP2_ERR_INVALID_STREAM_STATE;
   }
-  return NGHTTP2_ERR_INVALID_STREAM_STATE;
 }
 
 /*
@@ -2068,14 +2065,6 @@ static int session_prep_frame(nghttp2_session *session,
       /* We don't call nghttp2_session_adjust_closed_stream() here,
          since we don't keep closed stream in client side */
 
-      estimated_payloadlen = session_estimate_headers_payload(
-          session, frame->headers.nva, frame->headers.nvlen,
-          NGHTTP2_PRIORITY_SPECLEN);
-
-      if (estimated_payloadlen > session->max_send_header_block_length) {
-        return NGHTTP2_ERR_FRAME_SIZE_ERROR;
-      }
-
       rv = session_predicate_request_headers_send(session, item);
       if (rv != 0) {
         return rv;
@@ -2086,14 +2075,6 @@ static int session_prep_frame(nghttp2_session *session,
       }
     } else {
       nghttp2_stream *stream;
-
-      estimated_payloadlen = session_estimate_headers_payload(
-          session, frame->headers.nva, frame->headers.nvlen,
-          NGHTTP2_PRIORITY_SPECLEN);
-
-      if (estimated_payloadlen > session->max_send_header_block_length) {
-        return NGHTTP2_ERR_FRAME_SIZE_ERROR;
-      }
 
       stream = nghttp2_session_get_stream(session, frame->hd.stream_id);
 
@@ -2119,6 +2100,14 @@ static int session_prep_frame(nghttp2_session *session,
       if (rv != 0) {
         return rv;
       }
+    }
+
+    estimated_payloadlen = session_estimate_headers_payload(
+        session, frame->headers.nva, frame->headers.nvlen,
+        NGHTTP2_PRIORITY_SPECLEN);
+
+    if (estimated_payloadlen > session->max_send_header_block_length) {
+      return NGHTTP2_ERR_FRAME_SIZE_ERROR;
     }
 
     rv = nghttp2_frame_pack_headers(&session->aob.framebufs, &frame->headers,
@@ -2190,13 +2179,6 @@ static int session_prep_frame(nghttp2_session *session,
     nghttp2_stream *stream;
     size_t estimated_payloadlen;
 
-    estimated_payloadlen = session_estimate_headers_payload(
-        session, frame->push_promise.nva, frame->push_promise.nvlen, 0);
-
-    if (estimated_payloadlen > session->max_send_header_block_length) {
-      return NGHTTP2_ERR_FRAME_SIZE_ERROR;
-    }
-
     /* stream could be NULL if associated stream was already
        closed. */
     stream = nghttp2_session_get_stream(session, frame->hd.stream_id);
@@ -2208,6 +2190,13 @@ static int session_prep_frame(nghttp2_session *session,
     }
 
     assert(stream);
+
+    estimated_payloadlen = session_estimate_headers_payload(
+        session, frame->push_promise.nva, frame->push_promise.nvlen, 0);
+
+    if (estimated_payloadlen > session->max_send_header_block_length) {
+      return NGHTTP2_ERR_FRAME_SIZE_ERROR;
+    }
 
     rv = nghttp2_frame_pack_push_promise(
         &session->aob.framebufs, &frame->push_promise, &session->hd_deflater);
