@@ -115,6 +115,10 @@ struct DownstreamAddr {
   bool tls;
   // true if dynamic DNS is enabled
   bool dns;
+  // true if :scheme pseudo header field should be upgraded to secure
+  // variant (e.g., "https") when forwarding request to a backend
+  // connected by TLS connection.
+  bool upgrade_scheme;
 };
 
 // Simplified weighted fair queuing.  Actually we don't use queue here
@@ -133,10 +137,10 @@ struct WeightedPri {
 struct SharedDownstreamAddr {
   SharedDownstreamAddr()
       : balloc(1024, 1024),
+        affinity{AFFINITY_NONE},
         next{0},
         http1_pri{},
         http2_pri{},
-        affinity{AFFINITY_NONE},
         redirect_if_not_tls{false} {}
 
   SharedDownstreamAddr(const SharedDownstreamAddr &) = delete;
@@ -161,6 +165,8 @@ struct SharedDownstreamAddr {
   // wise.
   DList<Http2Session> http2_avail_freelist;
   DownstreamConnectionPool dconn_pool;
+  // Configuration for session affinity
+  AffinityConfig affinity;
   // Next http/1.1 downstream address index in addrs.
   size_t next;
   // http1_pri and http2_pri are used to which protocols are used
@@ -171,7 +177,6 @@ struct SharedDownstreamAddr {
   WeightedPri http1_pri;
   WeightedPri http2_pri;
   // Session affinity
-  shrpx_session_affinity affinity;
   // true if this group requires that client connection must be TLS,
   // and the request must be redirected to https URI.
   bool redirect_if_not_tls;
