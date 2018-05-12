@@ -61,7 +61,8 @@ typedef enum {
  */
 typedef enum {
   NGHTTP2_TYPEMASK_NONE = 0,
-  NGHTTP2_TYPEMASK_ALTSVC = 1 << 0
+  NGHTTP2_TYPEMASK_ALTSVC = 1 << 0,
+  NGHTTP2_TYPEMASK_ORIGIN = 1 << 1
 } nghttp2_typemask;
 
 typedef enum {
@@ -121,6 +122,7 @@ typedef enum {
   NGHTTP2_IB_IGN_DATA,
   NGHTTP2_IB_IGN_ALL,
   NGHTTP2_IB_READ_ALTSVC_PAYLOAD,
+  NGHTTP2_IB_READ_ORIGIN_PAYLOAD,
   NGHTTP2_IB_READ_EXTENSION_PAYLOAD
 } nghttp2_inbound_state;
 
@@ -698,7 +700,7 @@ int nghttp2_session_on_push_promise_received(nghttp2_session *session,
  * NGHTTP2_ERR_NOMEM
  *     Out of memory.
  * NGHTTP2_ERR_CALLBACK_FAILURE
- *   The callback function failed.
+ *     The callback function failed.
  * NGHTTP2_ERR_FLOODED
  *     There are too many items in outbound queue, and this is most
  *     likely caused by misbehaviour of peer.
@@ -716,7 +718,7 @@ int nghttp2_session_on_ping_received(nghttp2_session *session,
  * NGHTTP2_ERR_NOMEM
  *     Out of memory.
  * NGHTTP2_ERR_CALLBACK_FAILURE
- *   The callback function failed.
+ *     The callback function failed.
  */
 int nghttp2_session_on_goaway_received(nghttp2_session *session,
                                        nghttp2_frame *frame);
@@ -731,7 +733,7 @@ int nghttp2_session_on_goaway_received(nghttp2_session *session,
  * NGHTTP2_ERR_NOMEM
  *     Out of memory.
  * NGHTTP2_ERR_CALLBACK_FAILURE
- *   The callback function failed.
+ *     The callback function failed.
  */
 int nghttp2_session_on_window_update_received(nghttp2_session *session,
                                               nghttp2_frame *frame);
@@ -744,9 +746,22 @@ int nghttp2_session_on_window_update_received(nghttp2_session *session,
  * negative error codes:
  *
  * NGHTTP2_ERR_CALLBACK_FAILURE
- *   The callback function failed.
+ *     The callback function failed.
  */
 int nghttp2_session_on_altsvc_received(nghttp2_session *session,
+                                       nghttp2_frame *frame);
+
+/*
+ * Called when ORIGIN is received, assuming |frame| is properly
+ * initialized.
+ *
+ * This function returns 0 if it succeeds, or one of the following
+ * negative error codes:
+ *
+ * NGHTTP2_ERR_CALLBACK_FAILURE
+ *     The callback function failed.
+ */
+int nghttp2_session_on_origin_received(nghttp2_session *session,
                                        nghttp2_frame *frame);
 
 /*
@@ -759,7 +774,7 @@ int nghttp2_session_on_altsvc_received(nghttp2_session *session,
  * NGHTTP2_ERR_NOMEM
  *     Out of memory.
  * NGHTTP2_ERR_CALLBACK_FAILURE
- *   The callback function failed.
+ *     The callback function failed.
  */
 int nghttp2_session_on_data_received(nghttp2_session *session,
                                      nghttp2_frame *frame);
