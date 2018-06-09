@@ -28,36 +28,36 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
+#  include <sys/socket.h>
 #endif // HAVE_SYS_SOCKET_H
 #include <sys/un.h>
 #ifdef HAVE_NETDB_H
-#include <netdb.h>
+#  include <netdb.h>
 #endif // HAVE_NETDB_H
 #include <signal.h>
 #ifdef HAVE_NETINET_IN_H
-#include <netinet/in.h>
+#  include <netinet/in.h>
 #endif // HAVE_NETINET_IN_H
 #include <netinet/tcp.h>
 #ifdef HAVE_ARPA_INET_H
-#include <arpa/inet.h>
+#  include <arpa/inet.h>
 #endif // HAVE_ARPA_INET_H
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>
+#  include <unistd.h>
 #endif // HAVE_UNISTD_H
 #include <getopt.h>
 #ifdef HAVE_SYSLOG_H
-#include <syslog.h>
+#  include <syslog.h>
 #endif // HAVE_SYSLOG_H
 #ifdef HAVE_LIMITS_H
-#include <limits.h>
+#  include <limits.h>
 #endif // HAVE_LIMITS_H
 #ifdef HAVE_SYS_TIME_H
-#include <sys/time.h>
+#  include <sys/time.h>
 #endif // HAVE_SYS_TIME_H
 #include <sys/resource.h>
 #ifdef HAVE_LIBSYSTEMD
-#include <systemd/sd-daemon.h>
+#  include <systemd/sd-daemon.h>
 #endif // HAVE_LIBSYSTEMD
 
 #include <cinttypes>
@@ -131,16 +131,16 @@ constexpr auto ENV_ACCEPT_PREFIX = StringRef::from_lit("NGHTTPX_ACCEPT_");
 constexpr auto ENV_ORIG_PID = StringRef::from_lit("NGHTTPX_ORIG_PID");
 
 #ifndef _KERNEL_FASTOPEN
-#define _KERNEL_FASTOPEN
+#  define _KERNEL_FASTOPEN
 // conditional define for TCP_FASTOPEN mostly on ubuntu
-#ifndef TCP_FASTOPEN
-#define TCP_FASTOPEN 23
-#endif
+#  ifndef TCP_FASTOPEN
+#    define TCP_FASTOPEN 23
+#  endif
 
 // conditional define for SOL_TCP mostly on ubuntu
-#ifndef SOL_TCP
-#define SOL_TCP 6
-#endif
+#  ifndef SOL_TCP
+#    define SOL_TCP 6
+#  endif
 #endif
 
 // This configuration is fixed at the first startup of the main
@@ -1140,15 +1140,15 @@ int call_daemon() {
 #ifdef __sgi
   return _daemonize(0, 0, 0, 0);
 #else // !__sgi
-#ifdef HAVE_LIBSYSTEMD
+#  ifdef HAVE_LIBSYSTEMD
   if (sd_booted() && (getenv("NOTIFY_SOCKET") != nullptr)) {
     LOG(NOTICE) << "Daemonising disabled under systemd";
     chdir("/");
     return 0;
   }
-#endif // HAVE_LIBSYSTEMD
+#  endif // HAVE_LIBSYSTEMD
   return daemon(0, 0);
-#endif // !__sgi
+#endif   // !__sgi
 }
 } // namespace
 
@@ -1897,7 +1897,8 @@ Connections:
 Performance:
   -n, --workers=<N>
               Set the number of worker threads.
-              Default: )" << config->num_worker << R"(
+              Default: )"
+      << config->num_worker << R"(
   --single-thread
               Run everything in one  thread inside the worker process.
               This   feature   is   provided  for   better   debugging
@@ -2078,7 +2079,8 @@ SSL/TLS:
   --client-ciphers=<SUITE>
               Set  allowed cipher  list for  backend connection.   The
               format of the string is described in OpenSSL ciphers(1).
-              Default: )" << config->tls.client.ciphers << R"(
+              Default: )"
+      << config->tls.client.ciphers << R"(
   --ecdh-curves=<LIST>
               Set  supported  curve  list  for  frontend  connections.
               <LIST> is a  colon separated list of curve  NID or names
@@ -2134,7 +2136,8 @@ SSL/TLS:
               NPN.  The parameter must be  delimited by a single comma
               only  and any  white spaces  are  treated as  a part  of
               protocol string.
-              Default: )" << DEFAULT_NPN_LIST
+              Default: )"
+      << DEFAULT_NPN_LIST
       << R"(
   --verify-client
               Require and verify client certificate.
@@ -2539,7 +2542,8 @@ Logging:
               Set path to write error  log.  To reopen file, send USR1
               signal  to nghttpx.   stderr will  be redirected  to the
               error log file unless --errorlog-syslog is used.
-              Default: )" << config->logging.error.file << R"(
+              Default: )"
+      << config->logging.error.file << R"(
   --errorlog-syslog
               Send  error log  to  syslog.  If  this  option is  used,
               --errorlog-file option is ignored.
@@ -2671,8 +2675,8 @@ HTTP:
               Specify the port number which appears in Location header
               field  when  redirect  to  HTTPS  URI  is  made  due  to
               "redirect-if-not-tls" parameter in --backend option.
-              Default: )" << config->http.redirect_https_port
-      << R"(
+              Default: )"
+      << config->http.redirect_https_port << R"(
 
 API:
   --api-max-request-body=<SIZE>
@@ -2751,7 +2755,8 @@ Misc:
               Load  configuration  from   <PATH>.   Please  note  that
               nghttpx always  tries to read the  default configuration
               file if --conf is not given.
-              Default: )" << config->conf_path << R"(
+              Default: )"
+      << config->conf_path << R"(
   --include=<PATH>
               Load additional configurations from <PATH>.  File <PATH>
               is  read  when  configuration  parser  encountered  this
@@ -2769,7 +2774,8 @@ Misc:
   The <DURATION> argument is an integer and an optional unit (e.g., 1s
   is 1 second and 500ms is 500 milliseconds).  Units are h, m, s or ms
   (hours, minutes, seconds and milliseconds, respectively).  If a unit
-  is omitted, a second is used as unit.)" << std::endl;
+  is omitted, a second is used as unit.)"
+      << std::endl;
 }
 } // namespace
 
