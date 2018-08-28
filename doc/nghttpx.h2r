@@ -300,15 +300,24 @@ HTTP variables, like authority or request path, and even return custom
 response without forwarding request to backend servers.
 
 There are 2 levels of mruby script invocations: global and
-per-backend.  The global mruby script is set by :option:`--mruby-file`
-option and is called for all requests.  The per-backend mruby script
+per-pattern.  The global mruby script is set by :option:`--mruby-file`
+option and is called for all requests.  The per-pattern mruby script
 is set by "mruby" parameter in :option:`-b` option.  It is invoked for
-a request which is forwarded to the particular backend.  The order of
-hook invocation is: global request phase hook, per-backend request
-phase hook, per-backend response phase hook, and finally global
-response phase hook.  If a hook returns a response, any later hooks
-are not invoked.  The global request hook is invoked before selecting
-backend, and changing request path may affect the backend selection.
+a request which matches the particular pattern.  The order of hook
+invocation is: global request phase hook, per-pattern request phase
+hook, per-pattern response phase hook, and finally global response
+phase hook.  If a hook returns a response, any later hooks are not
+invoked.  The global request hook is invoked before the pattern
+matching is made and changing request path may affect the pattern
+matching.
+
+Please note that request and response hooks of per-pattern mruby
+script for a single request might not come from the same script.  This
+might happen after a request hook is executed, backend failed for some
+reason, and at the same time, backend configuration is replaced by API
+request, and then the request uses new configuration on retry.  The
+response hook from new configuration, if it is specified, will be
+invoked.
 
 The all mruby script will be evaluated once per thread on startup, and
 it must instantiate object and evaluate it as the return value (e.g.,
