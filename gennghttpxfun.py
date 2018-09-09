@@ -172,6 +172,9 @@ OPTIONS = [
     "ignore-per-pattern-mruby-error",
     "tls-no-postpone-early-data",
     "tls-max-early-data",
+    "tls13-ciphers",
+    "tls13-client-ciphers",
+    "no-strip-incoming-early-data",
 ]
 
 LOGVARS = [

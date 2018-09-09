@@ -351,6 +351,11 @@ constexpr auto SHRPX_OPT_TLS_NO_POSTPONE_EARLY_DATA =
     StringRef::from_lit("tls-no-postpone-early-data");
 constexpr auto SHRPX_OPT_TLS_MAX_EARLY_DATA =
     StringRef::from_lit("tls-max-early-data");
+constexpr auto SHRPX_OPT_TLS13_CIPHERS = StringRef::from_lit("tls13-ciphers");
+constexpr auto SHRPX_OPT_TLS13_CLIENT_CIPHERS =
+    StringRef::from_lit("tls13-client-ciphers");
+constexpr auto SHRPX_OPT_NO_STRIP_INCOMING_EARLY_DATA =
+    StringRef::from_lit("no-strip-incoming-early-data");
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
@@ -626,6 +631,7 @@ struct TLSConfig {
     StringRef private_key_file;
     StringRef cert_file;
     StringRef ciphers;
+    StringRef tls13_ciphers;
     bool no_http2_cipher_black_list;
   } client;
 
@@ -652,6 +658,7 @@ struct TLSConfig {
   StringRef cert_file;
   StringRef dh_param_file;
   StringRef ciphers;
+  StringRef tls13_ciphers;
   StringRef ecdh_curves;
   StringRef cacert;
   // The maximum amount of 0-RTT data that server accepts.
@@ -699,6 +706,9 @@ struct HttpConfig {
     bool add;
     bool strip_incoming;
   } xfp;
+  struct {
+    bool strip_incoming;
+  } early_data;
   std::vector<AltSvc> altsvcs;
   std::vector<ErrorPage> error_pages;
   HeaderRefs add_request_headers;
@@ -1095,6 +1105,7 @@ enum {
   SHRPX_OPTID_NO_OCSP,
   SHRPX_OPTID_NO_SERVER_PUSH,
   SHRPX_OPTID_NO_SERVER_REWRITE,
+  SHRPX_OPTID_NO_STRIP_INCOMING_EARLY_DATA,
   SHRPX_OPTID_NO_STRIP_INCOMING_X_FORWARDED_PROTO,
   SHRPX_OPTID_NO_VERIFY_OCSP,
   SHRPX_OPTID_NO_VIA,
@@ -1144,6 +1155,8 @@ enum {
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_MAX_RETRY,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_PRIVATE_KEY_FILE,
   SHRPX_OPTID_TLS_TICKET_KEY_MEMCACHED_TLS,
+  SHRPX_OPTID_TLS13_CIPHERS,
+  SHRPX_OPTID_TLS13_CLIENT_CIPHERS,
   SHRPX_OPTID_USER,
   SHRPX_OPTID_VERIFY_CLIENT,
   SHRPX_OPTID_VERIFY_CLIENT_CACERT,

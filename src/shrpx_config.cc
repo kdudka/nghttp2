@@ -1759,6 +1759,11 @@ int option_lookup_token(const char *name, size_t namelen) {
         return SHRPX_OPTID_FORWARDED_FOR;
       }
       break;
+    case 's':
+      if (util::strieq_l("tls13-cipher", name, 12)) {
+        return SHRPX_OPTID_TLS13_CIPHERS;
+      }
+      break;
     case 't':
       if (util::strieq_l("verify-clien", name, 12)) {
         return SHRPX_OPTID_VERIFY_CLIENT;
@@ -1954,6 +1959,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     case 'l':
       if (util::strieq_l("ocsp-update-interva", name, 19)) {
         return SHRPX_OPTID_OCSP_UPDATE_INTERVAL;
+      }
+      break;
+    case 's':
+      if (util::strieq_l("tls13-client-cipher", name, 19)) {
+        return SHRPX_OPTID_TLS13_CLIENT_CIPHERS;
       }
       break;
     case 't':
@@ -2176,6 +2186,11 @@ int option_lookup_token(const char *name, size_t namelen) {
     break;
   case 28:
     switch (name[27]) {
+    case 'a':
+      if (util::strieq_l("no-strip-incoming-early-dat", name, 27)) {
+        return SHRPX_OPTID_NO_STRIP_INCOMING_EARLY_DATA;
+      }
+      break;
     case 'd':
       if (util::strieq_l("tls-dyn-rec-warmup-threshol", name, 27)) {
         return SHRPX_OPTID_TLS_DYN_REC_WARMUP_THRESHOLD;
@@ -2831,6 +2846,10 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     return parse_uint(&config->conn.listener.backlog, opt, optarg);
   case SHRPX_OPTID_CIPHERS:
     config->tls.ciphers = make_string_ref(config->balloc, optarg);
+
+    return 0;
+  case SHRPX_OPTID_TLS13_CIPHERS:
+    config->tls.tls13_ciphers = make_string_ref(config->balloc, optarg);
 
     return 0;
   case SHRPX_OPTID_CLIENT:
@@ -3548,6 +3567,10 @@ int parse_config(Config *config, int optid, const StringRef &opt,
     config->tls.client.ciphers = make_string_ref(config->balloc, optarg);
 
     return 0;
+  case SHRPX_OPTID_TLS13_CLIENT_CIPHERS:
+    config->tls.client.tls13_ciphers = make_string_ref(config->balloc, optarg);
+
+    return 0;
   case SHRPX_OPTID_ACCESSLOG_WRITE_EARLY:
     config->logging.access.write_early = util::strieq_l("yes", optarg);
 
@@ -3608,6 +3631,10 @@ int parse_config(Config *config, int optid, const StringRef &opt,
   case SHRPX_OPTID_TLS_MAX_EARLY_DATA: {
     return parse_uint_with_unit(&config->tls.max_early_data, opt, optarg);
   }
+  case SHRPX_OPTID_NO_STRIP_INCOMING_EARLY_DATA:
+    config->http.early_data.strip_incoming = !util::strieq_l("yes", optarg);
+
+    return 0;
   case SHRPX_OPTID_CONF:
     LOG(WARN) << "conf: ignored";
 
