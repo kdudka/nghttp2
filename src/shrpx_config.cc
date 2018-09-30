@@ -1053,15 +1053,17 @@ int parse_mapping(Config *config, DownstreamAddrConfig &addr,
         g.redirect_if_not_tls = true;
       }
       // All backends in the same group must have the same mruby path.
-      // If some backend does not specify mruby file, and there is at
-      // least one backend with mruby file, it is used for all backend
-      // in the group.
-      if (g.mruby_file.empty()) {
-        g.mruby_file = make_string_ref(downstreamconf.balloc, params.mruby);
-      } else if (g.mruby_file != params.mruby) {
-        LOG(ERROR) << "backend: mruby: multiple different mruby file found in "
-                      "a single group";
-        return -1;
+      // If some backends do not specify mruby file, and there is at
+      // least one backend with mruby file, it is used for all
+      // backends in the group.
+      if (!params.mruby.empty()) {
+        if (g.mruby_file.empty()) {
+          g.mruby_file = make_string_ref(downstreamconf.balloc, params.mruby);
+        } else if (g.mruby_file != params.mruby) {
+          LOG(ERROR) << "backend: mruby: multiple different mruby file found "
+                        "in a single group";
+          return -1;
+        }
       }
 
       g.addrs.push_back(addr);
